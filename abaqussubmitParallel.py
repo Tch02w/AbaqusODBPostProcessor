@@ -195,7 +195,6 @@ APP_BG = "#ffffff"
 CARD_BG = "#ffffff"
 LOG_BG = "#f9fafb"
 JOBLIST_FILENAME = "joblist.json"
-JOB_TAB_COLUMNS = 3
 BTN_LIGHT_FG = "#dbe3ee"
 BTN_LIGHT_HOVER = "#cbd5e1"
 BTN_LIGHT_TEXT = "#111827"
@@ -224,7 +223,10 @@ joblist_state = {
     "dependencies": {},
     "existing_odb_action": "",
 }
-job_tab_buttons = {}
+job_tab_records = {}
+job_selector_var = None
+job_selector = None
+job_stats_var = None
 abaqus_memory_cache = {
     "timestamp": 0.0,
     "usage": {},
@@ -1604,7 +1606,7 @@ def create_job_log_tab(job_state):
 
     job_name = job_state["job_name"]
     log_tab_counter += 1
-    tab_title = f"{job_name}"
+    tab_title = make_unique_job_selector_title(job_name)
 
     if not right_panel_visible:
         root.geometry(FULL_GEOMETRY)
@@ -1768,105 +1770,150 @@ def select_job_tab(tab_frame):
     except tk.TclError:
         return
 
-    for frame, button in list(job_tab_buttons.items()):
+    for frame, record in list(job_tab_records.items()):
         try:
             selected = frame == tab_frame
-            final_status = getattr(button, "job_final_status", "")
-            success_tab = final_status in ("完成", "Datacheck Completed")
-            error_tab = final_status and not success_tab
-            if selected and success_tab:
-                fg_color = "#16a34a"
-                hover_color = "#15803d"
-                text_color = "#ffffff"
-            elif selected and error_tab:
-                fg_color = "#b91c1c"
-                hover_color = "#991b1b"
-                text_color = "#ffffff"
-            elif selected:
-                fg_color = "#2563eb"
-                hover_color = "#1d4ed8"
-                text_color = "#ffffff"
-            elif success_tab:
-                fg_color = "#dcfce7"
-                hover_color = "#bbf7d0"
-                text_color = "#166534"
-            elif error_tab:
-                fg_color = "#fee2e2"
-                hover_color = "#fecaca"
-                text_color = "#991b1b"
-            else:
-                fg_color = BTN_LIGHT_FG
-                hover_color = BTN_LIGHT_HOVER
-                text_color = BTN_LIGHT_TEXT
-            button.configure(
-                fg_color=fg_color,
-                hover_color=hover_color,
-                text_color=text_color,
-            )
+            if selected and job_selector_var is not None:
+                job_selector_var.set(record["title"])
         except tk.TclError:
-            job_tab_buttons.pop(frame, None)
+            job_tab_records.pop(frame, None)
+
+    update_job_selector_values()
+    update_selected_job_selector_style()
 
 
 def mark_job_tab_final_status(job_state, status):
     """Mark a retained job tab by final status."""
     tab_frame = job_state.get("tab_frame")
-    button = job_tab_buttons.get(tab_frame)
-    if button is None:
+    record = job_tab_records.get(tab_frame)
+    if record is None:
         return
 
+    record["status"] = status
+    update_job_selector_values()
     try:
-        button.job_final_status = status
         selected_tab = log_notebook.select()
-        select_job_tab(root.nametowidget(selected_tab) if selected_tab else tab_frame)
+        if selected_tab:
+            select_job_tab(root.nametowidget(selected_tab))
     except tk.TclError:
-        pass
-
-
-def relayout_job_tab_buttons():
-    """Lay out job switch buttons in multiple rows."""
-    for index, button in enumerate(job_tab_buttons.values()):
-        try:
-            button.grid_forget()
-            row, column = divmod(index, JOB_TAB_COLUMNS)
-            button.grid(row=row, column=column, sticky="w", padx=(0, 8), pady=(0, 6))
-        except tk.TclError:
-            continue
+        return
 
 
 def add_job_tab_button(tab_frame, title):
-    """在自定义多行标签栏中添加一个作业切换按钮。"""
-    button = ctk.CTkButton(
-        job_tab_bar,
-        text=title,
-        width=118,
-        height=28,
-        corner_radius=7,
-        font=FONT_HINT,
-        fg_color=BTN_LIGHT_FG,
-        hover_color=BTN_LIGHT_HOVER,
-        text_color=BTN_LIGHT_TEXT,
-        bg_color="#ffffff",
-        command=lambda: select_job_tab(tab_frame)
-    )
-    job_tab_buttons[tab_frame] = button
-    relayout_job_tab_buttons()
+    """Register one job page in the selector."""
+    job_tab_records[tab_frame] = {
+        "title": title,
+        "status": "",
+    }
+    update_job_selector_values()
     select_job_tab(tab_frame)
 
 
 def remove_job_tab_button(tab_frame):
-    """移除已关闭作业对应的自定义标签按钮。"""
-    button = job_tab_buttons.pop(tab_frame, None)
-    if button is not None:
-        try:
-            button.destroy()
-        except tk.TclError:
-            pass
-    relayout_job_tab_buttons()
+    """Remove one job page from the selector."""
+    job_tab_records.pop(tab_frame, None)
+    update_job_selector_values()
 
     try:
         tabs = list(log_notebook.tabs())
         if tabs:
             select_job_tab(root.nametowidget(tabs[-1]))
+    except tk.TclError:
+        pass
+
+
+def select_job_from_dropdown(choice):
+    """Switch log page from the top job selector."""
+    for tab_frame, record in list(job_tab_records.items()):
+        if record.get("title") == choice:
+            select_job_tab(tab_frame)
+            return
+
+
+def update_job_selector_values():
+    """Refresh job selector options and status summary."""
+    if job_selector is None:
+        return
+
+    records = list(job_tab_records.values())
+    values = [record["title"] for record in records] or ["无作业"]
+    selected_title = job_selector_var.get() if job_selector_var is not None else ""
+    if selected_title not in values and job_selector_var is not None:
+        job_selector_var.set(values[0])
+
+    try:
+        job_selector.configure(values=values, state="normal" if records else "disabled")
+    except tk.TclError:
+        return
+
+    running_count = 0
+    done_count = 0
+    failed_count = 0
+    for record in records:
+        status = record.get("status", "")
+        if status in ("完成", "Datacheck Completed"):
+            done_count += 1
+        elif status:
+            failed_count += 1
+        else:
+            running_count += 1
+
+    if job_stats_var is not None:
+        job_stats_var.set(
+            f"运行中 {running_count} | 完成 {done_count} | 异常 {failed_count}"
+        )
+
+    update_selected_job_selector_style()
+
+
+def make_unique_job_selector_title(base_title):
+    """Return a unique display title for the job selector."""
+    existing_titles = {
+        record.get("title", "")
+        for record in job_tab_records.values()
+    }
+    if base_title not in existing_titles:
+        return base_title
+
+    index = 2
+    while f"{base_title} ({index})" in existing_titles:
+        index += 1
+
+    return f"{base_title} ({index})"
+
+
+def update_selected_job_selector_style():
+    """Tint the selected job selector by the selected job's final status."""
+    if job_selector is None or job_selector_var is None:
+        return
+
+    selected_title = job_selector_var.get()
+    selected_status = ""
+    for record in job_tab_records.values():
+        if record.get("title") == selected_title:
+            selected_status = record.get("status", "")
+            break
+
+    if selected_status in ("完成", "Datacheck Completed"):
+        fg_color = "#dcfce7"
+        hover_color = "#bbf7d0"
+        text_color = "#166534"
+    elif selected_status:
+        fg_color = "#fee2e2"
+        hover_color = "#fecaca"
+        text_color = "#991b1b"
+    else:
+        fg_color = BTN_LIGHT_FG
+        hover_color = BTN_LIGHT_HOVER
+        text_color = BTN_LIGHT_TEXT
+
+    try:
+        job_selector.configure(
+            fg_color=fg_color,
+            button_color=fg_color,
+            button_hover_color=hover_color,
+            text_color=text_color,
+        )
     except tk.TclError:
         pass
 
@@ -1895,8 +1942,10 @@ def ensure_right_panel_ui():
     global right_panel
     global log_card
     global log_inner
-    global job_tab_bar
     global log_notebook
+    global job_selector_var
+    global job_selector
+    global job_stats_var
 
     if right_panel is None:
         right_panel = ttk.Frame(
@@ -1923,8 +1972,46 @@ def ensure_right_panel_ui():
         style="Normal.TLabel"
     ).pack(anchor="w", pady=(0, 8))
 
-    job_tab_bar = tk.Frame(log_inner, bg=CARD_BG)
-    job_tab_bar.pack(fill="x", anchor="w", pady=(0, 6))
+    selector_row = ttk.Frame(log_inner, style="Card.TFrame")
+    selector_row.pack(fill="x", anchor="w", pady=(0, 8))
+    selector_row.columnconfigure(1, weight=1)
+
+    ttk.Label(
+        selector_row,
+        text="Job",
+        style="Normal.TLabel"
+    ).grid(row=0, column=0, sticky="w", padx=(0, 8))
+
+    job_selector_var = tk.StringVar(value="无作业")
+    job_selector = ctk.CTkOptionMenu(
+        selector_row,
+        variable=job_selector_var,
+        values=["无作业"],
+        width=220,
+        height=30,
+        corner_radius=7,
+        fg_color=BTN_LIGHT_FG,
+        button_color=BTN_LIGHT_FG,
+        button_hover_color=BTN_LIGHT_HOVER,
+        text_color=BTN_LIGHT_TEXT,
+        dropdown_fg_color="#ffffff",
+        dropdown_hover_color="#e5e7eb",
+        dropdown_text_color="#111827",
+        font=FONT_HINT,
+        dropdown_font=FONT_HINT,
+        anchor="center",
+        dynamic_resizing=False,
+        state="disabled",
+        command=select_job_from_dropdown
+    )
+    job_selector.grid(row=0, column=1, sticky="w")
+
+    job_stats_var = tk.StringVar(value="运行中 0 | 完成 0 | 异常 0")
+    ttk.Label(
+        selector_row,
+        textvariable=job_stats_var,
+        style="Hint.TLabel"
+    ).grid(row=0, column=2, sticky="e", padx=(14, 0))
 
     log_notebook = ttk.Notebook(log_inner, style="Hidden.TNotebook")
     log_notebook.pack(fill="y", expand=True, anchor="w")
@@ -1970,7 +2057,8 @@ def collapse_right_panel_if_empty():
         # 重置页签计数，下一次提交作业时重新按第一次提交处理
         log_tab_counter = 0
 
-        job_tab_buttons.clear()
+        job_tab_records.clear()
+        update_job_selector_values()
         log_notebook.configure(style="Hidden.TNotebook")
 
     except tk.TclError:
@@ -4635,7 +4723,6 @@ left_panel.pack_propagate(False)
 right_panel = None
 log_card = None
 log_inner = None
-job_tab_bar = None
 log_notebook = None
 
 # ================= 左侧提交表单 =================

@@ -1910,7 +1910,7 @@ def update_selected_job_selector_style():
     try:
         job_selector.configure(
             fg_color=fg_color,
-            button_hover_color=hover_color,
+            hover_color=hover_color,
             text_color=text_color,
         )
     except tk.TclError:
@@ -2121,6 +2121,7 @@ def ensure_right_panel_ui():
         height=30,
         corner_radius=7,
         fg_color=BTN_LIGHT_FG,
+        hover_color=BTN_LIGHT_HOVER,
         text_color=BTN_LIGHT_TEXT,
         font=FONT_HINT,
         anchor="center",

@@ -226,6 +226,7 @@ joblist_state = {
 job_tab_records = {}
 job_selector_var = None
 job_selector = None
+job_selector_popup = None
 job_stats_var = None
 abaqus_memory_cache = {
     "timestamp": 0.0,
@@ -1821,14 +1822,6 @@ def remove_job_tab_button(tab_frame):
         pass
 
 
-def select_job_from_dropdown(choice):
-    """Switch log page from the top job selector."""
-    for tab_frame, record in list(job_tab_records.items()):
-        if record.get("title") == choice:
-            select_job_tab(tab_frame)
-            return
-
-
 def update_job_selector_values():
     """Refresh job selector options and status summary."""
     if job_selector is None:
@@ -1841,7 +1834,10 @@ def update_job_selector_values():
         job_selector_var.set(values[0])
 
     try:
-        job_selector.configure(values=values, state="normal" if records else "disabled")
+        job_selector.configure(
+            text=job_selector_var.get() if job_selector_var is not None else "无作业",
+            state="normal" if records else "disabled",
+        )
     except tk.TclError:
         return
 
@@ -1909,12 +1905,121 @@ def update_selected_job_selector_style():
     try:
         job_selector.configure(
             fg_color=fg_color,
-            button_color=fg_color,
             button_hover_color=hover_color,
             text_color=text_color,
         )
     except tk.TclError:
         pass
+
+
+def get_job_selector_status_info(status):
+    """Return display status and colors for one selector row."""
+    if status in ("完成", "Datacheck Completed"):
+        return "Completed", "#dcfce7", "#166534", "#bbf7d0"
+
+    if status:
+        return "Failed", "#fee2e2", "#991b1b", "#fecaca"
+
+    return "Running", BTN_LIGHT_FG, BTN_LIGHT_TEXT, BTN_LIGHT_HOVER
+
+
+def select_job_from_popup(tab_frame):
+    """Switch to one job and close the custom selector popup."""
+    close_job_selector_popup()
+    select_job_tab(tab_frame)
+
+
+def close_job_selector_popup():
+    """Close the custom selector popup if it is open."""
+    global job_selector_popup
+
+    if job_selector_popup is not None:
+        try:
+            job_selector_popup.destroy()
+        except tk.TclError:
+            pass
+        job_selector_popup = None
+
+
+def show_job_selector_popup():
+    """Show a color-coded custom job selector popup."""
+    global job_selector_popup
+
+    if job_selector is None or not job_tab_records:
+        return
+
+    if job_selector_popup is not None:
+        close_job_selector_popup()
+        return
+
+    popup = tk.Toplevel(root)
+    popup.overrideredirect(True)
+    popup.configure(bg="#cbd5e1")
+    popup.transient(root)
+    job_selector_popup = popup
+
+    container = tk.Frame(popup, bg="#cbd5e1", padx=1, pady=1)
+    container.pack(fill="both", expand=True)
+
+    row_width = job_selector.winfo_width()
+    popup_font = (FONT_FAMILY, 11)
+    for tab_frame, record in list(job_tab_records.items()):
+        status_text, bg_color, text_color, hover_color = get_job_selector_status_info(
+            record.get("status", "")
+        )
+        row = tk.Frame(container, bg=bg_color, width=row_width, height=28)
+        row.pack(fill="x", pady=(0, 1))
+        row.pack_propagate(False)
+
+        name_label = tk.Label(
+            row,
+            text=record.get("title", ""),
+            bg=bg_color,
+            fg=text_color,
+            font=popup_font,
+            anchor="w",
+            padx=8
+        )
+        name_label.pack(side="left", fill="both", expand=True)
+
+        status_label = tk.Label(
+            row,
+            text=status_text,
+            bg=bg_color,
+            fg=text_color,
+            font=popup_font,
+            anchor="e",
+            padx=8,
+            width=9
+        )
+        status_label.pack(side="right", fill="y")
+
+        def bind_row(widget, frame=tab_frame, row_widgets=(row, name_label, status_label),
+                     normal_bg=bg_color, hover_bg=hover_color):
+            widget.bind("<Button-1>", lambda _event: select_job_from_popup(frame))
+            widget.bind(
+                "<Enter>",
+                lambda _event: [
+                    item.configure(bg=hover_bg) for item in row_widgets
+                ]
+            )
+            widget.bind(
+                "<Leave>",
+                lambda _event: [
+                    item.configure(bg=normal_bg) for item in row_widgets
+                ]
+            )
+
+        for widget in (row, name_label, status_label):
+            bind_row(widget)
+
+    root.update_idletasks()
+    x = job_selector.winfo_rootx()
+    y = job_selector.winfo_rooty() + job_selector.winfo_height() + 2
+    popup.geometry(f"{row_width}x{max(1, len(job_tab_records)) * 29}+{x}+{y}")
+    popup.bind("<Escape>", lambda _event: close_job_selector_popup())
+    popup.bind("<FocusOut>", lambda _event: close_job_selector_popup())
+    popup.focus_force()
 
 
 def sync_log_notebook_width(log_widget):
@@ -1944,6 +2049,7 @@ def ensure_right_panel_ui():
     global log_notebook
     global job_selector_var
     global job_selector
+    global job_selector_popup
     global job_stats_var
 
     if right_panel is None:
@@ -1982,26 +2088,19 @@ def ensure_right_panel_ui():
     ).grid(row=0, column=0, sticky="w", padx=(0, 8))
 
     job_selector_var = tk.StringVar(value="无作业")
-    job_selector = ctk.CTkOptionMenu(
+    job_selector_popup = None
+    job_selector = ctk.CTkButton(
         selector_row,
-        variable=job_selector_var,
-        values=["无作业"],
+        textvariable=job_selector_var,
         width=220,
         height=30,
         corner_radius=7,
         fg_color=BTN_LIGHT_FG,
-        button_color=BTN_LIGHT_FG,
-        button_hover_color=BTN_LIGHT_HOVER,
         text_color=BTN_LIGHT_TEXT,
-        dropdown_fg_color="#ffffff",
-        dropdown_hover_color="#e5e7eb",
-        dropdown_text_color="#111827",
         font=FONT_HINT,
-        dropdown_font=FONT_HINT,
         anchor="center",
-        dynamic_resizing=False,
         state="disabled",
-        command=select_job_from_dropdown
+        command=show_job_selector_popup
     )
     job_selector.grid(row=0, column=1, sticky="w")
 

@@ -1893,6 +1893,16 @@ def make_unique_job_selector_title(base_title):
     return f"{base_title} ({index})"
 
 
+def format_job_selector_button_text():
+    """Return the compact selector button text with a dropdown indicator."""
+    if job_selector_var is None:
+        title = "无作业"
+    else:
+        title = job_selector_var.get() or "无作业"
+
+    return f"{title}  ▼"
+
+
 def update_selected_job_selector_style():
     """Tint the selected job selector by the selected job's final status."""
     if job_selector is None or job_selector_var is None:
@@ -1909,6 +1919,7 @@ def update_selected_job_selector_style():
 
     try:
         job_selector.configure(
+            text=format_job_selector_button_text(),
             fg_color=fg_color,
             hover_color=hover_color,
             text_color=text_color,
@@ -2116,7 +2127,7 @@ def ensure_right_panel_ui():
     job_selector_popup = None
     job_selector = ctk.CTkButton(
         selector_row,
-        textvariable=job_selector_var,
+        text=format_job_selector_button_text(),
         width=220,
         height=30,
         corner_radius=7,

@@ -884,14 +884,13 @@ def update_job_memory_sample(job_state, usage):
     ):
         job_memory_estimates[job_name]["stable"] = True
         job_state["memory_monitor_stopped"] = True
-        log_widget = job_state.get("log_widget")
-        if log_widget is not None:
-            append_log(
-                log_widget,
-                "状态：内存监测已稳定，"
-                f"峰值 {format_memory_size(peak_after)}，"
-                f"估算 {format_memory_size(job_memory_estimates[job_name]['estimated_memory'])}。\n"
-            )
+        monitor_time = time.strftime("%Y-%m-%d %H:%M:%S")
+        append_history_text(f"[{monitor_time}]\n", "history_time")
+        append_history_text(
+            f"{job_name}：状态：内存监测已稳定，"
+            f"峰值 {format_memory_size(peak_after)}，"
+            f"估算 {format_memory_size(job_memory_estimates[job_name]['estimated_memory'])}。\n\n"
+        )
 
 
 def start_job_memory_monitor(job_state):
@@ -3731,6 +3730,14 @@ def scan_inp_names_in_dir(work_dir):
     )
 
 
+def format_joblist_names_for_history(names):
+    """Format all queue job names for the monitor history."""
+    return "\n".join(
+        f"{index}. {name}"
+        for index, name in enumerate(names, start=1)
+    )
+
+
 def create_joblist_from_dir():
     """选择文件夹，扫描 INP 并生成新的 joblist.json。"""
     work_dir = filedialog.askdirectory(title="选择包含 INP 文件的文件夹")
@@ -3774,7 +3781,8 @@ def create_joblist_from_dir():
         f"已生成队列文件：{joblist_path}\n"
         f"队列 INP 数量：{len(inp_names)}\n"
         f"Restart INP 数量：{len(restart_names)}\n"
-        f"{', '.join(inp_names[:8])}{' ...' if len(inp_names) > 8 else ''}\n\n"
+        "本次计算 Job：\n"
+        f"{format_joblist_names_for_history(inp_names)}\n\n"
     )
     update_joblist_status_label()
     update_joblist_button_mode()
@@ -3859,7 +3867,8 @@ def append_joblist_from_dir():
     append_history_text(
         f"已追加队列作业：{len(new_names)} 个\n"
         f"Restart INP 数量：{len(restart_names)}\n"
-        f"{', '.join(new_names[:8])}{' ...' if len(new_names) > 8 else ''}\n\n"
+        "本次追加 Job：\n"
+        f"{format_joblist_names_for_history(new_names)}\n\n"
     )
     update_joblist_status_label()
     update_joblist_button_mode()
@@ -5108,7 +5117,7 @@ history_inner.columnconfigure(0, weight=1)
 
 ttk.Label(
     history_inner,
-    text="提交记录",
+    text="运行监控",
     style="Normal.TLabel"
 ).grid(row=0, column=0, sticky="w", pady=(0, 8))
 

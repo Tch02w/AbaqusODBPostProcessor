@@ -1467,6 +1467,17 @@ def set_job_status(job_state, text):
             job_state["visible_status_text"] = visible_text
 
 
+def refresh_job_selector_for_job(job_state):
+    """Refresh selector colors when a running job state changes."""
+    tab_frame = job_state.get("tab_frame")
+    record = job_tab_records.get(tab_frame)
+    if record is None:
+        return
+
+    if not record.get("status"):
+        update_job_selector_values()
+
+
 def ask_overwrite_existing_job(job_state):
     """由 Abaqus 提示触发，询问是否覆盖旧作业结果。"""
     return messagebox.askyesno(
@@ -1759,6 +1770,8 @@ def create_job_log_tab(job_state):
     job_state["terminate_btn"] = terminate_btn
     job_state["sta_header_label"] = sta_header_label
     job_state["tab_frame"] = tab_frame
+    if tab_frame in job_tab_records:
+        job_tab_records[tab_frame]["job_state"] = job_state
 
     return log_widget
 
@@ -1804,6 +1817,7 @@ def add_job_tab_button(tab_frame, title):
     job_tab_records[tab_frame] = {
         "title": title,
         "status": "",
+        "job_state": None,
     }
     update_job_selector_values()
     select_job_tab(tab_frame)
@@ -1845,9 +1859,11 @@ def update_job_selector_values():
     done_count = 0
     failed_count = 0
     for record in records:
-        status = record.get("status", "")
+        status = get_job_selector_record_status(record)
         if status in ("完成", "Datacheck Completed"):
             done_count += 1
+        elif status == "Paused":
+            running_count += 1
         elif status:
             failed_count += 1
         else:
@@ -1886,21 +1902,10 @@ def update_selected_job_selector_style():
     selected_status = ""
     for record in job_tab_records.values():
         if record.get("title") == selected_title:
-            selected_status = record.get("status", "")
+            selected_status = get_job_selector_record_status(record)
             break
 
-    if selected_status in ("完成", "Datacheck Completed"):
-        fg_color = "#dcfce7"
-        hover_color = "#bbf7d0"
-        text_color = "#166534"
-    elif selected_status:
-        fg_color = "#fee2e2"
-        hover_color = "#fecaca"
-        text_color = "#991b1b"
-    else:
-        fg_color = BTN_LIGHT_FG
-        hover_color = BTN_LIGHT_HOVER
-        text_color = BTN_LIGHT_TEXT
+    _, fg_color, text_color, hover_color = get_job_selector_status_info(selected_status)
 
     try:
         job_selector.configure(
@@ -1918,9 +1923,29 @@ def get_job_selector_status_info(status):
         return "Completed", "#dcfce7", "#166534", "#bbf7d0"
 
     if status:
+        if status == "Paused":
+            return "Paused", "#fef3c7", "#92400e", "#fde68a"
+
+        if status == "Terminated":
+            return "Terminated", "#fee2e2", "#991b1b", "#fecaca"
+
         return "Failed", "#fee2e2", "#991b1b", "#fecaca"
 
     return "Running", BTN_LIGHT_FG, BTN_LIGHT_TEXT, BTN_LIGHT_HOVER
+
+
+def get_job_selector_record_status(record):
+    """Return final or transient status for one selector record."""
+    if record.get("status"):
+        if record["status"] == "终止":
+            return "Terminated"
+        return record["status"]
+
+    job_state = record.get("job_state")
+    if job_state is not None and job_state.get("suspended"):
+        return "Paused"
+
+    return ""
 
 
 def select_job_from_popup(tab_frame):
@@ -1965,7 +1990,7 @@ def show_job_selector_popup():
     popup_font = (FONT_FAMILY, 11)
     for tab_frame, record in list(job_tab_records.items()):
         status_text, bg_color, text_color, hover_color = get_job_selector_status_info(
-            record.get("status", "")
+            get_job_selector_record_status(record)
         )
         row = tk.Frame(container, bg=bg_color, width=row_width, height=28)
         row.pack(fill="x", pady=(0, 1))
@@ -2214,6 +2239,9 @@ def notify_job_finished(job_state, status, detail):
 
 def format_final_status_for_display(status, detail=""):
     """格式化顶部状态栏的最终显示文本。"""
+    if status == "终止" and detail and "手动终止" in detail:
+        return "Terminated"
+
     display_map = {
         "完成": "计算完成",
         "失败": "计算失败",
@@ -2323,6 +2351,7 @@ def toggle_job_suspend(job_state):
         )
 
         set_job_status(job_state, format_progress_status(job_state, "Running"))
+        refresh_job_selector_for_job(job_state)
 
     else:
         # 当前正在运行，点击后发送 suspend，按钮变为绿色“继续”
@@ -2337,6 +2366,7 @@ def toggle_job_suspend(job_state):
         )
 
         set_job_status(job_state, format_progress_status(job_state, "Suspended"))
+        refresh_job_selector_for_job(job_state)
 
 
 def terminate_job(job_state):

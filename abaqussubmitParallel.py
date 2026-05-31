@@ -3167,8 +3167,9 @@ def get_queue_inp_name_for_oldjob_path(oldjob_path):
         return ""
 
     oldjob_inp_name = get_oldjob_name_from_path(oldjob_path) + ".inp"
-    if oldjob_inp_name in joblist_state.get("jobs", []):
-        return oldjob_inp_name
+    for item in joblist_state.get("jobs", []):
+        if os.path.basename(get_joblist_item_path(item)).lower() == oldjob_inp_name.lower():
+            return item
 
     return ""
 
@@ -3829,11 +3830,10 @@ def apply_joblist_max_parallel_change(event=None):
 
 def refresh_joblist_restart_jobs():
     """Rescan the queue before submission so restart detection is never stale."""
-    work_dir = joblist_state.get("work_dir", "")
     restart_names = []
 
     for name in joblist_state.get("jobs", []):
-        inp_file = os.path.join(work_dir, name)
+        inp_file = get_joblist_item_path(name)
         if os.path.isfile(inp_file) and inp_has_restart_keyword(inp_file):
             restart_names.append(name)
 
@@ -3841,12 +3841,138 @@ def refresh_joblist_restart_jobs():
     return restart_names
 
 
+def normalize_joblist_path(path):
+    """Return a stable absolute path for queue file comparisons."""
+    return os.path.normpath(os.path.abspath(path))
+
+
+def normalize_joblist_compare_path(path):
+    """Return a case-normalized absolute path for duplicate detection."""
+    return os.path.normcase(normalize_joblist_path(path))
+
+
+def get_joblist_item_path(item):
+    """Return the real INP path for either a queue file name or an absolute path."""
+    if os.path.isabs(item):
+        return normalize_joblist_path(item)
+
+    work_dir = joblist_state.get("work_dir", "")
+    return normalize_joblist_path(os.path.join(work_dir, item))
+
+
+def get_joblist_item_display(item):
+    """Return a queue item label that preserves the path when it matters."""
+    if os.path.isabs(item):
+        path = get_joblist_item_path(item)
+        return f"{os.path.basename(path)} | {path}"
+
+    return item
+
+
+def get_common_joblist_dir(paths):
+    """Return a directory suitable for saving joblist.json for selected INP files."""
+    directories = [os.path.dirname(normalize_joblist_path(path)) for path in paths]
+    if not directories:
+        return ""
+
+    try:
+        return os.path.commonpath(directories)
+    except ValueError:
+        return directories[0]
+
+
+def get_joblist_items_from_dir(work_dir, absolute=False):
+    """Return queue items scanned from a directory."""
+    inp_names = scan_inp_names_in_dir(work_dir)
+    if absolute:
+        return [normalize_joblist_path(os.path.join(work_dir, name)) for name in inp_names]
+
+    return inp_names
+
+
+def get_joblist_items_from_selection():
+    """Ask whether the queue should be built from INP files or from a directory."""
+    choice = messagebox.askyesnocancel(
+        "选择队列来源",
+        "选择“是”：选择一个或多个 INP 文件\n"
+        "选择“否”：选择文件夹并扫描其中的 INP 文件\n"
+        "选择“取消”：取消"
+    )
+    if choice is None:
+        return None
+
+    if choice:
+        file_paths = filedialog.askopenfilenames(
+            title="选择一个或多个 INP 文件",
+            filetypes=[
+                ("Abaqus INP 文件", "*.inp"),
+                ("所有文件", "*.*"),
+            ]
+        )
+        if not file_paths:
+            return None
+
+        inp_paths = [
+            normalize_joblist_path(path)
+            for path in file_paths
+            if os.path.isfile(path) and os.path.splitext(path)[1].lower() == ".inp"
+        ]
+        if not inp_paths:
+            messagebox.showwarning("未选择 INP", "请选择 .inp 后缀的 Abaqus 输入文件。")
+            return None
+
+        return {
+            "work_dir": get_common_joblist_dir(inp_paths),
+            "items": inp_paths,
+            "source": "files",
+        }
+
+    work_dir = filedialog.askdirectory(title="选择包含 INP 文件的文件夹")
+    if not work_dir:
+        return None
+
+    work_dir = normalize_joblist_path(work_dir)
+    inp_names = get_joblist_items_from_dir(work_dir, absolute=True)
+    if not inp_names:
+        messagebox.showwarning("未找到 INP", "该文件夹下没有 .inp 文件。")
+        return None
+
+    return {
+        "work_dir": work_dir,
+        "items": inp_names,
+        "source": "directory",
+    }
+
+
+def map_restart_oldjobs_to_queue_items(restart_items, restart_mapping):
+    """Convert basename-keyed restart mapping to the queue's item keys."""
+    mapped = {}
+    for item in restart_items:
+        basename = os.path.basename(get_joblist_item_path(item))
+        oldjob_path = restart_mapping.get(basename)
+        if oldjob_path:
+            mapped[item] = oldjob_path
+
+    return mapped
+
+
 def save_joblist_file(work_dir, inp_names):
-    """保存只包含 INP 文件名的 joblist.json。"""
+    """Save joblist.json with full INP paths when available."""
     path = os.path.join(work_dir, JOBLIST_FILENAME)
+    has_absolute_items = any(os.path.isabs(item) for item in inp_names)
+    if has_absolute_items:
+        payload = [
+            {
+                "name": os.path.basename(get_joblist_item_path(item)),
+                "path": get_joblist_item_path(item),
+            }
+            for item in inp_names
+        ]
+    else:
+        payload = inp_names
 
     with open(path, "w", encoding="utf-8") as file:
-        json.dump(inp_names, file, ensure_ascii=False, indent=2)
+        json.dump(payload, file, ensure_ascii=False, indent=2)
 
     return path
 
@@ -3863,7 +3989,7 @@ def scan_inp_names_in_dir(work_dir):
 def format_joblist_names_for_history(names):
     """Format all queue job names for the monitor history."""
     return "\n".join(
-        f"{index}. {name}"
+        f"{index}. {get_joblist_item_display(name)}"
         for index, name in enumerate(names, start=1)
     )
 
@@ -4005,12 +4131,154 @@ def append_joblist_from_dir():
     root.after(100, dispatch_joblist)
 
 
+def create_joblist_from_source():
+    """Create a new queue from selected INP files or a scanned directory."""
+    selection = get_joblist_items_from_selection()
+    if not selection:
+        return
+
+    work_dir = selection["work_dir"]
+    inp_names = selection["items"]
+
+    try:
+        joblist_path = save_joblist_file(work_dir, inp_names)
+    except OSError as e:
+        messagebox.showerror("保存失败", f"无法保存 joblist.json：\n{e}")
+        return
+
+    restart_names = [
+        name for name in inp_names
+        if inp_has_restart_keyword(
+            name if os.path.isabs(name) else os.path.join(work_dir, name)
+        )
+    ]
+
+    joblist_state.update(
+        {
+            "active": False,
+            "work_dir": work_dir,
+            "jobs": inp_names,
+            "statuses": {name: "等待" for name in inp_names},
+            "running": set(),
+            "joblist_path": joblist_path,
+            "max_parallel": 1,
+            "restart_jobs": restart_names,
+            "oldjob_paths": {},
+            "dependencies": {},
+            "existing_odb_action": "",
+        }
+    )
+
+    append_history_text(
+        f"已生成队列文件：{joblist_path}\n"
+        f"队列 INP 数量：{len(inp_names)}\n"
+        f"Restart INP 数量：{len(restart_names)}\n"
+        "本次计算 Job：\n"
+        f"{format_joblist_names_for_history(inp_names)}\n\n"
+    )
+    update_joblist_status_label()
+    update_joblist_button_mode()
+
+
+def append_joblist_from_source():
+    """Append selected INP files or scanned directory jobs to the active queue."""
+    base_dir = joblist_state.get("work_dir", "")
+    if not base_dir:
+        create_joblist_from_source()
+        return
+
+    selection = get_joblist_items_from_selection()
+    if not selection:
+        return
+
+    work_dir = selection["work_dir"]
+    inp_names = selection["items"]
+    same_base_dir = (
+        os.path.normcase(os.path.abspath(work_dir))
+        == os.path.normcase(os.path.abspath(base_dir))
+    )
+    if selection["source"] == "directory" and not same_base_dir:
+        inp_names = get_joblist_items_from_dir(work_dir, absolute=True)
+
+    existing_paths = {
+        normalize_joblist_compare_path(get_joblist_item_path(name))
+        for name in joblist_state.get("jobs", [])
+    }
+    new_names = [
+        name for name in inp_names
+        if normalize_joblist_compare_path(get_joblist_item_path(name)) not in existing_paths
+    ]
+
+    if not new_names:
+        messagebox.showinfo("没有新作业", "没有可追加的新 INP 文件。")
+        return
+
+    restart_names = [
+        name for name in new_names
+        if inp_has_restart_keyword(get_joblist_item_path(name))
+    ]
+    restart_mapping = {}
+    if restart_names:
+        restart_files = [get_joblist_item_path(name) for name in restart_names]
+        raw_restart_mapping = collect_restart_oldjob_paths(restart_files)
+        if raw_restart_mapping is None:
+            messagebox.showinfo("已取消", "已取消追加队列，未加入新作业。")
+            return
+        restart_mapping = map_restart_oldjobs_to_queue_items(
+            restart_names,
+            raw_restart_mapping
+        )
+
+    previous_jobs = list(joblist_state.get("jobs", []))
+    previous_statuses = dict(joblist_state.get("statuses", {}))
+    previous_restart_jobs = list(joblist_state.get("restart_jobs", []))
+    previous_oldjob_paths = dict(joblist_state.get("oldjob_paths", {}))
+    previous_dependencies = dict(joblist_state.get("dependencies", {}))
+
+    joblist_state["jobs"].extend(new_names)
+    for name in new_names:
+        joblist_state["statuses"][name] = "等待"
+    joblist_state["restart_jobs"] = previous_restart_jobs + restart_names
+    joblist_state["oldjob_paths"].update(restart_mapping)
+
+    if not ensure_joblist_restart_oldjobs(force_prompt=False, confirm=False):
+        joblist_state["jobs"] = previous_jobs
+        joblist_state["statuses"] = previous_statuses
+        joblist_state["restart_jobs"] = previous_restart_jobs
+        joblist_state["oldjob_paths"] = previous_oldjob_paths
+        joblist_state["dependencies"] = previous_dependencies
+        messagebox.showinfo("已取消", "追加队列未生效，当前运行队列保持不变。")
+        return
+
+    try:
+        joblist_state["joblist_path"] = save_joblist_file(base_dir, joblist_state["jobs"])
+    except OSError as e:
+        joblist_state["jobs"] = previous_jobs
+        joblist_state["statuses"] = previous_statuses
+        joblist_state["restart_jobs"] = previous_restart_jobs
+        joblist_state["oldjob_paths"] = previous_oldjob_paths
+        joblist_state["dependencies"] = previous_dependencies
+        messagebox.showerror("保存失败", f"无法更新 joblist.json：\n{e}")
+        return
+
+    joblist_state["active"] = True
+    append_history_text(
+        f"已追加队列作业：{len(new_names)} 个\n"
+        f"Restart INP 数量：{len(restart_names)}\n"
+        "本次追加 Job：\n"
+        f"{format_joblist_names_for_history(new_names)}\n\n"
+    )
+    update_joblist_status_label()
+    update_joblist_button_mode()
+    root.after(100, dispatch_joblist)
+
+
 def select_joblist_dir():
     """Create a new queue before submission, or append to an already submitted queue."""
     if is_joblist_submitted():
-        append_joblist_from_dir()
+        append_joblist_from_source()
     else:
-        create_joblist_from_dir()
+        create_joblist_from_source()
 
 
 def get_joblist_submit_settings():
@@ -4064,11 +4332,15 @@ def ensure_joblist_restart_oldjobs(force_prompt=False, confirm=True):
                 joblist_state["statuses"][name] = "等待"
 
         restart_files = [
-            os.path.join(joblist_state["work_dir"], name)
+            get_joblist_item_path(name)
             for name in restart_names
         ]
-        oldjob_paths = collect_restart_oldjob_paths(restart_files)
-        if oldjob_paths is None:
+        raw_oldjob_paths = collect_restart_oldjob_paths(restart_files)
+        oldjob_paths = map_restart_oldjobs_to_queue_items(
+            restart_names,
+            raw_oldjob_paths or {}
+        )
+        if raw_oldjob_paths is None:
             messagebox.showinfo("已取消", "已取消队列提交。")
             return False
 
@@ -4079,7 +4351,7 @@ def ensure_joblist_restart_oldjobs(force_prompt=False, confirm=True):
     invalid_oldjobs = []
     for inp_name, oldjob_path in oldjob_paths.items():
         oldjob_name = get_oldjob_name_from_path(oldjob_path)
-        current_job_name = os.path.splitext(inp_name)[0]
+        current_job_name = os.path.splitext(os.path.basename(get_joblist_item_path(inp_name)))[0]
 
         if os.path.splitext(oldjob_path)[1].lower() != ".odb":
             invalid_oldjobs.append(f"{inp_name} -> 不是 ODB 文件：{oldjob_path}")
@@ -4287,14 +4559,15 @@ def dispatch_joblist():
         if not next_name:
             break
 
-        inp_file = os.path.join(joblist_state["work_dir"], next_name)
+        inp_file = get_joblist_item_path(next_name)
         joblist_state["statuses"][next_name] = "提交中"
         update_joblist_status_label()
 
         submitted_job = submit_job(
             inp_file_override=inp_file,
             queue_mode=True,
-            oldjob_path_override=joblist_state["oldjob_paths"].get(next_name, "")
+            oldjob_path_override=joblist_state["oldjob_paths"].get(next_name, ""),
+            queue_job_key_override=next_name
         )
         if submitted_job:
             joblist_state["running"].add(next_name)
@@ -4377,7 +4650,7 @@ def stop_joblist_queue(source_job_state=None):
     update_joblist_button_mode()
 
 
-def submit_job(inp_file_override="", queue_mode=False, oldjob_path_override=""):
+def submit_job(inp_file_override="", queue_mode=False, oldjob_path_override="", queue_job_key_override=""):
     """提交 Abaqus 作业"""
     inp_file = inp_file_override or inp_file_var.get().strip()
     cpus_text = cpus_var.get().strip()
@@ -4611,7 +4884,7 @@ def submit_job(inp_file_override="", queue_mode=False, oldjob_path_override=""):
         "memory_argument": memory_argument,
         "datacheck_mode": datacheck_mode,
         "from_joblist": queue_mode,
-        "joblist_inp_name": os.path.basename(inp_file) if queue_mode else "",
+        "joblist_inp_name": queue_job_key_override if queue_mode else "",
         "overwrite_existing": True if odb_action == "overwrite" else False,
         "odb_action": odb_action,
         "backup_odb_path": backup_odb_path,

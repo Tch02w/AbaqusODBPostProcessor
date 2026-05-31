@@ -3901,57 +3901,246 @@ def get_joblist_items_from_dir(work_dir, absolute=False):
     return inp_names
 
 
-def get_joblist_items_from_selection():
-    """Ask whether the queue should be built from INP files or from a directory."""
-    choice = messagebox.askyesnocancel(
-        "选择队列来源",
-        "选择“是”：选择一个或多个 INP 文件\n"
-        "选择“否”：选择文件夹并扫描其中的 INP 文件\n"
-        "选择“取消”：取消"
+def get_initial_joblist_browse_dir():
+    """Return the best starting directory for queue source browsing."""
+    candidates = [
+        joblist_state.get("work_dir", ""),
+        os.path.dirname(inp_file_var.get().strip()) if "inp_file_var" in globals() else "",
+        os.getcwd(),
+    ]
+    for path in candidates:
+        if path and os.path.isdir(path):
+            return normalize_joblist_path(path)
+
+    return normalize_joblist_path(os.getcwd())
+
+
+def list_joblist_browser_entries(current_dir):
+    """Return browsable folders and INP files for the custom queue picker."""
+    entries = []
+    try:
+        names = sorted(os.listdir(current_dir), key=lambda item: item.lower())
+    except OSError:
+        return entries
+
+    parent = os.path.dirname(current_dir)
+    if parent and parent != current_dir:
+        entries.append({
+            "label": "[..] 上一级",
+            "path": parent,
+            "kind": "parent",
+        })
+
+    for name in names:
+        path = os.path.join(current_dir, name)
+        if os.path.isdir(path):
+            entries.append({
+                "label": f"[文件夹] {name}",
+                "path": path,
+                "kind": "directory",
+            })
+
+    for name in names:
+        path = os.path.join(current_dir, name)
+        if os.path.isfile(path) and name.lower().endswith(".inp"):
+            entries.append({
+                "label": f"[INP] {name}",
+                "path": path,
+                "kind": "file",
+            })
+
+    return entries
+
+
+def ask_joblist_source_paths():
+    """Pick INP files or folders from one lightweight browser window."""
+    dialog = tk.Toplevel(root)
+    dialog.title("选择队列来源")
+    dialog.transient(root)
+    dialog.grab_set()
+    dialog.configure(bg="#ffffff")
+    dialog.resizable(True, True)
+
+    result = {"paths": None}
+    current_dir_var = tk.StringVar(value=get_initial_joblist_browse_dir())
+    entries = []
+
+    main = tk.Frame(dialog, bg="#ffffff")
+    main.pack(fill="both", expand=True, padx=12, pady=12)
+    main.rowconfigure(1, weight=1)
+    main.columnconfigure(0, weight=1)
+
+    path_label = tk.Label(
+        main,
+        textvariable=current_dir_var,
+        bg="#ffffff",
+        fg="#475569",
+        anchor="w",
+        font=FONT_HINT
     )
-    if choice is None:
-        return None
+    path_label.grid(row=0, column=0, sticky="ew", pady=(0, 8))
 
-    if choice:
-        file_paths = filedialog.askopenfilenames(
-            title="选择一个或多个 INP 文件",
-            filetypes=[
-                ("Abaqus INP 文件", "*.inp"),
-                ("所有文件", "*.*"),
-            ]
-        )
-        if not file_paths:
-            return None
+    list_frame = tk.Frame(main, bg="#ffffff")
+    list_frame.grid(row=1, column=0, sticky="nsew")
+    list_frame.rowconfigure(0, weight=1)
+    list_frame.columnconfigure(0, weight=1)
 
-        inp_paths = [
-            normalize_joblist_path(path)
-            for path in file_paths
-            if os.path.isfile(path) and os.path.splitext(path)[1].lower() == ".inp"
+    listbox = tk.Listbox(
+        list_frame,
+        selectmode=tk.EXTENDED,
+        activestyle="none",
+        exportselection=False,
+        font=(FONT_FAMILY, 10),
+        height=16
+    )
+    listbox.grid(row=0, column=0, sticky="nsew")
+
+    scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+    scrollbar.grid(row=0, column=1, sticky="ns")
+    listbox.configure(yscrollcommand=scrollbar.set)
+
+    def refresh_entries(target_dir=None):
+        nonlocal entries
+        if target_dir:
+            current_dir_var.set(normalize_joblist_path(target_dir))
+
+        entries = list_joblist_browser_entries(current_dir_var.get())
+        listbox.delete(0, tk.END)
+        for entry in entries:
+            listbox.insert(tk.END, entry["label"])
+
+    def selected_entries():
+        return [
+            entries[index]
+            for index in listbox.curselection()
+            if 0 <= index < len(entries)
         ]
-        if not inp_paths:
-            messagebox.showwarning("未选择 INP", "请选择 .inp 后缀的 Abaqus 输入文件。")
-            return None
 
-        return {
-            "work_dir": get_common_joblist_dir(inp_paths),
-            "items": inp_paths,
-            "source": "files",
-        }
+    def enter_selected_directory(_event=None):
+        selected = selected_entries()
+        if len(selected) != 1:
+            return
 
-    work_dir = filedialog.askdirectory(title="选择包含 INP 文件的文件夹")
-    if not work_dir:
+        entry = selected[0]
+        if entry["kind"] in ("directory", "parent"):
+            refresh_entries(entry["path"])
+
+    def choose_current_folder():
+        result["paths"] = [current_dir_var.get()]
+        dialog.destroy()
+
+    def confirm_selection():
+        selected = selected_entries()
+        paths = [
+            normalize_joblist_path(entry["path"])
+            for entry in selected
+            if entry["kind"] in ("directory", "file")
+        ]
+        if not paths:
+            messagebox.showwarning("未选择", "请选择一个文件夹或一个/多个 INP 文件。", parent=dialog)
+            return
+
+        result["paths"] = paths
+        dialog.destroy()
+
+    def cancel_selection():
+        result["paths"] = None
+        dialog.destroy()
+
+    listbox.bind("<Double-Button-1>", enter_selected_directory)
+    listbox.bind("<Return>", lambda _event: confirm_selection())
+
+    button_row = tk.Frame(main, bg="#ffffff")
+    button_row.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+
+    ctk.CTkButton(
+        button_row,
+        text="选择当前文件夹",
+        width=120,
+        height=30,
+        corner_radius=7,
+        font=FONT_BUTTON,
+        fg_color=BTN_LIGHT_FG,
+        hover_color=BTN_LIGHT_HOVER,
+        text_color=BTN_LIGHT_TEXT,
+        command=choose_current_folder
+    ).pack(side="left", padx=(0, 8))
+
+    ctk.CTkButton(
+        button_row,
+        text="确认选择",
+        width=120,
+        height=30,
+        corner_radius=7,
+        font=FONT_BUTTON,
+        fg_color="#2563eb",
+        hover_color="#1d4ed8",
+        text_color="#ffffff",
+        command=confirm_selection
+    ).pack(side="left", padx=(0, 8))
+
+    ctk.CTkButton(
+        button_row,
+        text="取消",
+        width=84,
+        height=30,
+        corner_radius=7,
+        font=FONT_BUTTON,
+        fg_color="#e5e7eb",
+        hover_color="#d1d5db",
+        text_color="#111827",
+        command=cancel_selection
+    ).pack(side="right")
+
+    dialog.protocol("WM_DELETE_WINDOW", cancel_selection)
+    refresh_entries()
+
+    dialog.update_idletasks()
+    width = max(520, dialog.winfo_reqwidth())
+    height = max(440, dialog.winfo_reqheight())
+    root.update_idletasks()
+    x = root.winfo_x() + (root.winfo_width() - width) // 2
+    y = root.winfo_y() + (root.winfo_height() - height) // 2
+    dialog.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
+    listbox.focus_set()
+
+    root.wait_window(dialog)
+    return result["paths"]
+
+
+def get_joblist_items_from_selection():
+    """Build a queue from selected INP files or selected folders."""
+    selected_paths = ask_joblist_source_paths()
+    if not selected_paths:
         return None
 
-    work_dir = normalize_joblist_path(work_dir)
-    inp_names = get_joblist_items_from_dir(work_dir, absolute=True)
+    inp_names = []
+    source = "files"
+    for path in selected_paths:
+        if os.path.isdir(path):
+            source = "directory"
+            inp_names.extend(get_joblist_items_from_dir(path, absolute=True))
+        elif os.path.isfile(path) and os.path.splitext(path)[1].lower() == ".inp":
+            inp_names.append(normalize_joblist_path(path))
+
+    seen_paths = set()
+    unique_inp_names = []
+    for path in inp_names:
+        compare_path = normalize_joblist_compare_path(path)
+        if compare_path in seen_paths:
+            continue
+        seen_paths.add(compare_path)
+        unique_inp_names.append(path)
+
+    inp_names = unique_inp_names
     if not inp_names:
-        messagebox.showwarning("未找到 INP", "该文件夹下没有 .inp 文件。")
+        messagebox.showwarning("未找到 INP", "所选内容中没有可加入队列的 .inp 文件。")
         return None
 
     return {
-        "work_dir": work_dir,
+        "work_dir": get_common_joblist_dir(inp_names),
         "items": inp_names,
-        "source": "directory",
+        "source": source,
     }
 
 
@@ -4204,12 +4393,6 @@ def append_joblist_from_source():
 
     work_dir = selection["work_dir"]
     inp_names = selection["items"]
-    same_base_dir = (
-        os.path.normcase(os.path.abspath(work_dir))
-        == os.path.normcase(os.path.abspath(base_dir))
-    )
-    if selection["source"] == "directory" and not same_base_dir:
-        inp_names = get_joblist_items_from_dir(work_dir, absolute=True)
 
     existing_paths = {
         normalize_joblist_compare_path(get_joblist_item_path(name))

@@ -6,10 +6,13 @@ import re
 import subprocess
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
+from uuid import uuid4
 
 import customtkinter as ctk
 
@@ -88,8 +91,10 @@ LEFT_PANEL_WIDTH = 416
 LOG_SEPARATOR_WIDTH = 64
 LOG_TEXT_WIDTH = LOG_SEPARATOR_WIDTH
 LOG_TEXT_PIXEL_WIDTH = 488
+LOG_SCROLLBAR_WIDTH = 12
+LOG_VIEW_PIXEL_WIDTH = LOG_TEXT_PIXEL_WIDTH + LOG_SCROLLBAR_WIDTH
 RIGHT_PANEL_HORIZONTAL_PADDING = 0
-RIGHT_PANEL_MIN_WIDTH = LOG_TEXT_PIXEL_WIDTH + RIGHT_PANEL_HORIZONTAL_PADDING
+RIGHT_PANEL_MIN_WIDTH = LOG_VIEW_PIXEL_WIDTH + RIGHT_PANEL_HORIZONTAL_PADDING
 UNLIMITED_JOB_SLOTS = 10 ** 9
 WINDOW_HORIZONTAL_PADDING = 24
 WINDOW_VERTICAL_PADDING = 24
@@ -190,6 +195,10 @@ FONT_MEMORY_MENU = (FONT_FAMILY, 11)
 FONT_BUTTON = (FONT_FAMILY, 12)
 FONT_BUTTON_BOLD = (FONT_FAMILY, 13, "bold")
 FONT_LOG = ("Consolas", 10)
+FONT_JOB_SELECTOR = ("Consolas", 11)
+FONT_QUEUE_BUTTON = (FONT_FAMILY, 13)
+FONT_QUEUE_TABLE = (FONT_FAMILY, 10)
+FONT_QUEUE_HEADING = (FONT_FAMILY, 10)
 
 APP_BG = "#ffffff"
 CARD_BG = "#ffffff"
@@ -206,10 +215,66 @@ BTN_RESUME_HOVER = "#16a34a"
 BTN_STATUS_TEXT_DARK = "#111827"
 BTN_STATUS_TEXT_LIGHT = "#ffffff"
 
+STATUS_PENDING_CONFIRM = "待确认"
+STATUS_PENDING_RUN = "待运行"
+STATUS_STARTING = "正在启动"
+STATUS_RUNNING = "运行中"
+STATUS_COMPLETED = "已完成"
+STATUS_FAILED = "运行失败"
+STATUS_CANCELED = "已取消"
+STATUS_TERMINATING = "正在终止"
+STATUS_TERMINATED = "已终止"
+STATUS_WAITING_DEPENDENCY = "等待前置"
+
+TERMINAL_QUEUE_STATUSES = {
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_CANCELED,
+    STATUS_TERMINATED,
+    "Datacheck Completed",
+    "Datacheck Failed",
+}
+
+
+@dataclass
+class QueueItem:
+    item_id: str = field(default_factory=lambda: uuid4().hex)
+    inp_path: str = ""
+    job_name: str = ""
+    source: str = ""
+    status: str = STATUS_PENDING_CONFIRM
+    selected: bool = True
+    valid: bool = True
+    message: str = "可加入"
+    run_mode: str = "normal"
+    oldjob_name: str = ""
+    oldjob_dir: str = ""
+    oldjob_path: str = ""
+    fortran_path: str = ""
+    cores: int = 1
+    memory: str = ""
+    interactive: bool = False
+    datacheck_only: bool = False
+    complete_notify: bool = False
+    active_job_key: str = ""
+    elapsed: str = ""
+
+
 log_tab_counter = 0
 right_panel_visible = False
 active_jobs = {}
 diagnostic_file_cache = {}
+queue_lock = threading.Lock()
+queue_candidates = []
+queue_items = []
+queue_manager_window = None
+queue_candidate_tree = None
+queue_formal_tree = None
+queue_candidate_summary_var = None
+queue_formal_summary_var = None
+queue_scan_subdirs_var = None
+queue_skip_restart_var = None
+queue_skip_existing_var = None
 joblist_state = {
     "active": False,
     "work_dir": "",
@@ -226,6 +291,8 @@ joblist_state = {
 job_tab_records = {}
 job_selector_var = None
 job_selector = None
+job_selector_name_label = None
+job_selector_arrow_label = None
 job_selector_popup = None
 job_stats_var = None
 abaqus_memory_cache = {
@@ -1637,10 +1704,11 @@ def create_job_log_tab(job_state):
     content_frame.grid(row=0, column=0, sticky="nsw")
     content_frame.rowconfigure(3, weight=1)
     content_frame.columnconfigure(0, weight=0)
+    content_frame.columnconfigure(1, minsize=LOG_SCROLLBAR_WIDTH, weight=0)
     content_frame.grid_propagate(False)
 
     toolbar = ttk.Frame(content_frame, style="Card.TFrame")
-    toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+    toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
 
     toolbar_info = ttk.Frame(toolbar, style="Card.TFrame")
     toolbar_info.grid(row=0, column=0, sticky="ew")
@@ -1692,6 +1760,14 @@ def create_job_log_tab(job_state):
         pady=8
     )
     log_widget.grid(row=3, column=0, sticky="ns")
+    log_scrollbar = ttk.Scrollbar(
+        content_frame,
+        orient="vertical",
+        command=log_widget.yview,
+        style="Queue.Vertical.TScrollbar",
+    )
+    log_scrollbar.grid(row=3, column=1, sticky="ns")
+    log_widget.configure(yscrollcommand=log_scrollbar.set)
     log_widget.job_tab_frame = tab_frame
     log_widget.job_tab_closed = False
     log_widget.job_state = job_state
@@ -1703,7 +1779,7 @@ def create_job_log_tab(job_state):
     )
 
     filebar = ttk.Frame(content_frame, style="Card.TFrame")
-    filebar.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+    filebar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
     for control_column in (4, 6, 8):
         filebar.columnconfigure(control_column, weight=1, uniform="job_control_gap")
     for control_column in (5, 7):
@@ -1848,10 +1924,10 @@ def update_job_selector_values():
         job_selector_var.set(values[0])
 
     try:
-        job_selector.configure(
-            text=job_selector_var.get() if job_selector_var is not None else "无作业",
-            state="normal" if records else "disabled",
-        )
+        if job_selector_name_label is not None:
+            job_selector_name_label.configure(
+                text=job_selector_var.get() if job_selector_var is not None else "无作业"
+            )
     except tk.TclError:
         return
 
@@ -1896,14 +1972,19 @@ def make_unique_job_selector_title(base_title):
 def format_job_selector_button_text():
     """Return the compact selector button text with a dropdown indicator."""
     if job_selector_var is None:
-        title = "无作业"
-    else:
-        title = job_selector_var.get() or "无作业"
+        return "无作业"
 
-    return f"{title}  ▼"
+    return job_selector_var.get() or "无作业"
 
 
-def update_selected_job_selector_style():
+def bind_job_selector_click(widget):
+    """Make one part of the custom job selector open the popup."""
+    widget.bind("<Button-1>", lambda _event: show_job_selector_popup())
+    widget.bind("<Enter>", lambda _event: update_selected_job_selector_style(hover=True))
+    widget.bind("<Leave>", lambda _event: update_selected_job_selector_style(hover=False))
+
+
+def update_selected_job_selector_style(hover=False):
     """Tint the selected job selector by the selected job's final status."""
     if job_selector is None or job_selector_var is None:
         return
@@ -1916,14 +1997,23 @@ def update_selected_job_selector_style():
             break
 
     _, fg_color, text_color, hover_color = get_job_selector_status_info(selected_status)
+    display_color = hover_color if hover else fg_color
 
     try:
         job_selector.configure(
-            text=format_job_selector_button_text(),
-            fg_color=fg_color,
-            hover_color=hover_color,
-            text_color=text_color,
+            fg_color=display_color,
         )
+        if job_selector_name_label is not None:
+            job_selector_name_label.configure(
+                text=format_job_selector_button_text(),
+                fg_color=display_color,
+                text_color=text_color,
+            )
+        if job_selector_arrow_label is not None:
+            job_selector_arrow_label.configure(
+                fg_color=display_color,
+                text_color=text_color,
+            )
     except tk.TclError:
         pass
 
@@ -2062,7 +2152,7 @@ def sync_log_notebook_width(log_widget):
     """Keep the notebook border and right panel as wide as the actual log text widget."""
     try:
         log_widget.update_idletasks()
-        log_width = log_widget.winfo_reqwidth()
+        log_width = log_widget.winfo_reqwidth() + LOG_SCROLLBAR_WIDTH
         content_frame = log_widget.master
         content_frame.grid_propagate(False)
         content_frame.configure(width=log_width)
@@ -2085,6 +2175,8 @@ def ensure_right_panel_ui():
     global log_notebook
     global job_selector_var
     global job_selector
+    global job_selector_name_label
+    global job_selector_arrow_label
     global job_selector_popup
     global job_stats_var
 
@@ -2125,21 +2217,43 @@ def ensure_right_panel_ui():
 
     job_selector_var = tk.StringVar(value="无作业")
     job_selector_popup = None
-    job_selector = ctk.CTkButton(
+    job_selector = ctk.CTkFrame(
         selector_row,
-        text=format_job_selector_button_text(),
         width=220,
         height=30,
         corner_radius=7,
         fg_color=BTN_LIGHT_FG,
-        hover_color=BTN_LIGHT_HOVER,
-        text_color=BTN_LIGHT_TEXT,
-        font=FONT_HINT,
-        anchor="center",
-        state="disabled",
-        command=show_job_selector_popup
     )
     job_selector.grid(row=0, column=1, sticky="w")
+    job_selector.grid_propagate(False)
+    job_selector.columnconfigure(0, weight=1)
+    job_selector.columnconfigure(1, weight=0)
+
+    job_selector_name_label = ctk.CTkLabel(
+        job_selector,
+        text=format_job_selector_button_text(),
+        height=30,
+        anchor="w",
+        font=FONT_JOB_SELECTOR,
+        fg_color=BTN_LIGHT_FG,
+        text_color=BTN_LIGHT_TEXT,
+    )
+    job_selector_name_label.grid(row=0, column=0, sticky="nsew", padx=(10, 4))
+
+    job_selector_arrow_label = ctk.CTkLabel(
+        job_selector,
+        text="▼",
+        width=24,
+        height=30,
+        anchor="center",
+        font=FONT_JOB_SELECTOR,
+        fg_color=BTN_LIGHT_FG,
+        text_color=BTN_LIGHT_TEXT,
+    )
+    job_selector_arrow_label.grid(row=0, column=1, sticky="ns", padx=(0, 6))
+
+    for selector_widget in (job_selector, job_selector_name_label, job_selector_arrow_label):
+        bind_job_selector_click(selector_widget)
 
     job_stats_var = tk.StringVar(value="运行中 0 | 完成 0 | 异常 0")
     ttk.Label(
@@ -2309,6 +2423,7 @@ def finalize_job(job_state, status, detail=""):
     set_job_status(job_state, format_final_status_for_display(status, detail))
     append_job_final_history(job_state, status, detail)
     mark_job_tab_final_status(job_state, status)
+    update_queue_item_from_final_job_status(job_state, status, detail)
 
     log_widget = job_state.get("log_widget")
     if log_widget is not None:
@@ -2406,6 +2521,13 @@ def terminate_job(job_state):
             pass
 
     set_job_status(job_state, "Terminating")
+    queue_item_id = job_state.get("queue_item_id") or job_state.get("joblist_inp_name")
+    queue_item = get_queue_item(queue_item_id) if queue_item_id else None
+    if queue_item is not None:
+        queue_item.status = STATUS_TERMINATING
+        queue_item.message = "正在终止"
+        joblist_state["statuses"][queue_item.item_id] = STATUS_TERMINATING
+        refresh_queue_manager_views()
 
 
 def start_sta_monitor(sta_path, process, submitted_at, job_state):
@@ -2996,8 +3118,6 @@ def monitor_sta_file(monitor_state):
 
         if display_text:
             append_log(log_widget, display_text)
-        if not new_text.endswith("\n"):
-            append_log(log_widget, "\n")
 
         progress = parse_sta_progress(new_text)
         if progress:
@@ -3187,7 +3307,7 @@ def get_queue_inp_name_for_oldjob_path(oldjob_path):
 
 def is_completed_queue_status(status):
     """Return whether a queue job ended successfully enough for dependents."""
-    return status in ("完成", "Datacheck Completed")
+    return status in ("完成", "Datacheck Completed", STATUS_COMPLETED)
 
 
 def wait_for_oldjob_odb(oldjob_path, timeout_seconds=10, interval_seconds=2):
@@ -3765,16 +3885,22 @@ def update_joblist_status_label(text=""):
     try:
         if text:
             joblist_status_var.set(text)
-        elif joblist_state["jobs"]:
-            waiting = sum(
-                1 for name in joblist_state["jobs"]
-                if joblist_state["statuses"].get(name) in ("等待", "等待前置")
-            )
-            running = len(joblist_state["running"])
-            done = len(joblist_state["jobs"]) - waiting - running
+        elif queue_candidates or queue_items:
+            candidate_count = len(queue_candidates)
+            pending_count = sum(1 for item in queue_items if item.status == STATUS_PENDING_RUN)
+            dependency_count = sum(1 for item in queue_items if item.status == STATUS_WAITING_DEPENDENCY)
+            running_count = sum(1 for item in queue_items if item.status in (STATUS_STARTING, STATUS_RUNNING, STATUS_TERMINATING))
+            completed_count = sum(1 for item in queue_items if item.status == STATUS_COMPLETED)
+            failed_count = sum(1 for item in queue_items if item.status == STATUS_FAILED)
+            canceled_count = sum(1 for item in queue_items if item.status == STATUS_CANCELED)
+            terminated_count = sum(1 for item in queue_items if item.status == STATUS_TERMINATED)
+            stopped_count = canceled_count + terminated_count
             joblist_status_var.set(
-                f"队列：{len(joblist_state['jobs'])} 个 | 运行 {running} | 等待 {waiting} | 已结束 {done}"
+                f"队列：候选 {candidate_count} | 待运行 {pending_count} | 前置 {dependency_count}\n"
+                f"运行 {running_count} | 完成 {completed_count} | 失败 {failed_count} | 停止 {stopped_count}"
             )
+        elif joblist_state["jobs"]:
+            update_joblist_status_label("队列：已有旧队列数据，请打开管理队列检查")
         else:
             joblist_status_var.set("队列：未生成")
     except NameError:
@@ -3787,10 +3913,10 @@ def is_joblist_submitted():
 
 
 def update_joblist_button_mode():
-    """Switch the queue build button between create and append modes."""
+    """Refresh queue-management button states."""
     try:
         build_joblist_btn.configure(
-            text="追加队列" if is_joblist_submitted() else "生成队列"
+            text="管理队列"
         )
         stop_joblist_btn.configure(
             state="normal" if joblist_state.get("active") else "disabled"
@@ -3862,8 +3988,28 @@ def normalize_joblist_compare_path(path):
     return os.path.normcase(normalize_joblist_path(path))
 
 
+def get_queue_item(item_id):
+    """Return a formal queue item by id."""
+    for queue_item in queue_items:
+        if queue_item.item_id == item_id:
+            return queue_item
+    return None
+
+
+def get_candidate_item(item_id):
+    """Return a candidate queue item by id."""
+    for queue_item in queue_candidates:
+        if queue_item.item_id == item_id:
+            return queue_item
+    return None
+
+
 def get_joblist_item_path(item):
     """Return the real INP path for either a queue file name or an absolute path."""
+    queue_item = get_queue_item(item)
+    if queue_item is not None:
+        return normalize_joblist_path(queue_item.inp_path)
+
     if os.path.isabs(item):
         return normalize_joblist_path(item)
 
@@ -3878,6 +4024,228 @@ def get_joblist_item_display(item):
         return f"{os.path.basename(path)} | {path}"
 
     return item
+
+
+def queue_status_to_legacy(status):
+    """Map formal queue status to the status dictionary used by existing helpers."""
+    return status
+
+
+def current_queue_parameter_snapshot():
+    """Capture the main-window settings for queue items confirmed now."""
+    try:
+        cores = int(cpus_var.get().strip())
+    except (NameError, ValueError):
+        cores = DEFAULT_CPUS
+
+    return {
+        "cores": max(0, min(MAX_CPUS, cores)),
+        "memory": get_memory_argument() if "memory_mode_var" in globals() else "",
+        "fortran_path": for_file_var.get().strip() if "for_file_var" in globals() else "",
+        "interactive": bool(interactive_var.get()) if "interactive_var" in globals() else False,
+        "datacheck_only": bool(datacheck_var.get()) if "datacheck_var" in globals() else False,
+        "complete_notify": bool(complete_notify_var.get()) if "complete_notify_var" in globals() else False,
+    }
+
+
+def get_queue_item_command_settings(queue_item):
+    """Return per-job submit settings saved with a queue item."""
+    return {
+        "cpus_text": str(queue_item.cores),
+        "memory_argument": queue_item.memory,
+        "for_file_path": queue_item.fortran_path,
+        "interactive_mode": queue_item.interactive,
+        "datacheck_mode": queue_item.datacheck_only,
+        "oldjob_path": queue_item.oldjob_path,
+    }
+
+
+def queue_status_from_final_status(status):
+    """Map a finished Abaqus status to the formal queue status vocabulary."""
+    if status in ("完成", "Datacheck Completed"):
+        return STATUS_COMPLETED
+    if status in ("终止", "Terminated"):
+        return STATUS_TERMINATED
+    return STATUS_FAILED
+
+
+def final_status_from_queue_status(status):
+    """Return whether a queue status means a dependency can be released."""
+    return status in (STATUS_COMPLETED, "完成", "Datacheck Completed")
+
+
+def validate_formal_queue_item_before_submit(item):
+    """Validate one formal queue item immediately before it is submitted."""
+    item.valid = True
+    item.message = "等待提交"
+
+    if item.status != STATUS_PENDING_RUN:
+        item.valid = False
+        item.message = f"状态不可提交：{item.status}"
+        return False
+
+    if not item.inp_path or not os.path.isfile(item.inp_path):
+        item.status = STATUS_FAILED
+        item.valid = False
+        item.message = "INP 文件不存在"
+        return False
+
+    if item.fortran_path and not os.path.isfile(item.fortran_path):
+        item.status = STATUS_FAILED
+        item.valid = False
+        item.message = "FOR 文件不存在"
+        return False
+
+    try:
+        cores = int(item.cores)
+    except (TypeError, ValueError):
+        item.status = STATUS_FAILED
+        item.valid = False
+        item.message = "Core 参数无效"
+        return False
+
+    if cores < 0 or cores > MAX_CPUS:
+        item.status = STATUS_FAILED
+        item.valid = False
+        item.message = f"Core 范围应为 0–{MAX_CPUS}"
+        return False
+
+    if item.memory and not validate_memory_argument(item.memory):
+        item.status = STATUS_FAILED
+        item.valid = False
+        item.message = "Mem 参数无效"
+        return False
+
+    detect_queue_item_restart(item)
+    if item.run_mode == "restart":
+        if not item.oldjob_path:
+            item.status = STATUS_FAILED
+            item.valid = False
+            item.message = "未指定重启动依赖"
+            return False
+        if not os.path.isfile(item.oldjob_path):
+            item.status = STATUS_WAITING_DEPENDENCY
+            item.valid = True
+            item.message = "等待前置 ODB"
+            return False
+
+    item.message = "准备提交"
+    return True
+
+
+def sync_joblist_state_from_queue_items():
+    """Synchronize the legacy scheduler state from the formal queue items."""
+    with queue_lock:
+        job_ids = [item.item_id for item in queue_items]
+        joblist_state["jobs"] = job_ids
+        joblist_state["statuses"] = {
+            item.item_id: queue_status_to_legacy(item.status)
+            for item in queue_items
+        }
+        joblist_state["restart_jobs"] = [
+            item.item_id for item in queue_items
+            if item.run_mode == "restart"
+        ]
+        joblist_state["oldjob_paths"] = {
+            item.item_id: item.oldjob_path
+            for item in queue_items
+            if item.oldjob_path
+        }
+        if queue_items:
+            joblist_state["work_dir"] = get_common_joblist_dir(
+                [item.inp_path for item in queue_items]
+            )
+            joblist_state["joblist_path"] = os.path.join(
+                joblist_state["work_dir"],
+                JOBLIST_FILENAME
+            )
+
+    update_joblist_status_label()
+    refresh_queue_manager_views()
+
+
+def save_formal_queue_file():
+    """Persist the formal queue as joblist.json without changing any model files."""
+    if not queue_items:
+        return ""
+
+    work_dir = get_common_joblist_dir([item.inp_path for item in queue_items])
+    if not work_dir:
+        return ""
+
+    path = os.path.join(work_dir, JOBLIST_FILENAME)
+    payload = [
+        {
+            "job_name": item.job_name,
+            "inp_path": item.inp_path,
+            "run_mode": item.run_mode,
+            "oldjob_path": item.oldjob_path,
+            "fortran_path": item.fortran_path,
+            "cores": item.cores,
+            "memory": item.memory,
+            "status": item.status,
+            "message": item.message,
+        }
+        for item in queue_items
+    ]
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+
+    joblist_state["work_dir"] = work_dir
+    joblist_state["joblist_path"] = path
+    return path
+
+
+def register_single_submit_queue_item(job_state):
+    """Show a manually submitted single job in the formal queue manager."""
+    if job_state.get("from_joblist"):
+        return
+
+    item = QueueItem(
+        inp_path=job_state["inp_file"],
+        job_name=job_state["job_name"],
+        source="single",
+        status=STATUS_RUNNING,
+        selected=False,
+        valid=True,
+        message="单作业提交运行中",
+        run_mode="restart" if job_state.get("oldjob_name") else "normal",
+        oldjob_name=job_state.get("oldjob_name", ""),
+        oldjob_dir=os.path.dirname(job_state.get("oldjob_path", "")) if job_state.get("oldjob_path") else "",
+        oldjob_path=job_state.get("oldjob_path", ""),
+        fortran_path=job_state.get("for_file_path", ""),
+        cores=job_state.get("cpus", DEFAULT_CPUS),
+        memory=job_state.get("memory_argument", ""),
+        interactive=job_state.get("interactive_mode", False),
+        datacheck_only=job_state.get("datacheck_mode", False),
+        complete_notify=bool(complete_notify_var.get()) if "complete_notify_var" in globals() else False,
+        active_job_key=job_state["job_key"],
+    )
+    job_state["queue_item_id"] = item.item_id
+    with queue_lock:
+        queue_items.append(item)
+    sync_joblist_state_from_queue_items()
+    refresh_queue_manager_views()
+
+
+def update_queue_item_from_final_job_status(job_state, status, detail=""):
+    """Update queue-manager row for a job that has finished."""
+    item_id = job_state.get("queue_item_id") or job_state.get("joblist_inp_name")
+    item = get_queue_item(item_id) if item_id else None
+    if item is None:
+        return
+
+    item.status = queue_status_from_final_status(status)
+    item.message = detail or format_final_status_for_display(status, detail)
+    item.active_job_key = ""
+    if job_state.get("start_time") and job_state.get("end_time"):
+        item.elapsed = format_duration(job_state["end_time"] - job_state["start_time"])
+    joblist_state["statuses"][item.item_id] = item.status
+    refresh_queue_manager_views()
+    try:
+        save_formal_queue_file()
+    except OSError:
+        pass
 
 
 def get_common_joblist_dir(paths):
@@ -3899,6 +4267,25 @@ def get_joblist_items_from_dir(work_dir, absolute=False):
         return [normalize_joblist_path(os.path.join(work_dir, name)) for name in inp_names]
 
     return inp_names
+
+
+def natural_sort_key(value):
+    """Sort strings with embedded numbers in human order."""
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", str(value))
+    ]
+
+
+def scan_inp_paths_in_dir(work_dir, recursive=False):
+    """Return naturally sorted INP paths from one directory."""
+    base_path = Path(work_dir)
+    pattern = "**/*.inp" if recursive else "*.inp"
+    return [
+        normalize_joblist_path(path)
+        for path in sorted(base_path.glob(pattern), key=lambda item: natural_sort_key(str(item)))
+        if path.is_file()
+    ]
 
 
 def get_initial_joblist_browse_dir():
@@ -3994,6 +4381,144 @@ def ask_joblist_source_mode():
     return result["mode"]
 
 
+def ask_joblist_source_mode():
+    """Show a dropdown-like source menu below the queue button."""
+    dialog = tk.Toplevel(root)
+    dialog.overrideredirect(True)
+    dialog.transient(root)
+    dialog.configure(bg="#cbd5e1")
+    dialog.resizable(False, False)
+
+    result = {"mode": None}
+    main = tk.Frame(dialog, bg="#ffffff", padx=1, pady=1)
+    main.pack(fill="both", expand=True)
+
+    def choose(mode):
+        result["mode"] = mode
+        try:
+            dialog.destroy()
+        except tk.TclError:
+            pass
+
+    action_text = "追加队列" if is_joblist_submitted() else "生成队列"
+    button_width = 220
+    try:
+        button_width = max(190, build_joblist_btn.winfo_width())
+    except (NameError, tk.TclError):
+        pass
+
+    ctk.CTkButton(
+        main,
+        text=f"从 INP 文件{action_text}",
+        width=button_width,
+        height=32,
+        corner_radius=0,
+        font=FONT_BUTTON,
+        fg_color="#ffffff",
+        hover_color="#e5eefc",
+        text_color="#111827",
+        command=lambda: choose("files")
+    ).pack(fill="x")
+
+    ctk.CTkButton(
+        main,
+        text=f"从文件夹{action_text}",
+        width=button_width,
+        height=32,
+        corner_radius=0,
+        font=FONT_BUTTON,
+        fg_color="#ffffff",
+        hover_color="#e5eefc",
+        text_color="#111827",
+        command=lambda: choose("folder")
+    ).pack(fill="x")
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+    dialog.bind("<Escape>", lambda _event: choose(None))
+    dialog.update_idletasks()
+
+    width = max(button_width, dialog.winfo_reqwidth())
+    height = dialog.winfo_reqheight()
+    try:
+        x = build_joblist_btn.winfo_rootx()
+        y = build_joblist_btn.winfo_rooty() + build_joblist_btn.winfo_height() + 2
+    except (NameError, tk.TclError):
+        root.update_idletasks()
+        x = root.winfo_x() + (root.winfo_width() - width) // 2
+        y = root.winfo_y() + (root.winfo_height() - height) // 2
+
+    dialog.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
+    dialog.lift(root)
+    try:
+        dialog.attributes("-topmost", True)
+        dialog.after(150, lambda: dialog.attributes("-topmost", False))
+    except tk.TclError:
+        pass
+    dialog.focus_force()
+
+    root.wait_window(dialog)
+    return result["mode"]
+
+
+def ask_joblist_source_mode():
+    """Show a native dropdown menu below the queue build button."""
+    result = tk.StringVar(value="")
+    action_text = "追加队列" if is_joblist_submitted() else "生成队列"
+
+    menu = tk.Menu(
+        root,
+        tearoff=0,
+        font=FONT_HINT,
+        bg="#ffffff",
+        fg="#111827",
+        activebackground="#e5eefc",
+        activeforeground="#111827",
+        relief="solid",
+        bd=1,
+        activeborderwidth=0
+    )
+
+    def choose(mode):
+        result.set(mode)
+
+    menu.add_command(
+        label=f"从 INP 文件{action_text}",
+        command=lambda: choose("files")
+    )
+    menu.add_command(
+        label=f"从文件夹{action_text}",
+        command=lambda: choose("folder")
+    )
+
+    def cancel_if_unselected(_event=None):
+        if not result.get():
+            root.after_idle(lambda: result.set("__cancel__") if not result.get() else None)
+
+    menu.bind("<Unmap>", cancel_if_unselected)
+
+    try:
+        x = build_joblist_btn.winfo_rootx()
+        y = build_joblist_btn.winfo_rooty() + build_joblist_btn.winfo_height()
+    except (NameError, tk.TclError):
+        root.update_idletasks()
+        x = root.winfo_x()
+        y = root.winfo_y()
+
+    try:
+        menu.tk_popup(x, y)
+    finally:
+        menu.grab_release()
+
+    root.wait_variable(result)
+    try:
+        menu.unpost()
+    except tk.TclError:
+        pass
+
+    mode = result.get()
+    return None if mode == "__cancel__" else mode
+
+
 def ask_joblist_source_paths():
     """Use native dialogs after choosing files or folder as the queue source."""
     mode = ask_joblist_source_mode()
@@ -4063,6 +4588,656 @@ def get_joblist_items_from_selection():
         "items": inp_names,
         "source": source,
     }
+
+
+def queue_item_from_inp_path(inp_path, source="file", selected=True):
+    """Create a candidate queue item from an INP path."""
+    inp_path = normalize_joblist_path(inp_path)
+    job_name = os.path.splitext(os.path.basename(inp_path))[0]
+    item = QueueItem(
+        inp_path=inp_path,
+        job_name=job_name,
+        source=source,
+        selected=selected,
+    )
+    snapshot = current_queue_parameter_snapshot()
+    item.cores = snapshot["cores"]
+    item.memory = snapshot["memory"]
+    item.fortran_path = snapshot["fortran_path"]
+    item.interactive = snapshot["interactive"]
+    item.datacheck_only = snapshot["datacheck_only"]
+    item.complete_notify = snapshot["complete_notify"]
+    validate_queue_item(item)
+    if not item.valid:
+        item.selected = False
+    return item
+
+
+def get_existing_queue_paths(include_candidates=True):
+    """Return normalized INP paths already present in candidate/formal queues."""
+    paths = {
+        normalize_joblist_compare_path(item.inp_path)
+        for item in queue_items
+    }
+    if include_candidates:
+        paths.update(
+            normalize_joblist_compare_path(item.inp_path)
+            for item in queue_candidates
+        )
+    return paths
+
+
+def get_existing_queue_job_names(exclude_item_id=""):
+    """Return job names already present in the formal queue."""
+    return {
+        item.job_name.lower()
+        for item in queue_items
+        if item.item_id != exclude_item_id
+    }
+
+
+def detect_queue_item_restart(item):
+    """Update restart metadata for a queue item."""
+    item.run_mode = "restart" if os.path.isfile(item.inp_path) and inp_has_restart_keyword(item.inp_path) else "normal"
+    if item.run_mode == "restart":
+        oldjob_path = item.oldjob_path or (oldjob_var.get().strip() if "oldjob_var" in globals() else "")
+        if oldjob_path:
+            item.oldjob_path = oldjob_path
+            item.oldjob_name = get_oldjob_name_from_path(oldjob_path)
+            item.oldjob_dir = os.path.dirname(oldjob_path)
+    else:
+        item.oldjob_path = ""
+        item.oldjob_name = ""
+        item.oldjob_dir = ""
+
+
+def validate_queue_item(item):
+    """Validate a candidate/formal queue item without modifying files."""
+    item.valid = True
+    item.message = "可加入"
+
+    if not item.inp_path or not os.path.isfile(item.inp_path):
+        item.valid = False
+        item.message = "INP 文件不存在"
+        return item
+
+    if os.path.splitext(item.inp_path)[1].lower() != ".inp":
+        item.valid = False
+        item.message = "扩展名错误"
+        return item
+
+    if not JOB_NAME_PATTERN.fullmatch(item.job_name):
+        item.valid = False
+        item.message = "作业名称不合法"
+        return item
+
+    if item.job_name.lower() in get_existing_queue_job_names(item.item_id):
+        item.valid = False
+        item.message = "正式队列中已存在同名作业"
+        return item
+
+    if item.fortran_path and not os.path.isfile(item.fortran_path):
+        item.valid = False
+        item.message = "FOR 文件不存在"
+        return item
+
+    detect_queue_item_restart(item)
+    if item.run_mode == "restart":
+        if item.oldjob_path:
+            if not os.path.isfile(item.oldjob_path):
+                dependency_item = get_queue_inp_name_for_oldjob_path(item.oldjob_path)
+                if dependency_item:
+                    item.message = "等待队列内前置作业"
+                else:
+                    item.valid = False
+                    item.message = "未找到旧作业相关文件"
+        else:
+            item.message = "启动前选择 oldjob"
+
+    return item
+
+
+def add_candidate_items_from_paths(paths, source):
+    """Add INP paths to candidate queue with duplicate filtering."""
+    added = 0
+    skipped = 0
+    existing_paths = get_existing_queue_paths()
+    existing_job_names = {
+        item.job_name.lower()
+        for item in queue_items + queue_candidates
+    }
+    with queue_lock:
+        for path in paths:
+            normalized_path = normalize_joblist_path(path)
+            if normalize_joblist_compare_path(normalized_path) in existing_paths:
+                skipped += 1
+                continue
+            item = queue_item_from_inp_path(normalized_path, source=source)
+            if queue_skip_restart_var is not None and queue_skip_restart_var.get() and "restart" in item.job_name.lower():
+                skipped += 1
+                continue
+            if item.job_name.lower() in existing_job_names:
+                item.selected = False
+                item.valid = False
+                item.message = "队列中已存在同名作业"
+            if queue_skip_existing_var is not None and queue_skip_existing_var.get():
+                if get_existing_odb_file(os.path.dirname(item.inp_path), item.job_name):
+                    item.selected = False
+                    item.valid = False
+                    item.message = "已有结果文件"
+            queue_candidates.append(item)
+            existing_paths.add(normalize_joblist_compare_path(normalized_path))
+            existing_job_names.add(item.job_name.lower())
+            added += 1
+
+    refresh_queue_manager_views()
+    update_joblist_status_label()
+    if skipped:
+        append_history_text(f"候选区新增 {added} 个，跳过 {skipped} 个重复或过滤项。\n\n")
+    return added, skipped
+
+
+def add_current_inp_to_candidates():
+    """Add the currently selected main-window INP to candidates."""
+    inp_file = inp_file_var.get().strip()
+    if not inp_file:
+        messagebox.showwarning("未选择 INP", "请先在主界面选择 INP 文件。")
+        return
+    add_candidate_items_from_paths([inp_file], "current")
+
+
+def add_inp_files_to_candidates():
+    """Add one or more INP files to the candidate queue."""
+    file_paths = filedialog.askopenfilenames(
+        title="添加 INP 文件",
+        initialdir=get_initial_joblist_browse_dir(),
+        filetypes=[
+            ("Abaqus INP 文件", "*.inp"),
+            ("所有文件", "*.*"),
+        ],
+    )
+    if file_paths:
+        add_candidate_items_from_paths(file_paths, "file")
+
+
+def scan_folder_to_candidates():
+    """Scan a folder into the candidate queue."""
+    folder_path = filedialog.askdirectory(
+        title="扫描文件夹",
+        initialdir=get_initial_joblist_browse_dir(),
+    )
+    if not folder_path:
+        return
+    recursive = bool(queue_scan_subdirs_var.get()) if queue_scan_subdirs_var is not None else False
+    inp_paths = scan_inp_paths_in_dir(folder_path, recursive=recursive)
+    if not inp_paths:
+        messagebox.showinfo("未找到 INP", "该文件夹下没有 .inp 文件。")
+        return
+    add_candidate_items_from_paths(inp_paths, "folder")
+
+
+def set_candidate_selection(mode):
+    """Select/deselect/invert all candidates."""
+    with queue_lock:
+        for item in queue_candidates:
+            if mode == "all":
+                item.selected = item.valid
+            elif mode == "none":
+                item.selected = False
+            elif mode == "invert":
+                item.selected = not item.selected if item.valid else False
+    refresh_queue_manager_views()
+
+
+def remove_selected_candidates():
+    """Remove selected candidate rows only."""
+    with queue_lock:
+        queue_candidates[:] = [item for item in queue_candidates if not item.selected]
+    refresh_queue_manager_views()
+
+
+def candidate_tree_toggle_selection(event):
+    """Toggle candidate check mark when the first column is clicked."""
+    if queue_candidate_tree is None:
+        return
+    row_id = queue_candidate_tree.identify_row(event.y)
+    column = queue_candidate_tree.identify_column(event.x)
+    if not row_id or column != "#1":
+        return
+    item = get_candidate_item(row_id)
+    if item is not None and item.valid:
+        item.selected = not item.selected
+        refresh_queue_manager_views()
+
+
+def queue_item_row_values(item, index, candidate=False):
+    """Return row values for a queue Treeview."""
+    if candidate:
+        return (
+            "☑" if item.selected else "☐",
+            index,
+            item.job_name,
+            item.inp_path,
+            item.source,
+            "重启动" if item.run_mode == "restart" else "普通",
+            item.oldjob_name if item.oldjob_name else "—",
+            os.path.basename(item.fortran_path) if item.fortran_path else "—",
+            item.message,
+        )
+
+    return (
+        index,
+        item.job_name,
+        item.inp_path,
+        "重启动" if item.run_mode == "restart" else "普通",
+        item.oldjob_name if item.oldjob_name else "—",
+        os.path.basename(item.fortran_path) if item.fortran_path else "—",
+        item.cores,
+        item.memory if item.memory else "默认",
+        item.status,
+        item.message,
+    )
+
+
+def refresh_queue_manager_views():
+    """Refresh candidate/formal queue Treeviews and summaries."""
+    try:
+        if queue_candidate_tree is not None and queue_candidate_tree.winfo_exists():
+            queue_candidate_tree.delete(*queue_candidate_tree.get_children())
+            for index, item in enumerate(queue_candidates, start=1):
+                queue_candidate_tree.insert("", "end", iid=item.item_id, values=queue_item_row_values(item, index, candidate=True))
+        if queue_formal_tree is not None and queue_formal_tree.winfo_exists():
+            queue_formal_tree.delete(*queue_formal_tree.get_children())
+            for index, item in enumerate(queue_items, start=1):
+                queue_formal_tree.insert("", "end", iid=item.item_id, values=queue_item_row_values(item, index, candidate=False))
+        if queue_candidate_summary_var is not None:
+            total = len(queue_candidates)
+            selected = sum(1 for item in queue_candidates if item.selected)
+            invalid = sum(1 for item in queue_candidates if not item.valid)
+            queue_candidate_summary_var.set(f"候选：{total} | 已选 {selected} | 异常 {invalid}")
+        if queue_formal_summary_var is not None:
+            counts = {}
+            for item in queue_items:
+                counts[item.status] = counts.get(item.status, 0) + 1
+            queue_formal_summary_var.set(
+                "正式队列：" + (" | ".join(f"{status} {count}" for status, count in counts.items()) if counts else "空")
+            )
+    except tk.TclError:
+        pass
+
+
+def confirm_selected_candidates_to_queue():
+    """Move selected valid candidates into the formal queue."""
+    selected_items = [item for item in queue_candidates if item.selected and item.valid]
+    if not selected_items:
+        messagebox.showwarning("没有可加入作业", "请先勾选有效的候选作业。")
+        return
+
+    snapshot = current_queue_parameter_snapshot()
+    restart_lines = [
+        f"{item.job_name} -> {item.oldjob_name or '启动前选择'}"
+        for item in selected_items
+        if item.run_mode == "restart"
+    ]
+    summary = (
+        f"即将加入 {len(selected_items)} 个作业。\n\n"
+        f"Core: {snapshot['cores']}\n"
+        f"Mem: {snapshot['memory'] if snapshot['memory'] else '默认'}\n"
+        f"FOR: {os.path.basename(snapshot['fortran_path']) if snapshot['fortran_path'] else '无'}\n"
+        f"Restart: {len(restart_lines)}"
+        + (
+            "\n\n重启动依赖：\n"
+            + "\n".join(restart_lines[:10])
+            + ("\n..." if len(restart_lines) > 10 else "")
+            if restart_lines else ""
+        )
+    )
+    if not messagebox.askyesno("确认加入队列", summary):
+        return
+
+    with queue_lock:
+        added_ids = set()
+        for item in selected_items:
+            item.status = STATUS_PENDING_RUN
+            item.cores = snapshot["cores"]
+            item.memory = snapshot["memory"]
+            item.fortran_path = snapshot["fortran_path"]
+            item.interactive = snapshot["interactive"]
+            item.datacheck_only = snapshot["datacheck_only"]
+            item.complete_notify = snapshot["complete_notify"]
+            validate_queue_item(item)
+            if item.valid:
+                if item.message == "可加入":
+                    item.message = "待提交"
+                queue_items.append(item)
+                added_ids.add(item.item_id)
+        queue_candidates[:] = [item for item in queue_candidates if item.item_id not in added_ids]
+
+    sync_joblist_state_from_queue_items()
+    try:
+        save_formal_queue_file()
+    except OSError as e:
+        messagebox.showwarning("保存失败", f"正式队列已更新，但无法保存 joblist.json：\n{e}")
+    append_history_text(f"已确认加入正式队列：{len(added_ids)} 个作业\n\n")
+    if joblist_state.get("active"):
+        if ensure_joblist_restart_oldjobs(force_prompt=False, confirm=False):
+            root.after(100, dispatch_joblist)
+
+
+def cancel_selected_pending_queue_items():
+    """Cancel selected formal queue jobs that have not started."""
+    if queue_formal_tree is None:
+        return
+    changed = 0
+    blocked = 0
+    with queue_lock:
+        for item_id in queue_formal_tree.selection():
+            item = get_queue_item(item_id)
+            if item and item.status in (STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY):
+                item.status = STATUS_CANCELED
+                item.message = "用户手动取消"
+                changed += 1
+            elif item and item.status in (STATUS_STARTING, STATUS_RUNNING, STATUS_TERMINATING):
+                blocked += 1
+    if changed:
+        sync_joblist_state_from_queue_items()
+    if blocked:
+        messagebox.showinfo("不能取消运行中作业", "运行中作业请使用“终止选中的运行中作业”。")
+
+
+def terminate_selected_running_queue_items():
+    """Terminate selected formal queue jobs that are starting or running."""
+    if queue_formal_tree is None:
+        return
+    for item_id in queue_formal_tree.selection():
+        item = get_queue_item(item_id)
+        if not item or item.status not in (STATUS_STARTING, STATUS_RUNNING):
+            continue
+        if item.active_job_key and item.active_job_key in active_jobs:
+            item.status = STATUS_TERMINATING
+            item.message = "正在终止"
+            joblist_state["statuses"][item.item_id] = STATUS_TERMINATING
+            refresh_queue_manager_views()
+            terminate_job(active_jobs[item.active_job_key])
+
+
+def clear_finished_queue_items():
+    """Remove terminal records from the formal queue table only."""
+    with queue_lock:
+        queue_items[:] = [item for item in queue_items if item.status not in TERMINAL_QUEUE_STATUSES]
+    sync_joblist_state_from_queue_items()
+
+
+def show_queue_item_details(_event=None):
+    """Show details for selected formal queue item."""
+    if queue_formal_tree is None:
+        return
+    selection = queue_formal_tree.selection()
+    if not selection:
+        return
+    item = get_queue_item(selection[0])
+    if item is None:
+        return
+    details = (
+        f"作业名称：{item.job_name}\n"
+        f"INP 完整路径：{item.inp_path}\n"
+        f"FOR 文件完整路径：{item.fortran_path or '—'}\n"
+        f"是否属于重启动作业：{'是' if item.run_mode == 'restart' else '否'}\n"
+        f"重启动旧作业名称：{item.oldjob_name or '—'}\n"
+        f"重启动旧作业目录：{item.oldjob_dir or '—'}\n"
+        f"Core：{item.cores}\n"
+        f"Mem：{item.memory or '默认'}\n"
+        f"当前状态：{item.status}\n"
+        f"备注信息：{item.message}"
+    )
+    messagebox.showinfo("作业详情", details)
+
+
+def edit_selected_pending_queue_item():
+    """Edit settings for one pending formal queue item."""
+    if queue_formal_tree is None:
+        return
+    selection = queue_formal_tree.selection()
+    if not selection:
+        messagebox.showinfo("未选择作业", "请先选择一个待运行作业。")
+        return
+
+    item = get_queue_item(selection[0])
+    if item is None:
+        return
+    if item.status != STATUS_PENDING_RUN:
+        messagebox.showwarning("不可编辑", "只能编辑状态为“待运行”的作业。")
+        return
+
+    dialog = tk.Toplevel(root)
+    dialog.title("编辑待运行作业")
+    dialog.transient(root)
+    dialog.grab_set()
+    dialog.configure(bg="#ffffff")
+    dialog.resizable(False, False)
+
+    core_var = tk.StringVar(value=str(item.cores))
+    memory_var = tk.StringVar(value=item.memory)
+    fortran_var = tk.StringVar(value=item.fortran_path)
+    oldjob_path_var = tk.StringVar(value=item.oldjob_path)
+
+    main = ttk.Frame(dialog, style="Card.TFrame")
+    main.pack(fill="both", expand=True, padx=16, pady=14)
+    main.columnconfigure(1, minsize=360, weight=1)
+
+    def add_row(row, label, variable, browse_command=None):
+        ttk.Label(main, text=label, style="Normal.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=(0, 8))
+        entry = ttk.Entry(main, textvariable=variable, width=48)
+        entry.grid(row=row, column=1, sticky="ew", pady=(0, 8))
+        if browse_command is not None:
+            ttk.Button(main, text="选择", command=browse_command).grid(row=row, column=2, sticky="w", padx=(8, 0), pady=(0, 8))
+        return entry
+
+    ttk.Label(main, text=f"作业：{item.job_name}", style="Normal.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 12))
+    add_row(1, "Core", core_var)
+    add_row(2, "Mem", memory_var)
+
+    def choose_fortran():
+        path = filedialog.askopenfilename(
+            title="选择 Fortran 子程序",
+            initialdir=os.path.dirname(item.fortran_path) if item.fortran_path else get_initial_joblist_browse_dir(),
+            filetypes=[("Fortran 文件", "*.for *.f *.f90"), ("所有文件", "*.*")]
+        )
+        if path:
+            fortran_var.set(normalize_joblist_path(path))
+
+    def choose_oldjob():
+        path = filedialog.askopenfilename(
+            title="选择重启动 oldjob ODB",
+            initialdir=os.path.dirname(item.oldjob_path) if item.oldjob_path else get_initial_joblist_browse_dir(),
+            filetypes=[("Abaqus ODB 文件", "*.odb"), ("所有文件", "*.*")]
+        )
+        if path:
+            oldjob_path_var.set(normalize_joblist_path(path))
+
+    add_row(3, "FOR", fortran_var, choose_fortran)
+    add_row(4, "ODB", oldjob_path_var, choose_oldjob)
+
+    button_row = ttk.Frame(main, style="Card.TFrame")
+    button_row.grid(row=5, column=0, columnspan=3, sticky="e", pady=(8, 0))
+
+    def apply_changes():
+        try:
+            cores = int(core_var.get().strip())
+        except ValueError:
+            messagebox.showerror("错误", "Core 必须是整数。")
+            return
+        if cores < 0 or cores > MAX_CPUS:
+            messagebox.showerror("错误", f"Core 范围应为 0–{MAX_CPUS}。")
+            return
+
+        memory_value = memory_var.get().strip()
+        if memory_value and not validate_memory_argument(memory_value):
+            return
+
+        fortran_path = fortran_var.get().strip()
+        if fortran_path and not os.path.isfile(fortran_path):
+            messagebox.showerror("错误", f"FOR 文件不存在：\n{fortran_path}")
+            return
+
+        oldjob_path = oldjob_path_var.get().strip()
+        if oldjob_path and os.path.splitext(oldjob_path)[1].lower() != ".odb":
+            messagebox.showerror("错误", "重启动依赖请选择 .odb 文件。")
+            return
+
+        item.cores = cores
+        item.memory = memory_value
+        item.fortran_path = fortran_path
+        item.oldjob_path = oldjob_path
+        item.oldjob_name = get_oldjob_name_from_path(oldjob_path) if oldjob_path else ""
+        item.oldjob_dir = os.path.dirname(oldjob_path) if oldjob_path else ""
+        validate_queue_item(item)
+        if item.valid:
+            item.status = STATUS_PENDING_RUN
+        sync_joblist_state_from_queue_items()
+        try:
+            save_formal_queue_file()
+        except OSError:
+            pass
+        dialog.destroy()
+
+    ttk.Button(button_row, text="保存", command=apply_changes).pack(side="left", padx=(0, 8))
+    ttk.Button(button_row, text="取消", command=dialog.destroy).pack(side="left")
+
+    dialog.update_idletasks()
+    width = dialog.winfo_reqwidth()
+    height = dialog.winfo_reqheight()
+    root.update_idletasks()
+    x = root.winfo_x() + (root.winfo_width() - width) // 2
+    y = root.winfo_y() + (root.winfo_height() - height) // 2
+    dialog.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
+
+
+def create_queue_window_button(parent, text, command, variant="light", width=96):
+    """Create a queue-manager button that matches the main window style."""
+    colors = {
+        "primary": ("#2563eb", "#1d4ed8", "#ffffff"),
+        "danger": ("#dc2626", "#b91c1c", "#ffffff"),
+        "light": (BTN_LIGHT_FG, BTN_LIGHT_HOVER, BTN_LIGHT_TEXT),
+    }
+    fg_color, hover_color, text_color = colors.get(variant, colors["light"])
+    button = ctk.CTkButton(
+        parent,
+        text=text,
+        width=width,
+        height=36,
+        corner_radius=7,
+        font=FONT_QUEUE_BUTTON,
+        fg_color=fg_color,
+        hover_color=hover_color,
+        text_color=text_color,
+        bg_color="#ffffff",
+        command=command,
+    )
+    button.pack(side="left", padx=(0, 6))
+    return button
+
+
+def create_queue_table(parent, columns, widths):
+    """Create a Treeview with scrollbars."""
+    frame = ttk.Frame(parent, style="Card.TFrame")
+    frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+    tree = ttk.Treeview(frame, columns=columns, show="headings", height=8, style="Queue.Treeview")
+    y_scroll = ttk.Scrollbar(frame, orient="vertical", command=tree.yview, style="Queue.Vertical.TScrollbar")
+    x_scroll = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview, style="Queue.Horizontal.TScrollbar")
+    tree.configure(yscrollcommand=y_scroll.set, xscrollcommand=x_scroll.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    y_scroll.grid(row=0, column=1, sticky="ns")
+    x_scroll.grid(row=1, column=0, sticky="ew")
+    frame.rowconfigure(0, weight=1)
+    frame.columnconfigure(0, weight=1)
+    for column, width in zip(columns, widths):
+        tree.heading(column, text=column)
+        tree.column(column, width=width, minwidth=45, anchor="w")
+    return tree
+
+
+def open_queue_manager_window():
+    """Open the standalone queue management window."""
+    global queue_manager_window, queue_candidate_tree, queue_formal_tree
+    global queue_candidate_summary_var, queue_formal_summary_var
+    global queue_scan_subdirs_var, queue_skip_restart_var, queue_skip_existing_var
+
+    if queue_manager_window is not None:
+        try:
+            if queue_manager_window.winfo_exists():
+                queue_manager_window.lift()
+                return
+        except tk.TclError:
+            pass
+
+    queue_manager_window = tk.Toplevel(root)
+    queue_manager_window.title("作业队列管理")
+    queue_manager_window.geometry("1120x720")
+    queue_manager_window.configure(bg="#f8fafc")
+    queue_manager_window.transient(root)
+
+    main = ttk.Frame(queue_manager_window, style="Main.TFrame")
+    main.pack(fill="both", expand=True, padx=12, pady=12)
+
+    queue_scan_subdirs_var = tk.BooleanVar(value=False)
+    queue_skip_restart_var = tk.BooleanVar(value=False)
+    queue_skip_existing_var = tk.BooleanVar(value=False)
+    queue_candidate_summary_var = tk.StringVar(value="候选：0")
+    queue_formal_summary_var = tk.StringVar(value="正式队列：空")
+
+    candidate_section = ttk.LabelFrame(main, text="候选区", style="Queue.TLabelframe")
+    candidate_section.pack(fill="both", expand=True, pady=(0, 10))
+    candidate_toolbar = ttk.Frame(candidate_section, style="Card.TFrame")
+    candidate_toolbar.pack(fill="x", padx=8, pady=(8, 6))
+    for text, command, variant, width in (
+        ("加入当前 INP", add_current_inp_to_candidates, "light", 92),
+        ("添加 INP 文件", add_inp_files_to_candidates, "light", 96),
+        ("扫描文件夹", scan_folder_to_candidates, "light", 86),
+        ("全选", lambda: set_candidate_selection("all"), "light", 60),
+        ("取消全选", lambda: set_candidate_selection("none"), "light", 76),
+        ("反选", lambda: set_candidate_selection("invert"), "light", 60),
+        ("移除选中候选项", remove_selected_candidates, "danger", 116),
+        ("确认选中项加入队列", confirm_selected_candidates_to_queue, "primary", 132),
+    ):
+        create_queue_window_button(candidate_toolbar, text, command, variant=variant, width=width)
+
+    candidate_options = ttk.Frame(candidate_section, style="Card.TFrame")
+    candidate_options.pack(fill="x", padx=8, pady=(0, 6))
+    ttk.Checkbutton(candidate_options, text="扫描子文件夹", variable=queue_scan_subdirs_var, style="Queue.TCheckbutton").pack(side="left", padx=(0, 14))
+    ttk.Checkbutton(candidate_options, text="跳过名称中包含 Restart 的文件", variable=queue_skip_restart_var, style="Queue.TCheckbutton").pack(side="left", padx=(0, 14))
+    ttk.Checkbutton(candidate_options, text="跳过已经存在结果文件的作业", variable=queue_skip_existing_var, style="Queue.TCheckbutton").pack(side="left")
+    ttk.Label(candidate_options, textvariable=queue_candidate_summary_var, style="Hint.TLabel").pack(side="right")
+    queue_candidate_tree = create_queue_table(
+        candidate_section,
+        ("勾选", "序号", "作业名称", "INP 文件路径", "加入方式", "作业类型", "重启动依赖", "FOR 文件", "检查结果"),
+        (55, 50, 130, 260, 80, 80, 120, 110, 170),
+    )
+    queue_candidate_tree.bind("<Button-1>", candidate_tree_toggle_selection)
+
+    formal_section = ttk.LabelFrame(main, text="正式队列", style="Queue.TLabelframe")
+    formal_section.pack(fill="both", expand=True)
+    formal_toolbar = ttk.Frame(formal_section, style="Card.TFrame")
+    formal_toolbar.pack(fill="x", padx=8, pady=(8, 6))
+    create_queue_window_button(formal_toolbar, "取消选中的待运行作业", cancel_selected_pending_queue_items, width=148)
+    create_queue_window_button(formal_toolbar, "编辑选中的待运行作业", edit_selected_pending_queue_item, width=148)
+    create_queue_window_button(formal_toolbar, "终止选中的运行中作业", terminate_selected_running_queue_items, variant="danger", width=148)
+    create_queue_window_button(formal_toolbar, "清理已结束记录", clear_finished_queue_items, width=112)
+    ttk.Label(formal_toolbar, textvariable=queue_formal_summary_var, style="Hint.TLabel").pack(side="right")
+    queue_formal_tree = create_queue_table(
+        formal_section,
+        ("序号", "作业名称", "INP 文件路径", "作业类型", "重启动依赖", "FOR 文件", "Core", "Mem", "状态", "备注"),
+        (50, 130, 280, 80, 120, 110, 60, 80, 90, 180),
+    )
+    queue_formal_tree.bind("<Double-1>", show_queue_item_details)
+
+    def on_close():
+        global queue_manager_window
+        queue_manager_window.destroy()
+        queue_manager_window = None
+
+    queue_manager_window.protocol("WM_DELETE_WINDOW", on_close)
+    refresh_queue_manager_views()
 
 
 def map_restart_oldjobs_to_queue_items(restart_items, restart_mapping):
@@ -4389,11 +5564,8 @@ def append_joblist_from_source():
 
 
 def select_joblist_dir():
-    """Create a new queue before submission, or append to an already submitted queue."""
-    if is_joblist_submitted():
-        append_joblist_from_source()
-    else:
-        create_joblist_from_source()
+    """Open the standalone formal queue manager."""
+    open_queue_manager_window()
 
 
 def get_joblist_submit_settings():
@@ -4443,8 +5615,8 @@ def ensure_joblist_restart_oldjobs(force_prompt=False, confirm=True):
         joblist_state["oldjob_paths"] = {}
         joblist_state["dependencies"] = {}
         for name in restart_names:
-            if joblist_state["statuses"].get(name) == "等待前置":
-                joblist_state["statuses"][name] = "等待"
+            if joblist_state["statuses"].get(name) in (STATUS_WAITING_DEPENDENCY, "等待前置"):
+                joblist_state["statuses"][name] = STATUS_PENDING_RUN
 
         restart_files = [
             get_joblist_item_path(name)
@@ -4460,6 +5632,14 @@ def ensure_joblist_restart_oldjobs(force_prompt=False, confirm=True):
             return False
 
     joblist_state["oldjob_paths"] = oldjob_paths
+    for item_id, oldjob_path in oldjob_paths.items():
+        item = get_queue_item(item_id)
+        if item is None:
+            continue
+        item.oldjob_path = oldjob_path
+        item.oldjob_name = get_oldjob_name_from_path(oldjob_path)
+        item.oldjob_dir = os.path.dirname(oldjob_path)
+        item.run_mode = "restart"
 
     dependencies = {}
     missing_external_oldjobs = []
@@ -4483,7 +5663,11 @@ def ensure_joblist_restart_oldjobs(force_prompt=False, confirm=True):
         dependency_inp_name = get_queue_inp_name_for_oldjob_path(oldjob_path)
         if dependency_inp_name:
             dependencies[inp_name] = dependency_inp_name
-            joblist_state["statuses"][inp_name] = "等待前置"
+            joblist_state["statuses"][inp_name] = STATUS_WAITING_DEPENDENCY
+            item = get_queue_item(inp_name)
+            if item is not None:
+                item.status = STATUS_WAITING_DEPENDENCY
+                item.message = f"等待前置作业：{dependency_inp_name}"
         elif os.path.isfile(oldjob_path):
             continue
         else:
@@ -4554,21 +5738,19 @@ def ensure_joblist_restart_oldjobs(force_prompt=False, confirm=True):
         )
         + "\n\n"
     )
+    sync_joblist_state_from_queue_items()
     return True
 
 
 def start_joblist():
     """按资源估算并行提交 joblist 中的作业。"""
-    if not joblist_state["jobs"]:
-        select_joblist_dir()
-        if not joblist_state["jobs"]:
-            return
-
-    if not ensure_joblist_restart_oldjobs(force_prompt=True):
+    sync_joblist_state_from_queue_items()
+    if not any(item.status in (STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY) for item in queue_items):
+        open_queue_manager_window()
+        messagebox.showinfo("队列为空", "请先在“管理队列”中确认需要运行的作业。")
         return
 
-    settings = get_joblist_submit_settings()
-    if settings is None:
+    if not ensure_joblist_restart_oldjobs(force_prompt=False):
         return
 
     slots, details = estimate_available_job_slots()
@@ -4587,6 +5769,10 @@ def start_joblist():
 
     joblist_state["active"] = True
     joblist_state["max_parallel"] = planned_slots
+    try:
+        save_formal_queue_file()
+    except OSError as e:
+        messagebox.showwarning("保存失败", f"队列可以继续运行，但无法保存 joblist.json：\n{e}")
     memory_table_widths = (12, 16, 12, 16)
     memory_table_header = format_history_table_row(
         ("可用内存", "保留后可用内存", "内存估算", "估算可提交 Job"),
@@ -4626,7 +5812,7 @@ def get_next_ready_joblist_name():
                 continue
 
             status = joblist_state["statuses"].get(name)
-            if status not in ("等待", "等待前置"):
+            if status not in (STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY, "等待", "等待前置"):
                 continue
 
             dependency_name = dependencies.get(name, "")
@@ -4634,19 +5820,42 @@ def get_next_ready_joblist_name():
                 return name
 
             dependency_status = joblist_state["statuses"].get(dependency_name)
-            if is_completed_queue_status(dependency_status):
-                joblist_state["statuses"][name] = "等待"
+            if is_completed_queue_status(dependency_status) or final_status_from_queue_status(dependency_status):
+                joblist_state["statuses"][name] = STATUS_PENDING_RUN
+                item = get_queue_item(name)
+                if item is not None:
+                    item.status = STATUS_PENDING_RUN
                 return name
 
-            if dependency_status in ("失败", "终止", "取消", "状态未知", "Datacheck Failed", "提交失败", "已停止", "跳过"):
-                joblist_state["statuses"][name] = "跳过"
+            if dependency_status in (
+                STATUS_FAILED,
+                STATUS_CANCELED,
+                STATUS_TERMINATED,
+                "失败",
+                "终止",
+                "取消",
+                "状态未知",
+                "Datacheck Failed",
+                "提交失败",
+                "已停止",
+                "跳过",
+            ):
+                joblist_state["statuses"][name] = STATUS_CANCELED
+                item = get_queue_item(name)
+                if item is not None:
+                    item.status = STATUS_CANCELED
+                    item.message = f"前置作业未正常完成：{dependency_name}"
                 append_history_text(
                     f"跳过 Restart 作业：{name}\n"
                     f"原因：前置作业 {dependency_name} 未正常完成（{dependency_status}）。\n\n"
                 )
                 continue
 
-            joblist_state["statuses"][name] = "等待前置"
+            joblist_state["statuses"][name] = STATUS_WAITING_DEPENDENCY
+            item = get_queue_item(name)
+            if item is not None:
+                item.status = STATUS_WAITING_DEPENDENCY
+                item.message = f"等待前置作业：{dependency_name}"
 
     return ""
 
@@ -4656,12 +5865,7 @@ def dispatch_joblist():
     if not joblist_state["active"]:
         return
 
-    settings = get_joblist_submit_settings()
-    if settings is None:
-        joblist_state["active"] = False
-        update_joblist_status_label("队列：已停止，参数无效")
-        update_joblist_button_mode()
-        return
+    sync_joblist_state_from_queue_items()
 
     slots, _ = estimate_available_job_slots()
     queue_room = max(0, joblist_state["max_parallel"] - len(joblist_state["running"]))
@@ -4674,26 +5878,46 @@ def dispatch_joblist():
         if not next_name:
             break
 
+        queue_item = get_queue_item(next_name)
+        if queue_item is None:
+            joblist_state["statuses"][next_name] = STATUS_FAILED
+            continue
+
+        if not validate_formal_queue_item_before_submit(queue_item):
+            joblist_state["statuses"][next_name] = queue_item.status
+            refresh_queue_manager_views()
+            submit_slots -= 1
+            continue
+
         inp_file = get_joblist_item_path(next_name)
-        joblist_state["statuses"][next_name] = "提交中"
+        queue_item.status = STATUS_STARTING
+        queue_item.message = "正在启动 Abaqus"
+        joblist_state["statuses"][next_name] = STATUS_STARTING
         update_joblist_status_label()
+        refresh_queue_manager_views()
 
         submitted_job = submit_job(
             inp_file_override=inp_file,
             queue_mode=True,
             oldjob_path_override=joblist_state["oldjob_paths"].get(next_name, ""),
-            queue_job_key_override=next_name
+            queue_job_key_override=next_name,
+            queue_item_override=queue_item
         )
         if submitted_job:
             joblist_state["running"].add(next_name)
-            joblist_state["statuses"][next_name] = "运行中"
+            queue_item.status = STATUS_RUNNING
+            queue_item.message = "运行中"
+            joblist_state["statuses"][next_name] = STATUS_RUNNING
         else:
-            joblist_state["statuses"][next_name] = "提交失败"
+            queue_item.status = STATUS_FAILED
+            queue_item.message = "提交失败"
+            queue_item.active_job_key = ""
+            joblist_state["statuses"][next_name] = STATUS_FAILED
 
         submit_slots -= 1
 
     waiting = any(
-        joblist_state["statuses"].get(name) in ("等待", "等待前置")
+        joblist_state["statuses"].get(name) in (STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY, "等待", "等待前置")
         for name in joblist_state["jobs"]
     )
 
@@ -4704,6 +5928,7 @@ def dispatch_joblist():
         append_history_text("队列提交结束。\n\n")
     else:
         update_joblist_status_label()
+        refresh_queue_manager_views()
         if waiting and (not joblist_state["running"] or submit_slots <= 0):
             root.after(5000, dispatch_joblist)
 
@@ -4715,22 +5940,36 @@ def finish_joblist_job(job_state, status, detail=""):
         return
 
     joblist_state["running"].discard(inp_name)
-    joblist_state["statuses"][inp_name] = status
+    queue_status = queue_status_from_final_status(status)
+    joblist_state["statuses"][inp_name] = queue_status
+    item = get_queue_item(inp_name)
+    if item is not None:
+        item.status = queue_status
+        item.message = detail or format_final_status_for_display(status, detail)
+        item.elapsed = format_duration(job_state.get("end_time", time.time()) - job_state.get("start_time", time.time()))
 
     for dependent_name, dependency_name in joblist_state.get("dependencies", {}).items():
         if dependency_name != inp_name:
             continue
 
         if is_completed_queue_status(status):
-            if joblist_state["statuses"].get(dependent_name) == "等待前置":
-                joblist_state["statuses"][dependent_name] = "等待"
+            if joblist_state["statuses"].get(dependent_name) in (STATUS_WAITING_DEPENDENCY, "等待前置"):
+                joblist_state["statuses"][dependent_name] = STATUS_PENDING_RUN
+                dependent_item = get_queue_item(dependent_name)
+                if dependent_item is not None:
+                    dependent_item.status = STATUS_PENDING_RUN
+                    dependent_item.message = "前置作业已完成"
                 oldjob_path = joblist_state["oldjob_paths"].get(dependent_name, "")
                 append_history_text(
                     f"释放 Restart 作业：{dependent_name}\n"
                     f"前置作业 {inp_name} 已完成，oldjob ODB：{oldjob_path}\n\n"
                 )
         else:
-            joblist_state["statuses"][dependent_name] = "跳过"
+            joblist_state["statuses"][dependent_name] = STATUS_CANCELED
+            dependent_item = get_queue_item(dependent_name)
+            if dependent_item is not None:
+                dependent_item.status = STATUS_CANCELED
+                dependent_item.message = f"前置作业未正常完成：{inp_name}"
             append_history_text(
                 f"跳过 Restart 作业：{dependent_name}\n"
                 f"原因：前置作业 {inp_name} 未正常完成（{status}）。\n\n"
@@ -4738,6 +5977,11 @@ def finish_joblist_job(job_state, status, detail=""):
 
     update_joblist_status_label()
     update_joblist_button_mode()
+    refresh_queue_manager_views()
+    try:
+        save_formal_queue_file()
+    except OSError:
+        pass
     root.after(500, dispatch_joblist)
 
 
@@ -4749,12 +5993,17 @@ def stop_joblist_queue(source_job_state=None):
     joblist_state["active"] = False
     skipped = 0
     for name in joblist_state["jobs"]:
-        if joblist_state["statuses"].get(name) in ("等待", "等待前置"):
-            joblist_state["statuses"][name] = "已停止"
+        if joblist_state["statuses"].get(name) in (STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY, "等待", "等待前置"):
+            joblist_state["statuses"][name] = STATUS_CANCELED
+            item = get_queue_item(name)
+            if item is not None:
+                item.status = STATUS_CANCELED
+                item.message = "队列终止，未提交"
             skipped += 1
 
     update_joblist_status_label("队列：已终止，不再提交等待作业")
     update_joblist_button_mode()
+    refresh_queue_manager_views()
     append_history_text(f"队列已终止，停止提交等待作业 {skipped} 个。\n\n")
 
     if source_job_state is not None:
@@ -4765,16 +6014,25 @@ def stop_joblist_queue(source_job_state=None):
     update_joblist_button_mode()
 
 
-def submit_job(inp_file_override="", queue_mode=False, oldjob_path_override="", queue_job_key_override=""):
+def submit_job(inp_file_override="", queue_mode=False, oldjob_path_override="", queue_job_key_override="", queue_item_override=None):
     """提交 Abaqus 作业"""
     inp_file = inp_file_override or inp_file_var.get().strip()
-    cpus_text = cpus_var.get().strip()
-    oldjob_path = oldjob_path_override if oldjob_path_override else ("" if queue_mode else oldjob_var.get().strip())
+    if queue_item_override is not None:
+        queue_settings = get_queue_item_command_settings(queue_item_override)
+        cpus_text = queue_settings["cpus_text"]
+        oldjob_path = queue_settings["oldjob_path"] or oldjob_path_override
+        for_file_path = queue_settings["for_file_path"]
+        interactive_mode = queue_settings["interactive_mode"]
+        memory_argument = queue_settings["memory_argument"]
+        datacheck_mode = queue_settings["datacheck_mode"]
+    else:
+        cpus_text = cpus_var.get().strip()
+        oldjob_path = oldjob_path_override if oldjob_path_override else ("" if queue_mode else oldjob_var.get().strip())
+        for_file_path = for_file_var.get().strip()
+        interactive_mode = interactive_var.get()
+        memory_argument = get_memory_argument()
+        datacheck_mode = datacheck_var.get()
     oldjob_name = get_oldjob_name_from_path(oldjob_path) if oldjob_path else ""
-    for_file_path = for_file_var.get().strip()
-    interactive_mode = interactive_var.get()
-    memory_argument = get_memory_argument()
-    datacheck_mode = datacheck_var.get()
 
     if not inp_file:
         messagebox.showerror("错误", "请选择 Abaqus INP 文件。")
@@ -4868,6 +6126,8 @@ def submit_job(inp_file_override="", queue_mode=False, oldjob_path_override="", 
 
     sta_file = os.path.join(work_dir, job_name + ".sta")
     job_key = get_job_key(work_dir, job_name)
+    if queue_item_override is not None:
+        queue_item_override.active_job_key = job_key
 
     if job_key in active_jobs:
         messagebox.showwarning(
@@ -5000,6 +6260,7 @@ def submit_job(inp_file_override="", queue_mode=False, oldjob_path_override="", 
         "datacheck_mode": datacheck_mode,
         "from_joblist": queue_mode,
         "joblist_inp_name": queue_job_key_override if queue_mode else "",
+        "queue_item_id": queue_item_override.item_id if queue_item_override is not None else "",
         "overwrite_existing": True if odb_action == "overwrite" else False,
         "odb_action": odb_action,
         "backup_odb_path": backup_odb_path,
@@ -5067,6 +6328,7 @@ def submit_job(inp_file_override="", queue_mode=False, oldjob_path_override="", 
         process = run_command_hidden(cmd, work_dir)
         job_state["process"] = process
         active_jobs[job_key] = job_state
+        register_single_submit_queue_item(job_state)
         refresh_runtime_status(job_state)
         start_global_runtime_status_monitor()
         start_job_memory_monitor(job_state)
@@ -5225,6 +6487,113 @@ style.configure(
 )
 
 style.layout("Hidden.TNotebook.Tab", [])
+
+style.configure(
+    "Queue.Treeview",
+    background="#ffffff",
+    fieldbackground="#ffffff",
+    foreground="#111827",
+    rowheight=26,
+    borderwidth=0,
+    font=FONT_QUEUE_TABLE,
+)
+
+style.configure(
+    "Queue.Treeview.Heading",
+    background="#eef4fb",
+    foreground="#111827",
+    relief="flat",
+    font=FONT_QUEUE_HEADING,
+)
+
+style.map(
+    "Queue.Treeview.Heading",
+    background=[("active", "#dbe3ee")]
+)
+
+style.configure(
+    "Queue.Vertical.TScrollbar",
+    gripcount=0,
+    background="#9aa8ba",
+    darkcolor="#9aa8ba",
+    lightcolor="#9aa8ba",
+    troughcolor="#f1f5f9",
+    bordercolor="#f1f5f9",
+    arrowcolor="#9aa8ba",
+    relief="flat",
+    width=12,
+)
+
+style.map(
+    "Queue.Vertical.TScrollbar",
+    background=[
+        ("active", "#7f8da0"),
+        ("pressed", "#7f8da0"),
+        ("disabled", "#cbd5e1"),
+        ("!active", "#9aa8ba"),
+    ],
+    arrowcolor=[
+        ("active", "#7f8da0"),
+        ("pressed", "#7f8da0"),
+        ("disabled", "#cbd5e1"),
+        ("!active", "#9aa8ba"),
+    ],
+)
+
+style.configure(
+    "Queue.Horizontal.TScrollbar",
+    gripcount=0,
+    background="#9aa8ba",
+    darkcolor="#9aa8ba",
+    lightcolor="#9aa8ba",
+    troughcolor="#f1f5f9",
+    bordercolor="#f1f5f9",
+    arrowcolor="#9aa8ba",
+    relief="flat",
+    width=12,
+)
+
+style.map(
+    "Queue.Horizontal.TScrollbar",
+    background=[
+        ("active", "#7f8da0"),
+        ("pressed", "#7f8da0"),
+        ("disabled", "#cbd5e1"),
+        ("!active", "#9aa8ba"),
+    ],
+    arrowcolor=[
+        ("active", "#7f8da0"),
+        ("pressed", "#7f8da0"),
+        ("disabled", "#cbd5e1"),
+        ("!active", "#9aa8ba"),
+    ],
+)
+
+style.configure(
+    "Queue.TLabelframe",
+    background="#ffffff",
+    borderwidth=1,
+    relief="solid",
+)
+
+style.configure(
+    "Queue.TLabelframe.Label",
+    background="#ffffff",
+    foreground="#111827",
+    font=FONT_LABEL,
+)
+
+style.configure(
+    "Queue.TCheckbutton",
+    background="#ffffff",
+    foreground="#111827",
+    font=FONT_QUEUE_HEADING,
+)
+
+style.map(
+    "Queue.TCheckbutton",
+    background=[("active", "#ffffff"), ("selected", "#ffffff")],
+)
 
 # ================= 页面布局 =================
 
@@ -5541,7 +6910,7 @@ submit_btn.grid(row=0, column=1, sticky="ew", padx=(0, 6))
 
 build_joblist_btn = ctk.CTkButton(
     button_row,
-    text="生成队列",
+    text="管理队列",
     width=86,
     height=32,
     corner_radius=8,
@@ -5620,7 +6989,9 @@ stop_joblist_btn.grid(row=1, column=3, sticky="ew", pady=(8, 0))
 ttk.Label(
     inner,
     textvariable=joblist_status_var,
-    style="Hint.TLabel"
+    style="Hint.TLabel",
+    wraplength=360,
+    justify="left"
 ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
 # ================= 左侧提交记录 =================

@@ -181,6 +181,29 @@ ABAQUS_PROCESS_NAME_MARKERS = (
     "solver",
     "mpiexec",
 )
+ABAQUS_PROCESS_EXACT_NAMES = {
+    "abaqus",
+    "standard",
+    "explicit",
+    "pre",
+    "package",
+    "packager",
+    "mpiexec",
+    "eqsequationsolver",
+}
+ABAQUS_PROCESS_SUBSTRINGS = (
+    "abaqus",
+    "standard",
+    "explicit",
+    "solver",
+    "package",
+)
+JOB_NAME_COMMAND_PATTERNS = (
+    re.compile(r'(?:^|\s)-?job\s*=\s*["\']?([^"\'\s]+)', re.IGNORECASE),
+    re.compile(r'(?:^|\s)-job\s+["\']?([^"\'\s]+)', re.IGNORECASE),
+    re.compile(r'(?:^|\s)-?input\s*=\s*["\']?([^"\'\s]+)', re.IGNORECASE),
+)
+COMMAND_PARAMETER_PATTERN_CACHE = {}
 
 # ================= 字体统一设置 =================
 FONT_FAMILY = "Microsoft YaHei"
@@ -258,12 +281,18 @@ class QueueItem:
     complete_notify: bool = False
     active_job_key: str = ""
     elapsed: str = ""
+    job_type: str = ""
+    is_external: bool = False
+    external_work_dir: str = ""
+    pids: list = field(default_factory=list)
+    rss_bytes: int = 0
 
 
 log_tab_counter = 0
 right_panel_visible = False
 active_jobs = {}
 diagnostic_file_cache = {}
+inp_restart_keyword_cache = {}
 queue_lock = threading.Lock()
 queue_candidates = []
 queue_items = []
@@ -275,6 +304,14 @@ queue_formal_summary_var = None
 queue_scan_subdirs_var = None
 queue_skip_restart_var = None
 queue_skip_existing_var = None
+queue_work_dir_var = None
+queue_work_dir_combo = None
+queue_scan_external_btn = None
+queue_work_dir_history = []
+queue_manager_view_signature = {
+    "candidate": None,
+    "formal": None,
+}
 joblist_state = {
     "active": False,
     "work_dir": "",
@@ -287,6 +324,8 @@ joblist_state = {
     "oldjob_paths": {},
     "dependencies": {},
     "existing_odb_action": "",
+    "dispatch_after_id": None,
+    "dispatch_due_time": 0.0,
 }
 job_tab_records = {}
 job_selector_var = None
@@ -309,6 +348,21 @@ job_memory_estimates = {}
 memory_safety_factor_state = {
     "value": JOB_MEMORY_BASE_SAFETY_FACTOR,
 }
+
+
+class MemoryStatusEx(ctypes.Structure):
+    """Windows GlobalMemoryStatusEx structure reused across queue checks."""
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
 
 
 def append_log(log_widget, text):
@@ -507,19 +561,6 @@ def format_duration(seconds):
 def get_system_memory_info():
     """读取系统总物理内存和当前可用物理内存。"""
     if os.name == "nt":
-        class MemoryStatusEx(ctypes.Structure):
-            _fields_ = [
-                ("dwLength", ctypes.c_ulong),
-                ("dwMemoryLoad", ctypes.c_ulong),
-                ("ullTotalPhys", ctypes.c_ulonglong),
-                ("ullAvailPhys", ctypes.c_ulonglong),
-                ("ullTotalPageFile", ctypes.c_ulonglong),
-                ("ullAvailPageFile", ctypes.c_ulonglong),
-                ("ullTotalVirtual", ctypes.c_ulonglong),
-                ("ullAvailVirtual", ctypes.c_ulonglong),
-                ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-            ]
-
         status = MemoryStatusEx()
         status.dwLength = ctypes.sizeof(MemoryStatusEx)
 
@@ -648,14 +689,8 @@ def parse_job_name_from_command_line(command_line):
     if not command_line:
         return ""
 
-    patterns = (
-        r'(?i)(?:^|\s)-?job\s*=\s*["\']?([^"\'\s]+)',
-        r'(?i)(?:^|\s)-job\s+["\']?([^"\'\s]+)',
-        r'(?i)(?:^|\s)-?input\s*=\s*["\']?([^"\'\s]+)',
-    )
-
-    for pattern in patterns:
-        match = re.search(pattern, command_line)
+    for pattern in JOB_NAME_COMMAND_PATTERNS:
+        match = pattern.search(command_line)
         if match:
             return os.path.splitext(os.path.basename(match.group(1)))[0]
 
@@ -691,6 +726,340 @@ def find_process_abaqus_job_name(process_row, process_by_pid):
     return ""
 
 
+def normalize_work_dir(path):
+    """Normalize a work directory for Windows-safe comparisons."""
+    if not path:
+        return ""
+
+    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
+
+
+def join_process_command_line(cmdline):
+    """Return a readable command line from psutil cmdline data."""
+    if isinstance(cmdline, (list, tuple)):
+        return " ".join(str(part) for part in cmdline)
+
+    return str(cmdline or "")
+
+
+def is_abaqus_process_name(process_name):
+    """Return True when a process name is specific enough to be Abaqus-related."""
+    stem = os.path.splitext(os.path.basename(str(process_name or "").lower()))[0]
+    if not stem:
+        return False
+
+    if stem in ABAQUS_PROCESS_EXACT_NAMES:
+        return True
+
+    if stem.startswith("sma"):
+        return True
+
+    return any(marker in stem for marker in ABAQUS_PROCESS_SUBSTRINGS)
+
+
+def get_command_parameter_patterns(parameter):
+    """Return cached regexes for extracting Abaqus command parameters."""
+    parameter_key = parameter.lower()
+    cached = COMMAND_PARAMETER_PATTERN_CACHE.get(parameter_key)
+    if cached is not None:
+        return cached
+
+    name = re.escape(parameter_key)
+    patterns = [
+        re.compile(rf'(?:^|\s)-?{name}\s*=\s*"([^"]+)"', re.IGNORECASE),
+        re.compile(rf"(?:^|\s)-?{name}\s*=\s*'([^']+)'", re.IGNORECASE),
+        re.compile(rf"(?:^|\s)-?{name}\s*=\s*([^\s]+)", re.IGNORECASE),
+    ]
+    if parameter_key == "job":
+        patterns.extend(
+            [
+                re.compile(r'(?:^|\s)-job\s+"([^"]+)"', re.IGNORECASE),
+                re.compile(r"(?:^|\s)-job\s+'([^']+)'", re.IGNORECASE),
+                re.compile(r"(?:^|\s)-job\s+([^\s]+)", re.IGNORECASE),
+            ]
+        )
+
+    COMMAND_PARAMETER_PATTERN_CACHE[parameter_key] = patterns
+    return patterns
+
+
+def extract_abaqus_command_parameter(command_line, parameter):
+    """Extract one Abaqus command parameter from a command line."""
+    if not command_line or not parameter:
+        return ""
+
+    for pattern in get_command_parameter_patterns(parameter):
+        match = pattern.search(command_line)
+        if match:
+            return match.group(1).strip()
+
+    return ""
+
+
+def get_process_and_parent_chain(process_row, process_by_pid, max_depth=8):
+    """Return current process plus parents, limited to a small depth."""
+    chain = []
+    try:
+        current_pid = int(process_row.get("ProcessId") or 0)
+    except (TypeError, ValueError):
+        return chain
+
+    visited = set()
+    while current_pid and current_pid in process_by_pid and current_pid not in visited:
+        visited.add(current_pid)
+        current_row = process_by_pid[current_pid]
+        chain.append(current_row)
+        if len(chain) >= max_depth:
+            break
+        try:
+            current_pid = int(current_row.get("ParentProcessId") or 0)
+        except (TypeError, ValueError):
+            break
+
+    return chain
+
+
+def is_possible_abaqus_process(process_chain):
+    """Return True if a process chain looks Abaqus-related."""
+    for row in process_chain:
+        if is_abaqus_process_name(row.get("Name", "")):
+            return True
+
+        command_line = str(row.get("CommandLine", "")).lower()
+        if command_line and any(marker in command_line for marker in ABAQUS_PROCESS_NAME_MARKERS):
+            return True
+
+    return False
+
+
+def get_first_chain_parameter(process_chain, parameter):
+    """Find one Abaqus command parameter from current process or parents."""
+    for row in process_chain:
+        value = extract_abaqus_command_parameter(
+            row.get("CommandLine") or "",
+            parameter
+        )
+        if value:
+            return value
+
+    return ""
+
+
+def get_chain_work_dir(process_chain, target_work_dir):
+    """Return the matching process work directory from a process chain."""
+    normalized_target = normalize_work_dir(target_work_dir)
+    for row in process_chain:
+        cwd = row.get("Cwd") or ""
+        if cwd and normalize_work_dir(cwd) == normalized_target:
+            return os.path.abspath(os.path.normpath(cwd))
+
+    return ""
+
+
+def resolve_external_job_path(value, work_dir, extension=""):
+    """Resolve a command-line file path relative to an Abaqus work directory."""
+    if not value:
+        return ""
+
+    value = value.strip().strip('"').strip("'")
+    if extension and not os.path.splitext(value)[1]:
+        value = value + extension
+
+    if os.path.isabs(value):
+        return normalize_joblist_path(value)
+
+    return normalize_joblist_path(os.path.join(work_dir, value))
+
+
+def detect_external_job_type(process_chain):
+    """Infer Standard/Explicit/Abaqus from related process names and command lines."""
+    chain_text = " ".join(
+        f"{row.get('Name', '')} {row.get('CommandLine', '')}"
+        for row in process_chain
+    ).lower()
+    if "explicit" in chain_text:
+        return "Explicit"
+    if "standard" in chain_text:
+        return "Standard"
+
+    return "Abaqus"
+
+
+def fetch_psutil_process_rows_for_external_scan():
+    """Read process data needed to import externally launched Abaqus jobs."""
+    if psutil is None:
+        return []
+
+    rows = []
+    rows_by_pid = {}
+    process_by_pid = {}
+    detail_pids = set()
+
+    # Fast pass: avoid reading cmdline/cwd for every Windows process.
+    # Those calls can be slow or access-denied; only Abaqus-like processes and
+    # their parent chain need the expensive details for job-name detection.
+    for process in psutil.process_iter(["pid", "ppid", "name", "memory_info", "create_time"]):
+        try:
+            info = process.info
+            memory_info = info.get("memory_info")
+            pid = int(info.get("pid") or 0)
+            row = {
+                "Name": info.get("name") or "",
+                "ProcessId": pid,
+                "ParentProcessId": info.get("ppid") or 0,
+                "CommandLine": "",
+                "WorkingSetSize": getattr(memory_info, "rss", 0) if memory_info else 0,
+                "PrivatePageCount": getattr(memory_info, "private", 0) if memory_info else 0,
+                "CreateTime": info.get("create_time") or 0,
+                "Cwd": "",
+            }
+            rows.append(row)
+            rows_by_pid[pid] = row
+            process_by_pid[pid] = process
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            continue
+
+    for row in rows:
+        if not is_abaqus_process_name(row.get("Name") or ""):
+            continue
+
+        current_pid = int(row.get("ProcessId") or 0)
+        visited = set()
+        while current_pid and current_pid in rows_by_pid and current_pid not in visited:
+            visited.add(current_pid)
+            detail_pids.add(current_pid)
+            current_pid = int(rows_by_pid[current_pid].get("ParentProcessId") or 0)
+
+    for pid in detail_pids:
+        process = process_by_pid.get(pid)
+        if process is None:
+            continue
+        row = rows_by_pid.get(pid)
+        if row is None:
+            continue
+        try:
+            row["CommandLine"] = join_process_command_line(process.cmdline())
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            row["CommandLine"] = ""
+        try:
+            row["Cwd"] = process.cwd()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            row["Cwd"] = ""
+
+    return rows
+
+
+def scan_running_abaqus_jobs_by_psutil(work_dir):
+    """Scan running Abaqus jobs in one work directory using psutil."""
+    normalized_work_dir = normalize_work_dir(work_dir)
+    rows = fetch_psutil_process_rows_for_external_scan()
+    process_by_pid = {}
+    for row in rows:
+        try:
+            process_by_pid[int(row.get("ProcessId") or 0)] = row
+        except (TypeError, ValueError):
+            continue
+
+    scanned_jobs = {}
+    skipped_pids = []
+    counted_pids = {}
+    chain_cache = {}
+
+    for row in rows:
+        try:
+            row_pid = int(row.get("ProcessId") or 0)
+        except (TypeError, ValueError):
+            row_pid = 0
+
+        chain = chain_cache.get(row_pid)
+        if chain is None:
+            chain = get_process_and_parent_chain(row, process_by_pid)
+            chain_cache[row_pid] = chain
+        if not chain or not is_possible_abaqus_process(chain):
+            continue
+
+        matching_work_dir = get_chain_work_dir(chain, normalized_work_dir)
+        if not matching_work_dir:
+            continue
+
+        job_value = get_first_chain_parameter(chain, "job")
+        input_value = get_first_chain_parameter(chain, "input")
+        job_name = os.path.splitext(os.path.basename(job_value))[0] if job_value else ""
+        if not job_name and input_value:
+            job_name = os.path.splitext(os.path.basename(input_value))[0]
+
+        if not job_name:
+            try:
+                skipped_pids.append(row_pid)
+            except (TypeError, ValueError):
+                pass
+            continue
+
+        input_path = resolve_external_job_path(input_value, matching_work_dir)
+        if not input_path:
+            candidate_inp = os.path.join(matching_work_dir, job_name + ".inp")
+            if os.path.isfile(candidate_inp):
+                input_path = normalize_joblist_path(candidate_inp)
+
+        for_file = resolve_external_job_path(
+            get_first_chain_parameter(chain, "user"),
+            matching_work_dir
+        )
+        oldjob_name = get_first_chain_parameter(chain, "oldjob")
+        oldjob_path = resolve_external_job_path(oldjob_name, matching_work_dir, extension=".odb") if oldjob_name else ""
+        cores = get_first_chain_parameter(chain, "cpus")
+        memory_setting = get_first_chain_parameter(chain, "memory")
+        job_key = (normalized_work_dir, job_name.lower())
+
+        job_info = scanned_jobs.setdefault(
+            job_key,
+            {
+                "job_name": job_name,
+                "work_dir": matching_work_dir,
+                "inp_path": input_path,
+                "job_type": detect_external_job_type(chain),
+                "restart_dependency": oldjob_name,
+                "oldjob_path": oldjob_path,
+                "for_file": for_file,
+                "cores": cores,
+                "memory_setting": memory_setting,
+                "status": STATUS_RUNNING,
+                "source": "external_psutil",
+                "is_external": True,
+                "pids": [],
+                "rss_bytes": 0,
+            }
+        )
+
+        if input_path and not job_info.get("inp_path"):
+            job_info["inp_path"] = input_path
+        if for_file and not job_info.get("for_file"):
+            job_info["for_file"] = for_file
+        if oldjob_name and not job_info.get("restart_dependency"):
+            job_info["restart_dependency"] = oldjob_name
+        if oldjob_path and not job_info.get("oldjob_path"):
+            job_info["oldjob_path"] = oldjob_path
+        if cores and not job_info.get("cores"):
+            job_info["cores"] = cores
+        if memory_setting and not job_info.get("memory_setting"):
+            job_info["memory_setting"] = memory_setting
+        if job_info.get("job_type") == "Abaqus":
+            job_info["job_type"] = detect_external_job_type(chain)
+
+        if row_pid and row_pid not in counted_pids.setdefault(job_key, set()):
+            counted_pids[job_key].add(row_pid)
+            job_info["pids"].append(row_pid)
+            try:
+                job_info["rss_bytes"] += int(row.get("WorkingSetSize") or 0)
+            except (TypeError, ValueError):
+                pass
+
+    for job_info in scanned_jobs.values():
+        job_info["pids"] = sorted(job_info["pids"])
+
+    return list(scanned_jobs.values()), skipped_pids
+
+
 def fetch_psutil_process_rows():
     """Read process rows with psutil, avoiding PowerShell startup overhead."""
     if psutil is None:
@@ -717,8 +1086,7 @@ def fetch_psutil_process_rows():
 
     cmdline_pids = set()
     for row in rows:
-        process_name = str(row.get("Name") or "").lower()
-        if not any(marker in process_name for marker in ABAQUS_PROCESS_NAME_MARKERS):
+        if not is_abaqus_process_name(row.get("Name") or ""):
             continue
 
         current_pid = int(row.get("ProcessId") or 0)
@@ -800,7 +1168,6 @@ def get_abaqus_job_memory_usage(force=False):
     now = time.monotonic()
     if (
             not force
-            and abaqus_memory_cache["usage"]
             and now - abaqus_memory_cache["timestamp"] < ABAQUS_MEMORY_POLL_INTERVAL_SECONDS
     ):
         return abaqus_memory_cache["usage"]
@@ -1006,7 +1373,7 @@ def run_global_memory_monitor():
         memory_monitor_state["running"] = False
         return
 
-    usage_by_job = get_abaqus_job_memory_usage(force=True)
+    usage_by_job = get_abaqus_job_memory_usage()
     for job_state in tracked_jobs:
         update_job_memory_sample(
             job_state,
@@ -3292,6 +3659,30 @@ def get_oldjob_name_from_path(oldjob_path):
     return os.path.splitext(os.path.basename(oldjob_path))[0]
 
 
+def get_oldjob_lck_path(oldjob_path):
+    """Return the lock-file path that belongs to an oldjob ODB."""
+    if not oldjob_path:
+        return ""
+
+    root_path, _extension = os.path.splitext(oldjob_path)
+    return root_path + ".lck"
+
+
+def check_oldjob_result_ready(oldjob_path):
+    """Check that the restart oldjob ODB exists and its lock file is gone."""
+    if not oldjob_path:
+        return False, "未指定重启动依赖"
+
+    if not os.path.isfile(oldjob_path):
+        return False, "oldjob ODB 不存在"
+
+    lck_path = get_oldjob_lck_path(oldjob_path)
+    if lck_path and os.path.exists(lck_path):
+        return False, "oldjob LCK 未释放"
+
+    return True, ""
+
+
 def get_queue_inp_name_for_oldjob_path(oldjob_path):
     """Return the queue INP name that can produce the missing oldjob ODB."""
     if not oldjob_path:
@@ -3310,41 +3701,42 @@ def is_completed_queue_status(status):
     return status in ("完成", "Datacheck Completed", STATUS_COMPLETED)
 
 
-def wait_for_oldjob_odb(oldjob_path, timeout_seconds=10, interval_seconds=2):
-    """Wait briefly for an oldjob ODB that may be produced by a queued job."""
-    deadline = time.monotonic() + timeout_seconds
-
-    while True:
-        if os.path.isfile(oldjob_path):
-            return True
-
-        if time.monotonic() >= deadline:
-            return False
-
-        try:
-            root.update_idletasks()
-        except tk.TclError:
-            pass
-
-        time.sleep(interval_seconds)
-
-
 def inp_has_restart_keyword(inp_file):
     """检查 INP 头部是否包含 *Restart。"""
     try:
-        with open(inp_file, "r", encoding=STA_FILE_ENCODING, errors="replace") as file:
+        normalized_path = normalize_joblist_path(inp_file)
+        stat_result = os.stat(normalized_path)
+    except OSError:
+        inp_restart_keyword_cache.pop(inp_file, None)
+        return False
+
+    signature = (stat_result.st_mtime_ns, stat_result.st_size)
+    cached = inp_restart_keyword_cache.get(normalized_path)
+    if cached and cached.get("signature") == signature:
+        return bool(cached.get("has_restart"))
+
+    try:
+        has_restart = False
+        with open(normalized_path, "r", encoding=STA_FILE_ENCODING, errors="replace") as file:
             for index, line in enumerate(file):
                 stripped = line.strip().lower()
 
                 if stripped.startswith("*step"):
-                    return False
+                    break
 
                 if stripped.startswith("*restart"):
-                    return True
+                    has_restart = True
+                    break
 
                 if index >= 300:
-                    return False
+                    break
+        inp_restart_keyword_cache[normalized_path] = {
+            "signature": signature,
+            "has_restart": has_restart,
+        }
+        return has_restart
     except OSError:
+        inp_restart_keyword_cache.pop(normalized_path, None)
         return False
 
     return False
@@ -3958,7 +4350,7 @@ def apply_joblist_max_parallel_change(event=None):
     if joblist_state.get("active"):
         append_history_text(f"队列最大并行数已调整：{old_value} -> {value}\n\n")
         update_joblist_status_label()
-        root.after(100, dispatch_joblist)
+        schedule_dispatch_joblist(100)
     else:
         update_joblist_status_label()
 
@@ -4123,10 +4515,16 @@ def validate_formal_queue_item_before_submit(item):
             item.valid = False
             item.message = "未指定重启动依赖"
             return False
-        if not os.path.isfile(item.oldjob_path):
-            item.status = STATUS_WAITING_DEPENDENCY
-            item.valid = True
-            item.message = "等待前置 ODB"
+
+        ready, detail = check_oldjob_result_ready(item.oldjob_path)
+        if not ready:
+            if item.item_id in joblist_state.get("dependencies", {}):
+                item.status = STATUS_WAITING_DEPENDENCY
+                item.valid = True
+            else:
+                item.status = STATUS_FAILED
+                item.valid = False
+            item.message = detail
             return False
 
     item.message = "准备提交"
@@ -4185,6 +4583,11 @@ def save_formal_queue_file():
             "memory": item.memory,
             "status": item.status,
             "message": item.message,
+            "source": item.source,
+            "is_external": item.is_external,
+            "external_work_dir": item.external_work_dir,
+            "pids": item.pids,
+            "rss_bytes": item.rss_bytes,
         }
         for item in queue_items
     ]
@@ -4194,6 +4597,104 @@ def save_formal_queue_file():
     joblist_state["work_dir"] = work_dir
     joblist_state["joblist_path"] = path
     return path
+
+
+def get_queue_item_external_key(item):
+    """Return the formal queue de-duplication key for a job record."""
+    work_dir = item.external_work_dir or os.path.dirname(item.inp_path)
+    if not work_dir:
+        return ("", item.job_name.lower())
+
+    return (normalize_work_dir(work_dir), item.job_name.lower())
+
+
+def find_queue_item_by_external_key(work_dir, job_name):
+    """Find an existing formal queue item by work directory and job name."""
+    target_key = (normalize_work_dir(work_dir), job_name.lower())
+    for item in queue_items:
+        if get_queue_item_external_key(item) == target_key:
+            return item
+
+    return None
+
+
+def update_queue_item_from_external_job(item, job_info):
+    """Apply scanned external job fields to an existing QueueItem."""
+    item.source = "external_psutil" if not item.source else item.source
+    item.is_external = True
+    item.external_work_dir = job_info["work_dir"]
+    item.inp_path = job_info.get("inp_path") or item.inp_path
+    item.job_type = job_info.get("job_type") or item.job_type or "Abaqus"
+    item.oldjob_name = job_info.get("restart_dependency") or item.oldjob_name
+    item.oldjob_path = job_info.get("oldjob_path") or item.oldjob_path
+    item.oldjob_dir = os.path.dirname(item.oldjob_path) if item.oldjob_path else item.oldjob_dir
+    item.run_mode = "restart" if item.oldjob_name else item.run_mode
+    item.fortran_path = job_info.get("for_file") or item.fortran_path
+    try:
+        item.cores = int(job_info.get("cores") or item.cores or 0)
+    except (TypeError, ValueError):
+        item.cores = 0
+    item.memory = job_info.get("memory_setting") or item.memory
+    item.status = STATUS_RUNNING
+    item.valid = True
+    item.message = "外部导入运行中"
+    item.pids = list(job_info.get("pids") or [])
+    item.rss_bytes = int(job_info.get("rss_bytes") or 0)
+    item.active_job_key = ""
+
+
+def create_external_queue_item(job_info):
+    """Create a QueueItem for a running job launched outside this GUI."""
+    item = QueueItem(
+        inp_path=job_info.get("inp_path") or "",
+        job_name=job_info["job_name"],
+        source="external_psutil",
+        status=STATUS_RUNNING,
+        selected=False,
+        valid=True,
+        message="外部导入运行中",
+        run_mode="restart" if job_info.get("restart_dependency") else "normal",
+        oldjob_name=job_info.get("restart_dependency") or "",
+        oldjob_dir=os.path.dirname(job_info.get("oldjob_path") or "") if job_info.get("oldjob_path") else "",
+        oldjob_path=job_info.get("oldjob_path") or "",
+        fortran_path=job_info.get("for_file") or "",
+        memory=job_info.get("memory_setting") or "",
+        job_type=job_info.get("job_type") or "Abaqus",
+        is_external=True,
+        external_work_dir=job_info["work_dir"],
+        pids=list(job_info.get("pids") or []),
+        rss_bytes=int(job_info.get("rss_bytes") or 0),
+    )
+    try:
+        item.cores = int(job_info.get("cores") or 0)
+    except (TypeError, ValueError):
+        item.cores = 0
+    return item
+
+
+def import_or_update_external_jobs(scanned_jobs):
+    """Merge scanned external jobs into the formal queue."""
+    added = 0
+    updated = 0
+    with queue_lock:
+        for job_info in scanned_jobs:
+            existing = find_queue_item_by_external_key(
+                job_info["work_dir"],
+                job_info["job_name"]
+            )
+            if existing is None:
+                queue_items.append(create_external_queue_item(job_info))
+                added += 1
+            else:
+                update_queue_item_from_external_job(existing, job_info)
+                updated += 1
+
+    sync_joblist_state_from_queue_items()
+    try:
+        save_formal_queue_file()
+    except OSError:
+        pass
+    return added, updated
 
 
 def register_single_submit_queue_item(job_state):
@@ -4225,7 +4726,6 @@ def register_single_submit_queue_item(job_state):
     with queue_lock:
         queue_items.append(item)
     sync_joblist_state_from_queue_items()
-    refresh_queue_manager_views()
 
 
 def update_queue_item_from_final_job_status(job_state, status, detail=""):
@@ -4300,164 +4800,6 @@ def get_initial_joblist_browse_dir():
             return normalize_joblist_path(path)
 
     return normalize_joblist_path(os.getcwd())
-
-
-def ask_joblist_source_mode():
-    """Ask whether to build the queue from INP files or from a folder."""
-    dialog = tk.Toplevel(root)
-    dialog.title("生成队列")
-    dialog.transient(root)
-    dialog.grab_set()
-    dialog.configure(bg="#ffffff")
-    dialog.resizable(False, False)
-
-    result = {"mode": None}
-
-    main = tk.Frame(dialog, bg="#ffffff")
-    main.pack(fill="both", expand=True, padx=18, pady=16)
-
-    tk.Label(
-        main,
-        text="请选择队列来源",
-        bg="#ffffff",
-        fg="#111827",
-        anchor="w",
-        font=FONT_LABEL
-    ).pack(fill="x", pady=(0, 12))
-
-    def choose(mode):
-        result["mode"] = mode
-        dialog.destroy()
-
-    ctk.CTkButton(
-        main,
-        text="从 INP 文件生成队列",
-        width=220,
-        height=34,
-        corner_radius=7,
-        font=FONT_BUTTON,
-        fg_color="#2563eb",
-        hover_color="#1d4ed8",
-        text_color="#ffffff",
-        command=lambda: choose("files")
-    ).pack(fill="x", pady=(0, 8))
-
-    ctk.CTkButton(
-        main,
-        text="从文件夹生成队列",
-        width=220,
-        height=34,
-        corner_radius=7,
-        font=FONT_BUTTON,
-        fg_color=BTN_LIGHT_FG,
-        hover_color=BTN_LIGHT_HOVER,
-        text_color=BTN_LIGHT_TEXT,
-        command=lambda: choose("folder")
-    ).pack(fill="x", pady=(0, 8))
-
-    ctk.CTkButton(
-        main,
-        text="取消",
-        width=220,
-        height=30,
-        corner_radius=7,
-        font=FONT_BUTTON,
-        fg_color="#e5e7eb",
-        hover_color="#d1d5db",
-        text_color="#111827",
-        command=lambda: choose(None)
-    ).pack(fill="x")
-
-    dialog.protocol("WM_DELETE_WINDOW", lambda: choose(None))
-    dialog.update_idletasks()
-    width = dialog.winfo_reqwidth()
-    height = dialog.winfo_reqheight()
-    root.update_idletasks()
-    x = root.winfo_x() + (root.winfo_width() - width) // 2
-    y = root.winfo_y() + (root.winfo_height() - height) // 2
-    dialog.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
-
-    root.wait_window(dialog)
-    return result["mode"]
-
-
-def ask_joblist_source_mode():
-    """Show a dropdown-like source menu below the queue button."""
-    dialog = tk.Toplevel(root)
-    dialog.overrideredirect(True)
-    dialog.transient(root)
-    dialog.configure(bg="#cbd5e1")
-    dialog.resizable(False, False)
-
-    result = {"mode": None}
-    main = tk.Frame(dialog, bg="#ffffff", padx=1, pady=1)
-    main.pack(fill="both", expand=True)
-
-    def choose(mode):
-        result["mode"] = mode
-        try:
-            dialog.destroy()
-        except tk.TclError:
-            pass
-
-    action_text = "追加队列" if is_joblist_submitted() else "生成队列"
-    button_width = 220
-    try:
-        button_width = max(190, build_joblist_btn.winfo_width())
-    except (NameError, tk.TclError):
-        pass
-
-    ctk.CTkButton(
-        main,
-        text=f"从 INP 文件{action_text}",
-        width=button_width,
-        height=32,
-        corner_radius=0,
-        font=FONT_BUTTON,
-        fg_color="#ffffff",
-        hover_color="#e5eefc",
-        text_color="#111827",
-        command=lambda: choose("files")
-    ).pack(fill="x")
-
-    ctk.CTkButton(
-        main,
-        text=f"从文件夹{action_text}",
-        width=button_width,
-        height=32,
-        corner_radius=0,
-        font=FONT_BUTTON,
-        fg_color="#ffffff",
-        hover_color="#e5eefc",
-        text_color="#111827",
-        command=lambda: choose("folder")
-    ).pack(fill="x")
-
-    dialog.protocol("WM_DELETE_WINDOW", lambda: choose(None))
-    dialog.bind("<Escape>", lambda _event: choose(None))
-    dialog.update_idletasks()
-
-    width = max(button_width, dialog.winfo_reqwidth())
-    height = dialog.winfo_reqheight()
-    try:
-        x = build_joblist_btn.winfo_rootx()
-        y = build_joblist_btn.winfo_rooty() + build_joblist_btn.winfo_height() + 2
-    except (NameError, tk.TclError):
-        root.update_idletasks()
-        x = root.winfo_x() + (root.winfo_width() - width) // 2
-        y = root.winfo_y() + (root.winfo_height() - height) // 2
-
-    dialog.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
-    dialog.lift(root)
-    try:
-        dialog.attributes("-topmost", True)
-        dialog.after(150, lambda: dialog.attributes("-topmost", False))
-    except tk.TclError:
-        pass
-    dialog.focus_force()
-
-    root.wait_window(dialog)
-    return result["mode"]
 
 
 def ask_joblist_source_mode():
@@ -4812,6 +5154,14 @@ def candidate_tree_toggle_selection(event):
 
 def queue_item_row_values(item, index, candidate=False):
     """Return row values for a queue Treeview."""
+    job_type_text = item.job_type or ("重启动" if item.run_mode == "restart" else "普通")
+    status_text = item.status
+    if item.is_external and item.status == STATUS_RUNNING:
+        status_text = "运行中（外部导入）"
+    memory_text = item.memory if item.memory else "默认"
+    if item.is_external:
+        memory_text = format_memory_size(item.rss_bytes) if item.rss_bytes else ""
+
     if candidate:
         return (
             "☑" if item.selected else "☐",
@@ -4819,7 +5169,7 @@ def queue_item_row_values(item, index, candidate=False):
             item.job_name,
             item.inp_path,
             item.source,
-            "重启动" if item.run_mode == "restart" else "普通",
+            job_type_text,
             item.oldjob_name if item.oldjob_name else "—",
             os.path.basename(item.fortran_path) if item.fortran_path else "—",
             item.message,
@@ -4829,12 +5179,12 @@ def queue_item_row_values(item, index, candidate=False):
         index,
         item.job_name,
         item.inp_path,
-        "重启动" if item.run_mode == "restart" else "普通",
+        job_type_text,
         item.oldjob_name if item.oldjob_name else "—",
         os.path.basename(item.fortran_path) if item.fortran_path else "—",
         item.cores,
-        item.memory if item.memory else "默认",
-        item.status,
+        memory_text,
+        status_text,
         item.message,
     )
 
@@ -4843,13 +5193,37 @@ def refresh_queue_manager_views():
     """Refresh candidate/formal queue Treeviews and summaries."""
     try:
         if queue_candidate_tree is not None and queue_candidate_tree.winfo_exists():
-            queue_candidate_tree.delete(*queue_candidate_tree.get_children())
-            for index, item in enumerate(queue_candidates, start=1):
-                queue_candidate_tree.insert("", "end", iid=item.item_id, values=queue_item_row_values(item, index, candidate=True))
+            candidate_rows = tuple(
+                (
+                    item.item_id,
+                    queue_item_row_values(item, index, candidate=True)
+                )
+                for index, item in enumerate(queue_candidates, start=1)
+            )
+            if (
+                    candidate_rows != queue_manager_view_signature["candidate"]
+                    or (candidate_rows and not queue_candidate_tree.get_children())
+            ):
+                queue_candidate_tree.delete(*queue_candidate_tree.get_children())
+                for item_id, values in candidate_rows:
+                    queue_candidate_tree.insert("", "end", iid=item_id, values=values)
+                queue_manager_view_signature["candidate"] = candidate_rows
         if queue_formal_tree is not None and queue_formal_tree.winfo_exists():
-            queue_formal_tree.delete(*queue_formal_tree.get_children())
-            for index, item in enumerate(queue_items, start=1):
-                queue_formal_tree.insert("", "end", iid=item.item_id, values=queue_item_row_values(item, index, candidate=False))
+            formal_rows = tuple(
+                (
+                    item.item_id,
+                    queue_item_row_values(item, index, candidate=False)
+                )
+                for index, item in enumerate(queue_items, start=1)
+            )
+            if (
+                    formal_rows != queue_manager_view_signature["formal"]
+                    or (formal_rows and not queue_formal_tree.get_children())
+            ):
+                queue_formal_tree.delete(*queue_formal_tree.get_children())
+                for item_id, values in formal_rows:
+                    queue_formal_tree.insert("", "end", iid=item_id, values=values)
+                queue_manager_view_signature["formal"] = formal_rows
         if queue_candidate_summary_var is not None:
             total = len(queue_candidates)
             selected = sum(1 for item in queue_candidates if item.selected)
@@ -4921,7 +5295,7 @@ def confirm_selected_candidates_to_queue():
     append_history_text(f"已确认加入正式队列：{len(added_ids)} 个作业\n\n")
     if joblist_state.get("active"):
         if ensure_joblist_restart_oldjobs(force_prompt=False, confirm=False):
-            root.after(100, dispatch_joblist)
+            schedule_dispatch_joblist(100)
 
 
 def cancel_selected_pending_queue_items():
@@ -4949,16 +5323,39 @@ def terminate_selected_running_queue_items():
     """Terminate selected formal queue jobs that are starting or running."""
     if queue_formal_tree is None:
         return
+    changed = False
     for item_id in queue_formal_tree.selection():
         item = get_queue_item(item_id)
         if not item or item.status not in (STATUS_STARTING, STATUS_RUNNING):
+            continue
+        if item.is_external:
+            work_dir = item.external_work_dir or os.path.dirname(item.inp_path)
+            if not work_dir or not os.path.isdir(work_dir):
+                messagebox.showerror("无法终止", f"外部作业工作目录不存在：\n{work_dir}")
+                continue
+            try:
+                run_command_hidden(f"abaqus terminate job={item.job_name}", work_dir)
+            except OSError as exc:
+                messagebox.showerror(
+                    "终止命令失败",
+                    f"Abaqus 终止命令执行失败：\n{exc}\n\n"
+                    "未执行强制终止，以避免损坏结果文件。"
+                )
+                continue
+            item.status = STATUS_TERMINATING
+            item.message = "正在终止（外部导入）"
+            joblist_state["statuses"][item.item_id] = STATUS_TERMINATING
+            append_history_text(f"外部作业终止命令已发送：{item.job_name}\n\n")
+            changed = True
             continue
         if item.active_job_key and item.active_job_key in active_jobs:
             item.status = STATUS_TERMINATING
             item.message = "正在终止"
             joblist_state["statuses"][item.item_id] = STATUS_TERMINATING
-            refresh_queue_manager_views()
+            changed = True
             terminate_job(active_jobs[item.active_job_key])
+    if changed:
+        refresh_queue_manager_views()
 
 
 def clear_finished_queue_items():
@@ -4966,6 +5363,134 @@ def clear_finished_queue_items():
     with queue_lock:
         queue_items[:] = [item for item in queue_items if item.status not in TERMINAL_QUEUE_STATUSES]
     sync_joblist_state_from_queue_items()
+
+
+def get_default_queue_work_dir():
+    """Return the default directory for external-job scanning."""
+    candidates = [
+        joblist_state.get("work_dir", ""),
+        os.path.dirname(inp_file_var.get().strip()) if "inp_file_var" in globals() else "",
+        os.getcwd(),
+    ]
+    for path in candidates:
+        if path and os.path.isdir(path):
+            return normalize_joblist_path(path)
+
+    return normalize_joblist_path(os.getcwd())
+
+
+def remember_queue_work_dir(path):
+    """Keep a per-session history of queue scan directories."""
+    if not path:
+        return
+
+    normalized_path = normalize_joblist_path(path)
+    existing = [
+        old_path for old_path in queue_work_dir_history
+        if normalize_work_dir(old_path) != normalize_work_dir(normalized_path)
+    ]
+    queue_work_dir_history[:] = [normalized_path] + existing[:9]
+    if queue_work_dir_combo is not None:
+        try:
+            queue_work_dir_combo.configure(values=queue_work_dir_history)
+        except tk.TclError:
+            pass
+
+
+def set_external_scan_button_state(state):
+    """Enable or disable the queue external scan button."""
+    if queue_scan_external_btn is not None:
+        try:
+            queue_scan_external_btn.configure(state=state)
+        except tk.TclError:
+            pass
+
+
+def finish_external_job_scan(work_dir, scanned_jobs, skipped_pids, error=""):
+    """Merge scan results on the Tk main thread and report feedback."""
+    set_external_scan_button_state("normal")
+    if error:
+        messagebox.showerror("扫描失败", error)
+        return
+
+    if not scanned_jobs:
+        for pid in skipped_pids[:10]:
+            append_history_text(f"发现疑似 Abaqus 进程 PID {pid}，但无法识别 Job 名称，已跳过。\n")
+        messagebox.showinfo("未发现作业", "未在该目录中识别到正在运行的 Abaqus 作业。")
+        return
+
+    added, updated = import_or_update_external_jobs(scanned_jobs)
+    remember_queue_work_dir(work_dir)
+    for pid in skipped_pids[:10]:
+        append_history_text(f"发现疑似 Abaqus 进程 PID {pid}，但无法识别 Job 名称，已跳过。\n")
+    message = f"扫描完成：识别到 {len(scanned_jobs)} 个运行中的 Abaqus 作业，新增导入 {added} 个，更新 {updated} 个。"
+    append_history_text(message + "\n\n")
+    messagebox.showinfo("扫描完成", message)
+
+
+def scan_selected_work_directory():
+    """Scan external running Abaqus jobs from the selected work directory."""
+    if queue_work_dir_var is None:
+        return
+
+    work_dir = queue_work_dir_var.get().strip()
+    if not work_dir:
+        messagebox.showwarning("工作目录为空", "请先输入或选择工作目录。")
+        return
+
+    if not os.path.isdir(work_dir):
+        messagebox.showerror("工作目录不存在", f"工作目录不存在：\n{work_dir}")
+        return
+
+    if psutil is None:
+        messagebox.showerror("无法扫描", "当前 Python 环境未检测到 psutil，无法扫描外部运行作业。")
+        return
+
+    work_dir = normalize_joblist_path(work_dir)
+    queue_work_dir_var.set(work_dir)
+    remember_queue_work_dir(work_dir)
+    set_external_scan_button_state("disabled")
+
+    def worker():
+        try:
+            scanned_jobs, skipped_pids = scan_running_abaqus_jobs_by_psutil(work_dir)
+            error = ""
+        except (OSError, FileNotFoundError, ValueError) as exc:
+            scanned_jobs = []
+            skipped_pids = []
+            error = str(exc)
+
+        target_window = queue_manager_window if queue_manager_window is not None else root
+        try:
+            target_window.after(
+                0,
+                lambda: finish_external_job_scan(work_dir, scanned_jobs, skipped_pids, error)
+            )
+        except tk.TclError:
+            pass
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def select_queue_work_directory():
+    """Select a work directory for external Abaqus job scanning."""
+    if queue_work_dir_var is None:
+        return
+
+    initial_dir = queue_work_dir_var.get().strip()
+    if not initial_dir or not os.path.isdir(initial_dir):
+        initial_dir = get_default_queue_work_dir()
+
+    selected_dir = filedialog.askdirectory(
+        title="选择外部作业工作目录",
+        initialdir=initial_dir,
+    )
+    if not selected_dir:
+        return
+
+    selected_dir = normalize_joblist_path(selected_dir)
+    queue_work_dir_var.set(selected_dir)
+    remember_queue_work_dir(selected_dir)
 
 
 def show_queue_item_details(_event=None):
@@ -5162,6 +5687,7 @@ def open_queue_manager_window():
     global queue_manager_window, queue_candidate_tree, queue_formal_tree
     global queue_candidate_summary_var, queue_formal_summary_var
     global queue_scan_subdirs_var, queue_skip_restart_var, queue_skip_existing_var
+    global queue_work_dir_var, queue_work_dir_combo, queue_scan_external_btn
 
     if queue_manager_window is not None:
         try:
@@ -5173,7 +5699,8 @@ def open_queue_manager_window():
 
     queue_manager_window = tk.Toplevel(root)
     queue_manager_window.title("作业队列管理")
-    queue_manager_window.geometry("1120x720")
+    queue_manager_window.geometry("1280x720")
+    queue_manager_window.minsize(1180, 680)
     queue_manager_window.configure(bg="#f8fafc")
     queue_manager_window.transient(root)
 
@@ -5185,6 +5712,8 @@ def open_queue_manager_window():
     queue_skip_existing_var = tk.BooleanVar(value=False)
     queue_candidate_summary_var = tk.StringVar(value="候选：0")
     queue_formal_summary_var = tk.StringVar(value="正式队列：空")
+    queue_work_dir_var = tk.StringVar(value=get_default_queue_work_dir())
+    remember_queue_work_dir(queue_work_dir_var.get())
 
     candidate_section = ttk.LabelFrame(main, text="候选区", style="Queue.TLabelframe")
     candidate_section.pack(fill="both", expand=True, pady=(0, 10))
@@ -5223,6 +5752,47 @@ def open_queue_manager_window():
     create_queue_window_button(formal_toolbar, "编辑选中的待运行作业", edit_selected_pending_queue_item, width=148)
     create_queue_window_button(formal_toolbar, "终止选中的运行中作业", terminate_selected_running_queue_items, variant="danger", width=148)
     create_queue_window_button(formal_toolbar, "清理已结束记录", clear_finished_queue_items, width=112)
+    ctk.CTkLabel(
+        formal_toolbar,
+        text="工作目录：",
+        font=FONT_QUEUE_BUTTON,
+        text_color="#111827",
+        fg_color="#ffffff",
+        height=30,
+    ).pack(side="left", padx=(12, 4))
+    queue_work_dir_combo = ctk.CTkComboBox(
+        formal_toolbar,
+        variable=queue_work_dir_var,
+        values=queue_work_dir_history,
+        width=250,
+        height=30,
+        corner_radius=7,
+        border_width=1,
+        border_color="#cbd5e1",
+        fg_color="#ffffff",
+        button_color=BTN_LIGHT_FG,
+        button_hover_color=BTN_LIGHT_HOVER,
+        dropdown_fg_color="#ffffff",
+        dropdown_hover_color="#e5eefc",
+        dropdown_text_color="#111827",
+        text_color="#111827",
+        font=FONT_QUEUE_BUTTON,
+        dropdown_font=FONT_QUEUE_BUTTON,
+    )
+    queue_work_dir_combo.pack(side="left", padx=(0, 6))
+    create_queue_window_button(
+        formal_toolbar,
+        "选择",
+        select_queue_work_directory,
+        width=58
+    )
+    queue_scan_external_btn = create_queue_window_button(
+        formal_toolbar,
+        "扫描",
+        scan_selected_work_directory,
+        variant="primary",
+        width=58
+    )
     ttk.Label(formal_toolbar, textvariable=queue_formal_summary_var, style="Hint.TLabel").pack(side="right")
     queue_formal_tree = create_queue_table(
         formal_section,
@@ -5424,7 +5994,7 @@ def append_joblist_from_dir():
     )
     update_joblist_status_label()
     update_joblist_button_mode()
-    root.after(100, dispatch_joblist)
+    schedule_dispatch_joblist(100)
 
 
 def create_joblist_from_source():
@@ -5560,7 +6130,7 @@ def append_joblist_from_source():
     )
     update_joblist_status_label()
     update_joblist_button_mode()
-    root.after(100, dispatch_joblist)
+    schedule_dispatch_joblist(100)
 
 
 def select_joblist_dir():
@@ -5821,11 +6391,25 @@ def get_next_ready_joblist_name():
 
             dependency_status = joblist_state["statuses"].get(dependency_name)
             if is_completed_queue_status(dependency_status) or final_status_from_queue_status(dependency_status):
-                joblist_state["statuses"][name] = STATUS_PENDING_RUN
+                oldjob_path = joblist_state["oldjob_paths"].get(name, "")
+                ready, ready_detail = check_oldjob_result_ready(oldjob_path)
                 item = get_queue_item(name)
+                if ready:
+                    joblist_state["statuses"][name] = STATUS_PENDING_RUN
+                    if item is not None:
+                        item.status = STATUS_PENDING_RUN
+                        item.message = "前置作业已完成，ODB 已就绪"
+                    return name
+
+                joblist_state["statuses"][name] = STATUS_FAILED
                 if item is not None:
-                    item.status = STATUS_PENDING_RUN
-                return name
+                    item.status = STATUS_FAILED
+                    item.message = f"前置作业完成但 {ready_detail}"
+                append_history_text(
+                    f"跳过 Restart 作业：{name}\n"
+                    f"原因：前置作业 {dependency_name} 已完成，但 {ready_detail}。\n\n"
+                )
+                continue
 
             if dependency_status in (
                 STATUS_FAILED,
@@ -5858,6 +6442,50 @@ def get_next_ready_joblist_name():
                 item.message = f"等待前置作业：{dependency_name}"
 
     return ""
+
+
+def has_runnable_joblist_item():
+    """Return True when the queue has a non-dependency pending item."""
+    dependencies = joblist_state.get("dependencies", {})
+    for name in joblist_state["jobs"]:
+        if joblist_state["statuses"].get(name) != STATUS_PENDING_RUN:
+            continue
+
+        dependency_name = dependencies.get(name, "")
+        if not dependency_name or final_status_from_queue_status(joblist_state["statuses"].get(dependency_name)):
+            return True
+
+    return False
+
+
+def schedule_dispatch_joblist(delay_ms=100):
+    """Schedule one queue dispatch pass, coalescing duplicate timers."""
+    if not joblist_state.get("active"):
+        return
+
+    due_time = time.monotonic() + max(0, delay_ms) / 1000
+    existing_after_id = joblist_state.get("dispatch_after_id")
+    existing_due_time = float(joblist_state.get("dispatch_due_time") or 0)
+
+    if existing_after_id and existing_due_time and existing_due_time <= due_time:
+        return
+
+    if existing_after_id:
+        try:
+            root.after_cancel(existing_after_id)
+        except tk.TclError:
+            pass
+
+    def run_scheduled_dispatch():
+        joblist_state["dispatch_after_id"] = None
+        joblist_state["dispatch_due_time"] = 0.0
+        dispatch_joblist()
+
+    joblist_state["dispatch_due_time"] = due_time
+    joblist_state["dispatch_after_id"] = root.after(
+        max(0, delay_ms),
+        run_scheduled_dispatch
+    )
 
 
 def dispatch_joblist():
@@ -5929,8 +6557,8 @@ def dispatch_joblist():
     else:
         update_joblist_status_label()
         refresh_queue_manager_views()
-        if waiting and (not joblist_state["running"] or submit_slots <= 0):
-            root.after(5000, dispatch_joblist)
+        if waiting and has_runnable_joblist_item() and (not joblist_state["running"] or submit_slots <= 0):
+            schedule_dispatch_joblist(5000)
 
 
 def finish_joblist_job(job_state, status, detail=""):
@@ -5954,15 +6582,23 @@ def finish_joblist_job(job_state, status, detail=""):
 
         if is_completed_queue_status(status):
             if joblist_state["statuses"].get(dependent_name) in (STATUS_WAITING_DEPENDENCY, "等待前置"):
-                joblist_state["statuses"][dependent_name] = STATUS_PENDING_RUN
-                dependent_item = get_queue_item(dependent_name)
-                if dependent_item is not None:
-                    dependent_item.status = STATUS_PENDING_RUN
-                    dependent_item.message = "前置作业已完成"
                 oldjob_path = joblist_state["oldjob_paths"].get(dependent_name, "")
+                ready, ready_detail = check_oldjob_result_ready(oldjob_path)
+                dependent_item = get_queue_item(dependent_name)
+                if ready:
+                    joblist_state["statuses"][dependent_name] = STATUS_PENDING_RUN
+                    if dependent_item is not None:
+                        dependent_item.status = STATUS_PENDING_RUN
+                        dependent_item.message = "前置作业已完成，ODB 已就绪"
+                else:
+                    joblist_state["statuses"][dependent_name] = STATUS_FAILED
+                    if dependent_item is not None:
+                        dependent_item.status = STATUS_FAILED
+                        dependent_item.message = f"前置作业完成但 {ready_detail}"
                 append_history_text(
                     f"释放 Restart 作业：{dependent_name}\n"
-                    f"前置作业 {inp_name} 已完成，oldjob ODB：{oldjob_path}\n\n"
+                    f"前置作业 {inp_name} 已完成，oldjob ODB：{oldjob_path}\n"
+                    f"检查结果：{'ODB 已就绪，LCK 已释放' if ready else ready_detail}\n\n"
                 )
         else:
             joblist_state["statuses"][dependent_name] = STATUS_CANCELED
@@ -5982,7 +6618,7 @@ def finish_joblist_job(job_state, status, detail=""):
         save_formal_queue_file()
     except OSError:
         pass
-    root.after(500, dispatch_joblist)
+    schedule_dispatch_joblist(500)
 
 
 def stop_joblist_queue(source_job_state=None):
@@ -6065,23 +6701,9 @@ def submit_job(inp_file_override="", queue_mode=False, oldjob_path_override="", 
         oldjob_name = get_oldjob_name_from_path(oldjob_path)
 
     if oldjob_path:
-        if not os.path.isfile(oldjob_path):
-            if queue_mode and oldjob_path_override:
-                append_history_text(
-                    f"等待 oldjob ODB 生成：{os.path.basename(inp_file)} -> {oldjob_path}\n"
-                    "将在 10 秒内每 2 秒检测一次。\n\n"
-                )
-                if wait_for_oldjob_odb(oldjob_path):
-                    pass
-                else:
-                    messagebox.showerror("错误", f"ODB 文件不存在：\n{oldjob_path}")
-                    return ""
-            else:
-                messagebox.showerror("错误", f"ODB 文件不存在：\n{oldjob_path}")
-                return ""
-
-        if not os.path.isfile(oldjob_path):
-            messagebox.showerror("错误", f"ODB 文件不存在：\n{oldjob_path}")
+        ready, ready_detail = check_oldjob_result_ready(oldjob_path)
+        if not ready:
+            messagebox.showerror("错误", f"{ready_detail}：\n{oldjob_path}")
             return ""
 
         if os.path.splitext(oldjob_path)[1].lower() != ".odb":

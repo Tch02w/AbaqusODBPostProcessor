@@ -6,13 +6,12 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from queue import Empty, Queue
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
-from uuid import uuid4
 
 import customtkinter as ctk
 
@@ -22,288 +21,43 @@ except ImportError:
     psutil = None
 
 
-def get_physical_cpu_count():
-    """Return the physical CPU core count, falling back to logical CPUs."""
-    if os.name == "nt":
-        try:
-            relation_processor_core = 0
-            returned_length = ctypes.c_uint32(0)
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            get_processor_info = kernel32.GetLogicalProcessorInformationEx
-            get_processor_info.argtypes = [
-                ctypes.c_uint32,
-                ctypes.c_void_p,
-                ctypes.POINTER(ctypes.c_uint32)
-            ]
-            get_processor_info.restype = ctypes.c_int
-
-            get_processor_info(
-                relation_processor_core,
-                None,
-                ctypes.byref(returned_length)
-            )
-            if returned_length.value <= 0:
-                raise OSError("CPU core information is unavailable.")
-
-            buffer = ctypes.create_string_buffer(returned_length.value)
-            success = get_processor_info(
-                relation_processor_core,
-                buffer,
-                ctypes.byref(returned_length)
-            )
-            if not success:
-                raise OSError("Failed to read CPU core information.")
-
-            offset = 0
-            core_count = 0
-            while offset < returned_length.value:
-                entry_size = ctypes.c_uint32.from_buffer_copy(buffer, offset + 4).value
-                if entry_size <= 0:
-                    break
-                core_count += 1
-                offset += entry_size
-
-            if core_count:
-                return core_count
-        except (OSError, AttributeError, ValueError):
-            pass
-
-    return os.cpu_count() or 1
-
-
-MAX_CPUS = get_physical_cpu_count()
-MAX_THREADS = os.cpu_count() or MAX_CPUS
-DEFAULT_CPUS = max(1, MAX_CPUS // 2)
-STA_POLL_INTERVAL_MS = 5000
-RUNTIME_STATUS_INTERVAL_MS = 3000
-OUTPUT_FLUSH_INTERVAL_MS = 150
-ABAQUS_MEMORY_POLL_INTERVAL_SECONDS = 10
-JOB_MEMORY_MONITOR_INTERVAL_MS = 15000
-JOB_MEMORY_LEARNING_INTERVAL_MS = 15000
-JOB_MEMORY_PATROL_INTERVAL_MS = 90000
-EXTERNAL_JOB_MONITOR_INTERVAL_MS = 5000
-PROCESS_SNAPSHOT_CACHE_SECONDS = 5
-FORMAL_QUEUE_SAVE_DEBOUNCE_MS = 500
-MAX_JOB_LOG_LINES = 5000
-MAX_HISTORY_LOG_LINES = 2000
-LOG_TRIM_CHECK_INTERVAL = 50
-ENABLE_PERFORMANCE_LOG = False
-JOB_MEMORY_MIN_SAMPLES = 4
-JOB_MEMORY_STABLE_POLLS = 4
-JOB_MEMORY_STABLE_RELATIVE_DELTA = 0.08
-JOB_MEMORY_BASE_SAFETY_FACTOR = 1.10
-JOB_MEMORY_MAX_SAFETY_FACTOR = 1.50
-JOB_MEMORY_SAFETY_FACTOR_STEP = 0.10
-JOB_MEMORY_MAX_SAMPLES = 40
-STA_FILE_ENCODING = "GBK"
-LEFT_PANEL_WIDTH = 416
-LOG_SEPARATOR_WIDTH = 64
-LOG_TEXT_WIDTH = LOG_SEPARATOR_WIDTH
-LOG_TEXT_PIXEL_WIDTH = 488
-LOG_SCROLLBAR_WIDTH = 12
-LOG_VIEW_PIXEL_WIDTH = LOG_TEXT_PIXEL_WIDTH + LOG_SCROLLBAR_WIDTH
-RIGHT_PANEL_HORIZONTAL_PADDING = 0
-RIGHT_PANEL_MIN_WIDTH = LOG_VIEW_PIXEL_WIDTH + RIGHT_PANEL_HORIZONTAL_PADDING
-UNLIMITED_JOB_SLOTS = 10 ** 9
-WINDOW_HORIZONTAL_PADDING = 24
-WINDOW_VERTICAL_PADDING = 24
-WINDOW_HEIGHT = 720
-PANEL_HEIGHT = WINDOW_HEIGHT - WINDOW_VERTICAL_PADDING
-LEFT_ONLY_WIDTH = LEFT_PANEL_WIDTH + WINDOW_HORIZONTAL_PADDING
-FULL_WIDTH = LEFT_PANEL_WIDTH + RIGHT_PANEL_MIN_WIDTH + WINDOW_HORIZONTAL_PADDING + 16
-LEFT_ONLY_GEOMETRY = f"{LEFT_ONLY_WIDTH}x{WINDOW_HEIGHT}"
-FULL_GEOMETRY = f"{FULL_WIDTH}x{WINDOW_HEIGHT}"
-LEFT_ONLY_MIN_SIZE = (LEFT_ONLY_WIDTH, WINDOW_HEIGHT)
-FULL_MIN_SIZE = (FULL_WIDTH, WINDOW_HEIGHT)
-INP_FILE_PLACEHOLDER = "点击选择 INP 文件"
-OLDJOB_PLACEHOLDER = "点击选择重启动 ODB（可选）"
-FOR_FILE_PLACEHOLDER = "点击选择 Fortran 子程序（可选）"
-COMPLETE_MARKERS = (
-    "THE ANALYSIS HAS COMPLETED SUCCESSFULLY",
-    "THE ANALYSIS HAS BEEN COMPLETED SUCCESSFULLY",
+from abaqus_submitter.constants import *
+from abaqus_submitter.models import MemoryStatusEx, QueueItem
+from abaqus_submitter.persistence import atomic_write_json
+from abaqus_submitter.process_scanner import *
+from abaqus_submitter.ui_performance import (
+    ENABLE_UI_PERFORMANCE_LOG,
+    UI_EVENT_QUEUE_MAX_EVENTS_PER_TICK,
+    configure_ui_performance,
+    log_ui_queue_status,
+    log_worker_performance,
+    measure_ui_callback,
+    start_ui_lag_watchdog,
+    stop_ui_lag_watchdog,
 )
-
-TERMINATE_MARKERS = (
-    "THE ANALYSIS HAS BEEN TERMINATED",
-    "TERMINATED",
-    "USER REQUESTED TERMINATION",
-)
-
-ERROR_MARKERS = (
-    "ABAQUS ERROR",
-    "***ERROR",
-    "ERROR:",
-    "ABORTED",
-    "EXITED WITH ERRORS",
-    "EXITED WITH ERROR",
-    "ABAQUS/ANALYSIS EXITED WITH ERROR",
-    "THE ANALYSIS HAS NOT BEEN COMPLETED",
-    "LICENSE ERROR",
-    "LICENSE MANAGER ERROR",
-    "UNABLE TO CHECKOUT",
-    "NO LICENSE",
-    "PROBLEM DURING COMPILATION",
-    "PROBLEM DURING LINKING",
-    "LINK FATAL ERROR",
-    "TOO MANY ATTEMPTS",
-    "NUMERICAL SINGULARITY",
-    "ZERO PIVOT",
-    "TIME INCREMENT REQUIRED IS LESS THAN",
-    "EXCESSIVE DISTORTION",
-    "DUE TO ERRORS",
-    "ERRORS DETECTED",
+from abaqus_submitter.abaqus_diagnostics import (
+    abaqus_stage_started,
+    build_sta_table_header,
+    classify_job_text,
+    clear_diagnostic_file_cache,
+    format_sta_output_for_log,
+    get_existing_job_backup_time_tag,
+    inspect_job_files,
+    inspect_job_files_throttled,
+    parse_sta_progress,
+    read_file_tail,
+    update_abaqus_stage_from_text,
 )
 
 
-def calculate_default_joblist_parallel(cpus=None):
-    """Return default queue parallel count from 1.5x logical threads and per-job cores."""
-    if cpus is None:
-        cpus = DEFAULT_CPUS
-
-    try:
-        cpus = int(str(cpus).strip())
-    except (TypeError, ValueError):
-        cpus = DEFAULT_CPUS
-
-    requested_cpus = MAX_CPUS if cpus == 0 else max(1, cpus)
-    return max(1, (MAX_THREADS * 3) // (2 * requested_cpus))
-
-JOB_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
-DIAGNOSTIC_EXTENSIONS = (".sta", ".msg", ".dat", ".log")
-OVERWRITE_PROMPT_MARKERS = (
-    "OLD JOB FILES EXIST",
-    "OVERWRITE?",
-    "OVERWRITE",
-    "ALREADY EXISTS",
-    "EXISTING",
-    "Y/N",
-    "(Y/N)",
-)
-MEMORY_OPTIONS = ("默认", "%", "GB", "MB")
-ABAQUS_PROCESS_NAME_MARKERS = (
-    "abaqus",
-    "standard",
-    "explicit",
-    "pre",
-    "package",
-    "sma",
-    "solver",
-    "mpiexec",
-)
-ABAQUS_PROCESS_EXACT_NAMES = {
-    "abaqus",
-    "standard",
-    "explicit",
-    "pre",
-    "package",
-    "packager",
-    "mpiexec",
-    "eqsequationsolver",
-}
-ABAQUS_PROCESS_SUBSTRINGS = (
-    "abaqus",
-    "standard",
-    "explicit",
-    "solver",
-    "package",
-)
-JOB_NAME_COMMAND_PATTERNS = (
-    re.compile(r'(?:^|\s)-?job\s*=\s*["\']?([^"\'\s]+)', re.IGNORECASE),
-    re.compile(r'(?:^|\s)-job\s+["\']?([^"\'\s]+)', re.IGNORECASE),
-    re.compile(r'(?:^|\s)-?input\s*=\s*["\']?([^"\'\s]+)', re.IGNORECASE),
-)
-COMMAND_PARAMETER_PATTERN_CACHE = {}
-
-# ================= 字体统一设置 =================
-FONT_FAMILY = "Microsoft YaHei"
-
-FONT_TITLE = (FONT_FAMILY, 19, "bold")
-FONT_SUBTITLE = (FONT_FAMILY, 9)
-FONT_LABEL = (FONT_FAMILY, 12, "bold")
-FONT_HINT = (FONT_FAMILY, 10)
-FONT_ENTRY = (FONT_FAMILY, 10)
-FONT_NUMERIC_ENTRY = (FONT_FAMILY, 12)
-FONT_MEMORY_MENU = (FONT_FAMILY, 11)
-FONT_BUTTON = (FONT_FAMILY, 12)
-FONT_BUTTON_BOLD = (FONT_FAMILY, 13, "bold")
-FONT_LOG = ("Consolas", 10)
-FONT_JOB_SELECTOR = ("Consolas", 11)
-FONT_QUEUE_BUTTON = (FONT_FAMILY, 13)
-FONT_QUEUE_TABLE = (FONT_FAMILY, 10)
-FONT_QUEUE_HEADING = (FONT_FAMILY, 10)
-
-APP_BG = "#ffffff"
-CARD_BG = "#ffffff"
-LOG_BG = "#f9fafb"
-JOBLIST_FILENAME = "joblist.json"
-BTN_LIGHT_FG = "#dbe3ee"
-BTN_LIGHT_HOVER = "#cbd5e1"
-BTN_LIGHT_TEXT = "#111827"
-
-BTN_PAUSE_FG = "#facc15"      # 黄色：暂停
-BTN_PAUSE_HOVER = "#eab308"
-BTN_RESUME_FG = "#22c55e"     # 绿色：继续
-BTN_RESUME_HOVER = "#16a34a"
-BTN_STATUS_TEXT_DARK = "#111827"
-BTN_STATUS_TEXT_LIGHT = "#ffffff"
-
-STATUS_PENDING_CONFIRM = "待确认"
-STATUS_PENDING_RUN = "待运行"
-STATUS_STARTING = "正在启动"
-STATUS_RUNNING = "运行中"
-STATUS_COMPLETED = "已完成"
-STATUS_FAILED = "运行失败"
-STATUS_CANCELED = "已取消"
-STATUS_TERMINATING = "正在终止"
-STATUS_TERMINATED = "已终止"
-STATUS_WAITING_DEPENDENCY = "等待前置"
-STATUS_UNKNOWN = "状态未知"
-
-TERMINAL_QUEUE_STATUSES = {
-    STATUS_COMPLETED,
-    STATUS_FAILED,
-    STATUS_CANCELED,
-    STATUS_TERMINATED,
-    STATUS_UNKNOWN,
-    "Datacheck Completed",
-    "Datacheck Failed",
-}
-
-
-@dataclass
-class QueueItem:
-    item_id: str = field(default_factory=lambda: uuid4().hex)
-    inp_path: str = ""
-    job_name: str = ""
-    source: str = ""
-    status: str = STATUS_PENDING_CONFIRM
-    selected: bool = True
-    valid: bool = True
-    message: str = "可加入"
-    run_mode: str = "normal"
-    oldjob_name: str = ""
-    oldjob_dir: str = ""
-    oldjob_path: str = ""
-    fortran_path: str = ""
-    cores: int = 1
-    memory: str = ""
-    interactive: bool = False
-    datacheck_only: bool = False
-    complete_notify: bool = False
-    active_job_key: str = ""
-    elapsed: str = ""
-    job_type: str = ""
-    is_external: bool = False
-    external_work_dir: str = ""
-    pids: list = field(default_factory=list)
-    pid_create_times: dict = field(default_factory=dict)
-    rss_bytes: int = 0
-
+UI_EVENT_POLL_INTERVAL_MS = 300
 
 log_tab_counter = 0
 right_panel_visible = False
+application_closing = False
+ui_event_queue = Queue()
+ui_event_poll_after_id = None
 active_jobs = {}
-diagnostic_file_cache = {}
 inp_restart_keyword_cache = {}
 queue_lock = threading.Lock()
 queue_candidates = []
@@ -347,22 +101,17 @@ job_selector_name_label = None
 job_selector_arrow_label = None
 job_selector_popup = None
 job_stats_var = None
-abaqus_memory_cache = {
-    "timestamp": 0.0,
-    "usage": {},
-}
-process_snapshot_cache = {
-    "timestamp": 0.0,
-    "rows": [],
-    "include_details": False,
-}
 memory_monitor_state = {
     "running": False,
     "after_id": None,
+    "scanning": False,
+    "generation": 0,
 }
 external_job_monitor_state = {
     "running": False,
     "after_id": None,
+    "scanning": False,
+    "generation": 0,
 }
 formal_queue_save_state = {
     "after_id": None,
@@ -374,21 +123,6 @@ job_memory_estimates = {}
 memory_safety_factor_state = {
     "value": JOB_MEMORY_BASE_SAFETY_FACTOR,
 }
-
-
-class MemoryStatusEx(ctypes.Structure):
-    """Windows GlobalMemoryStatusEx structure reused across queue checks."""
-    _fields_ = [
-        ("dwLength", ctypes.c_ulong),
-        ("dwMemoryLoad", ctypes.c_ulong),
-        ("ullTotalPhys", ctypes.c_ulonglong),
-        ("ullAvailPhys", ctypes.c_ulonglong),
-        ("ullTotalPageFile", ctypes.c_ulonglong),
-        ("ullAvailPageFile", ctypes.c_ulonglong),
-        ("ullTotalVirtual", ctypes.c_ulonglong),
-        ("ullAvailVirtual", ctypes.c_ulonglong),
-        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-    ]
 
 
 def refresh_sta_header_index_after_trim(log_widget, job_state):
@@ -432,22 +166,48 @@ def trim_text_widget(widget, max_lines):
         pass
 
 
+def trim_log_trailing_blank_lines(log_widget, max_blank_lines=100):
+    """Remove accidental blank lines before appending formatted STA output."""
+    try:
+        for _ in range(max_blank_lines):
+            end_index = log_widget.index("end-1c")
+            end_line, end_col = (int(part) for part in end_index.split(".", 1))
+            if end_line <= 1:
+                return
+
+            candidate_line = end_line if end_col else end_line - 1
+            line_text = log_widget.get(
+                f"{candidate_line}.0",
+                f"{candidate_line}.end"
+            )
+            if line_text.strip():
+                return
+
+            log_widget.delete(
+                f"{candidate_line}.0",
+                f"{candidate_line + 1}.0"
+            )
+    except (tk.TclError, ValueError):
+        pass
+
+
 def append_log(log_widget, text):
     """向指定日志页追加文本并滚动到底部。"""
-    try:
-        if log_widget.winfo_exists():
-            insert_start = log_widget.index("end-1c")
-            log_widget.insert(tk.END, text)
-            log_widget.see(tk.END)
-            job_state = getattr(log_widget, "job_state", None)
-            if job_state is not None:
-                remember_sta_header_index(log_widget, job_state, insert_start, text)
-                job_state["log_append_count"] = job_state.get("log_append_count", 0) + 1
-                if job_state["log_append_count"] % LOG_TRIM_CHECK_INTERVAL == 0:
-                    trim_text_widget(log_widget, MAX_JOB_LOG_LINES)
-                update_sta_fixed_header_visibility(job_state)
-    except tk.TclError:
-        pass
+    with measure_ui_callback("append_log"):
+        try:
+            if log_widget.winfo_exists():
+                insert_start = log_widget.index("end-1c")
+                log_widget.insert(tk.END, text)
+                log_widget.see(tk.END)
+                job_state = getattr(log_widget, "job_state", None)
+                if job_state is not None:
+                    remember_sta_header_index(log_widget, job_state, insert_start, text)
+                    job_state["log_append_count"] = job_state.get("log_append_count", 0) + 1
+                    if job_state["log_append_count"] % LOG_TRIM_CHECK_INTERVAL == 0:
+                        trim_text_widget(log_widget, MAX_JOB_LOG_LINES)
+                    update_sta_fixed_header_visibility(job_state)
+        except tk.TclError:
+            pass
 
 
 def cache_console_output(job_state, text):
@@ -519,20 +279,22 @@ def update_sta_fixed_header_visibility(job_state):
 
 def append_history_text(text, tag=None):
     """向提交记录追加文本。"""
-    if history_text.get("1.0", "end-1c").strip() == "等待提交作业...":
-        history_text.delete("1.0", tk.END)
-
-    if tag:
-        history_text.insert(tk.END, text, tag)
-    else:
-        history_text.insert(tk.END, text)
-
-    append_count = getattr(history_text, "append_count", 0) + 1
-    history_text.append_count = append_count
-    if append_count % LOG_TRIM_CHECK_INTERVAL == 0:
-        trim_text_widget(history_text, MAX_HISTORY_LOG_LINES)
-
-    history_text.see(tk.END)
+    with measure_ui_callback("append_history_text"):
+        if getattr(history_text, "placeholder_visible", False):
+            history_text.delete("1.0", tk.END)
+            history_text.placeholder_visible = False
+    
+        if tag:
+            history_text.insert(tk.END, text, tag)
+        else:
+            history_text.insert(tk.END, text)
+    
+        append_count = getattr(history_text, "append_count", 0) + 1
+        history_text.append_count = append_count
+        if append_count % LOG_TRIM_CHECK_INTERVAL == 0:
+            trim_text_widget(history_text, MAX_HISTORY_LOG_LINES)
+    
+        history_text.see(tk.END)
 
 
 def append_submit_history(job_state):
@@ -759,574 +521,49 @@ def get_current_abaqus_memory_total(usage_by_job):
     return total
 
 
-def parse_job_name_from_command_line(command_line):
-    """Extract Abaqus job name from a process command line."""
-    if not command_line:
-        return ""
 
-    for pattern in JOB_NAME_COMMAND_PATTERNS:
-        match = pattern.search(command_line)
-        if match:
-            return os.path.splitext(os.path.basename(match.group(1)))[0]
 
-    return ""
 
 
-def find_process_abaqus_job_name(process_row, process_by_pid):
-    """Trace process parents until a command line containing job/input is found."""
-    try:
-        current_pid = int(process_row.get("ProcessId") or 0)
-    except (TypeError, ValueError):
-        return ""
 
-    visited = set()
 
-    while current_pid and current_pid in process_by_pid:
-        if current_pid in visited:
-            break
-
-        visited.add(current_pid)
-        current_process = process_by_pid[current_pid]
-        job_name = parse_job_name_from_command_line(
-            current_process.get("CommandLine") or ""
-        )
-        if job_name:
-            return job_name
-
-        try:
-            current_pid = int(current_process.get("ParentProcessId") or 0)
-        except (TypeError, ValueError):
-            break
-
-    return ""
-
-
-def normalize_work_dir(path):
-    """Normalize a work directory for Windows-safe comparisons."""
-    if not path:
-        return ""
-
-    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
 
 
-def join_process_command_line(cmdline):
-    """Return a readable command line from psutil cmdline data."""
-    if isinstance(cmdline, (list, tuple)):
-        return " ".join(str(part) for part in cmdline)
-
-    return str(cmdline or "")
-
-
-def is_abaqus_process_name(process_name):
-    """Return True when a process name is specific enough to be Abaqus-related."""
-    stem = os.path.splitext(os.path.basename(str(process_name or "").lower()))[0]
-    if not stem:
-        return False
 
-    if stem in ABAQUS_PROCESS_EXACT_NAMES:
-        return True
-
-    if stem.startswith("sma"):
-        return True
-
-    return any(marker in stem for marker in ABAQUS_PROCESS_SUBSTRINGS)
 
 
-def get_command_parameter_patterns(parameter):
-    """Return cached regexes for extracting Abaqus command parameters."""
-    parameter_key = parameter.lower()
-    cached = COMMAND_PARAMETER_PATTERN_CACHE.get(parameter_key)
-    if cached is not None:
-        return cached
 
-    name = re.escape(parameter_key)
-    patterns = [
-        re.compile(rf'(?:^|\s)-?{name}\s*=\s*"([^"]+)"', re.IGNORECASE),
-        re.compile(rf"(?:^|\s)-?{name}\s*=\s*'([^']+)'", re.IGNORECASE),
-        re.compile(rf"(?:^|\s)-?{name}\s*=\s*([^\s]+)", re.IGNORECASE),
-    ]
-    if parameter_key == "job":
-        patterns.extend(
-            [
-                re.compile(r'(?:^|\s)-job\s+"([^"]+)"', re.IGNORECASE),
-                re.compile(r"(?:^|\s)-job\s+'([^']+)'", re.IGNORECASE),
-                re.compile(r"(?:^|\s)-job\s+([^\s]+)", re.IGNORECASE),
-            ]
-        )
 
-    COMMAND_PARAMETER_PATTERN_CACHE[parameter_key] = patterns
-    return patterns
-
 
-def extract_abaqus_command_parameter(command_line, parameter):
-    """Extract one Abaqus command parameter from a command line."""
-    if not command_line or not parameter:
-        return ""
 
-    for pattern in get_command_parameter_patterns(parameter):
-        match = pattern.search(command_line)
-        if match:
-            return match.group(1).strip()
 
-    return ""
 
 
-def get_process_and_parent_chain(process_row, process_by_pid, max_depth=8):
-    """Return current process plus parents, limited to a small depth."""
-    chain = []
-    try:
-        current_pid = int(process_row.get("ProcessId") or 0)
-    except (TypeError, ValueError):
-        return chain
-
-    visited = set()
-    while current_pid and current_pid in process_by_pid and current_pid not in visited:
-        visited.add(current_pid)
-        current_row = process_by_pid[current_pid]
-        chain.append(current_row)
-        if len(chain) >= max_depth:
-            break
-        try:
-            current_pid = int(current_row.get("ParentProcessId") or 0)
-        except (TypeError, ValueError):
-            break
-
-    return chain
-
-
-def is_possible_abaqus_process(process_chain):
-    """Return True if a process chain looks Abaqus-related."""
-    for row in process_chain:
-        if is_abaqus_process_name(row.get("Name", "")):
-            return True
-
-        command_line = str(row.get("CommandLine", "")).lower()
-        if command_line and any(marker in command_line for marker in ABAQUS_PROCESS_NAME_MARKERS):
-            return True
-
-    return False
-
-
-def get_first_chain_parameter(process_chain, parameter):
-    """Find one Abaqus command parameter from current process or parents."""
-    for row in process_chain:
-        value = extract_abaqus_command_parameter(
-            row.get("CommandLine") or "",
-            parameter
-        )
-        if value:
-            return value
-
-    return ""
-
-
-def get_chain_work_dir(process_chain, target_work_dir):
-    """Return the matching process work directory from a process chain."""
-    normalized_target = normalize_work_dir(target_work_dir)
-    for row in process_chain:
-        cwd = row.get("Cwd") or ""
-        if cwd and normalize_work_dir(cwd) == normalized_target:
-            return os.path.abspath(os.path.normpath(cwd))
-
-    return ""
-
-
-def resolve_external_job_path(value, work_dir, extension=""):
-    """Resolve a command-line file path relative to an Abaqus work directory."""
-    if not value:
-        return ""
-
-    value = value.strip().strip('"').strip("'")
-    if extension and not os.path.splitext(value)[1]:
-        value = value + extension
-
-    if os.path.isabs(value):
-        return normalize_joblist_path(value)
-
-    return normalize_joblist_path(os.path.join(work_dir, value))
-
-
-def detect_external_job_type(process_chain):
-    """Infer Standard/Explicit/Abaqus from related process names and command lines."""
-    chain_text = " ".join(
-        f"{row.get('Name', '')} {row.get('CommandLine', '')}"
-        for row in process_chain
-    ).lower()
-    if "explicit" in chain_text:
-        return "Explicit"
-    if "standard" in chain_text:
-        return "Standard"
-
-    return "Abaqus"
-
-
-def log_performance(message):
-    """Print performance diagnostics only when explicitly enabled."""
-    if ENABLE_PERFORMANCE_LOG:
-        print(f"[perf] {message}")
-
-
-def get_psutil_process_snapshot(force=False, include_details=False):
-    """Return a cached psutil process snapshot with optional Abaqus-only details."""
-    if psutil is None:
-        return []
-
-    now = time.monotonic()
-    cache_has_details = bool(process_snapshot_cache.get("include_details"))
-    cache_valid = (
-        not force
-        and now - process_snapshot_cache.get("timestamp", 0.0) < PROCESS_SNAPSHOT_CACHE_SECONDS
-        and (cache_has_details or not include_details)
-    )
-    if cache_valid:
-        log_performance(
-            f"process snapshot cache hit; rows={len(process_snapshot_cache['rows'])}; "
-            f"details={cache_has_details}"
-        )
-        return process_snapshot_cache["rows"]
-
-    started_at = time.perf_counter()
-    rows = []
-    rows_by_pid = {}
-    process_by_pid = {}
-    detail_pids = set()
-
-    for process in psutil.process_iter(["pid", "ppid", "name"]):
-        try:
-            info = process.info
-            pid = int(info.get("pid") or 0)
-            row = {
-                "Name": info.get("name") or "",
-                "ProcessId": pid,
-                "ParentProcessId": info.get("ppid") or 0,
-                "CommandLine": "",
-                "WorkingSetSize": 0,
-                "PrivatePageCount": 0,
-                "CreateTime": 0,
-                "Cwd": "",
-            }
-            rows.append(row)
-            rows_by_pid[pid] = row
-            process_by_pid[pid] = process
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
-            continue
-
-    for row in rows:
-        if not is_abaqus_process_name(row.get("Name") or ""):
-            continue
-
-        current_pid = int(row.get("ProcessId") or 0)
-        visited = set()
-        while current_pid and current_pid in rows_by_pid and current_pid not in visited:
-            visited.add(current_pid)
-            detail_pids.add(current_pid)
-            current_pid = int(rows_by_pid[current_pid].get("ParentProcessId") or 0)
-
-    # Include descendants of Abaqus launchers/solvers, so helper processes that
-    # do not have Abaqus-looking names still contribute to memory totals.
-    changed = True
-    while changed:
-        changed = False
-        for row in rows:
-            try:
-                pid = int(row.get("ProcessId") or 0)
-                parent_pid = int(row.get("ParentProcessId") or 0)
-            except (TypeError, ValueError):
-                continue
-            if pid not in detail_pids and parent_pid in detail_pids:
-                detail_pids.add(pid)
-                changed = True
-
-    if not include_details:
-        process_snapshot_cache.update(
-            {
-                "timestamp": now,
-                "rows": rows,
-                "include_details": False,
-            }
-        )
-        log_performance(
-            f"process snapshot light; rows={len(rows)}; abaqus_pids={len(detail_pids)}; "
-            f"elapsed={(time.perf_counter() - started_at) * 1000:.1f} ms"
-        )
-        return rows
-
-    for pid in detail_pids:
-        process = process_by_pid.get(pid)
-        if process is None:
-            continue
-        row = rows_by_pid.get(pid)
-        if row is None:
-            continue
-        try:
-            memory_info = process.memory_info()
-            row["WorkingSetSize"] = getattr(memory_info, "rss", 0)
-            row["PrivatePageCount"] = getattr(memory_info, "private", 0)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
-            pass
-        try:
-            row["CreateTime"] = process.create_time()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
-            pass
-        try:
-            row["CommandLine"] = join_process_command_line(process.cmdline())
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
-            row["CommandLine"] = ""
-        try:
-            row["Cwd"] = process.cwd()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
-            row["Cwd"] = ""
-
-    process_snapshot_cache.update(
-        {
-            "timestamp": now,
-            "rows": rows,
-            "include_details": include_details,
-        }
-    )
-    log_performance(
-        f"process snapshot full; rows={len(rows)}; abaqus_pids={len(detail_pids)}; "
-        f"elapsed={(time.perf_counter() - started_at) * 1000:.1f} ms"
-    )
-    return rows
-
-
-def fetch_psutil_process_rows_for_external_scan(force=True):
-    """Read process data needed to import externally launched Abaqus jobs."""
-    return get_psutil_process_snapshot(force=force, include_details=True)
-
-
-def scan_running_abaqus_jobs_by_psutil(work_dir, force=True):
-    """Scan running Abaqus jobs in one work directory using psutil."""
-    normalized_work_dir = normalize_work_dir(work_dir)
-    rows = get_psutil_process_snapshot(force=force, include_details=True)
-    process_by_pid = {}
-    for row in rows:
-        try:
-            process_by_pid[int(row.get("ProcessId") or 0)] = row
-        except (TypeError, ValueError):
-            continue
-
-    scanned_jobs = {}
-    skipped_pids = []
-    counted_pids = {}
-    chain_cache = {}
-
-    for row in rows:
-        try:
-            row_pid = int(row.get("ProcessId") or 0)
-        except (TypeError, ValueError):
-            row_pid = 0
-
-        chain = chain_cache.get(row_pid)
-        if chain is None:
-            chain = get_process_and_parent_chain(row, process_by_pid)
-            chain_cache[row_pid] = chain
-        if not chain or not is_possible_abaqus_process(chain):
-            continue
-
-        matching_work_dir = get_chain_work_dir(chain, normalized_work_dir)
-        if not matching_work_dir:
-            continue
-
-        job_value = get_first_chain_parameter(chain, "job")
-        input_value = get_first_chain_parameter(chain, "input")
-        job_name = os.path.splitext(os.path.basename(job_value))[0] if job_value else ""
-        if not job_name and input_value:
-            job_name = os.path.splitext(os.path.basename(input_value))[0]
-
-        if not job_name:
-            try:
-                skipped_pids.append(row_pid)
-            except (TypeError, ValueError):
-                pass
-            continue
-
-        input_path = resolve_external_job_path(input_value, matching_work_dir)
-        if not input_path:
-            candidate_inp = os.path.join(matching_work_dir, job_name + ".inp")
-            if os.path.isfile(candidate_inp):
-                input_path = normalize_joblist_path(candidate_inp)
-
-        for_file = resolve_external_job_path(
-            get_first_chain_parameter(chain, "user"),
-            matching_work_dir
-        )
-        oldjob_name = get_first_chain_parameter(chain, "oldjob")
-        oldjob_path = resolve_external_job_path(oldjob_name, matching_work_dir, extension=".odb") if oldjob_name else ""
-        cores = get_first_chain_parameter(chain, "cpus")
-        memory_setting = get_first_chain_parameter(chain, "memory")
-        job_key = (normalized_work_dir, job_name.lower())
-
-        job_info = scanned_jobs.setdefault(
-            job_key,
-            {
-                "job_name": job_name,
-                "work_dir": matching_work_dir,
-                "inp_path": input_path,
-                "job_type": detect_external_job_type(chain),
-                "restart_dependency": oldjob_name,
-                "oldjob_path": oldjob_path,
-                "for_file": for_file,
-                "cores": cores,
-                "memory_setting": memory_setting,
-                "status": STATUS_RUNNING,
-                "source": "external_psutil",
-                "is_external": True,
-                "pids": [],
-                "pid_create_times": {},
-                "rss_bytes": 0,
-            }
-        )
-
-        if input_path and not job_info.get("inp_path"):
-            job_info["inp_path"] = input_path
-        if for_file and not job_info.get("for_file"):
-            job_info["for_file"] = for_file
-        if oldjob_name and not job_info.get("restart_dependency"):
-            job_info["restart_dependency"] = oldjob_name
-        if oldjob_path and not job_info.get("oldjob_path"):
-            job_info["oldjob_path"] = oldjob_path
-        if cores and not job_info.get("cores"):
-            job_info["cores"] = cores
-        if memory_setting and not job_info.get("memory_setting"):
-            job_info["memory_setting"] = memory_setting
-        if job_info.get("job_type") == "Abaqus":
-            job_info["job_type"] = detect_external_job_type(chain)
-
-        if row_pid and row_pid not in counted_pids.setdefault(job_key, set()):
-            counted_pids[job_key].add(row_pid)
-            job_info["pids"].append(row_pid)
-            job_info.setdefault("pid_create_times", {})[str(row_pid)] = row.get("CreateTime") or 0
-            try:
-                job_info["rss_bytes"] += int(row.get("WorkingSetSize") or 0)
-            except (TypeError, ValueError):
-                pass
-
-    for job_info in scanned_jobs.values():
-        job_info["pids"] = sorted(job_info["pids"])
-
-    return list(scanned_jobs.values()), skipped_pids
-
-
-def fetch_psutil_process_rows():
-    """Read process rows with psutil, avoiding PowerShell startup overhead."""
-    return get_psutil_process_snapshot(force=False, include_details=True)
-
-
-def fetch_windows_process_rows():
-    """Read Windows process rows through PowerShell CIM."""
-    if os.name != "nt":
-        return []
-
-    powershell_command = (
-        "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; "
-        "Get-CimInstance Win32_Process | "
-        "Select-Object Name,ProcessId,ParentProcessId,CommandLine,WorkingSetSize,PrivatePageCount | "
-        "ConvertTo-Json -Compress -Depth 3"
-    )
-
-    try:
-        result = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                powershell_command,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=8,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return []
-
-    if result.returncode != 0 or not result.stdout.strip():
-        return []
-
-    try:
-        rows = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return []
-
-    if isinstance(rows, dict):
-        return [rows]
-
-    if isinstance(rows, list):
-        return rows
-
-    return []
-
-
-def get_abaqus_job_memory_usage(force=False):
-    """Return memory usage grouped by Abaqus job name."""
-    now = time.monotonic()
-    if (
-            not force
-            and now - abaqus_memory_cache["timestamp"] < ABAQUS_MEMORY_POLL_INTERVAL_SECONDS
-    ):
-        return abaqus_memory_cache["usage"]
-
-    rows = fetch_psutil_process_rows()
-    if not rows:
-        rows = fetch_windows_process_rows()
-
-    process_by_pid = {}
-    for row in rows:
-        try:
-            process_by_pid[int(row.get("ProcessId") or 0)] = row
-        except (TypeError, ValueError):
-            continue
-
-    usage_by_job = {}
-
-    for row in rows:
-        job_name = find_process_abaqus_job_name(row, process_by_pid)
-        if not job_name:
-            continue
-
-        try:
-            working_set = int(row.get("WorkingSetSize") or 0)
-        except (TypeError, ValueError):
-            working_set = 0
-
-        try:
-            private_memory = int(row.get("PrivatePageCount") or 0)
-        except (TypeError, ValueError):
-            private_memory = 0
-
-        usage = usage_by_job.setdefault(
-            job_name,
-            {
-                "working_set": 0,
-                "private_memory": 0,
-                "process_count": 0,
-                "process_names": set(),
-            }
-        )
-        usage["working_set"] += working_set
-        usage["private_memory"] += private_memory
-        usage["process_count"] += 1
-        if row.get("Name"):
-            usage["process_names"].add(row["Name"])
-
-    for usage in usage_by_job.values():
-        usage["process_names"] = ", ".join(sorted(usage["process_names"]))
-
-    abaqus_memory_cache["timestamp"] = now
-    abaqus_memory_cache["usage"] = usage_by_job
-    return usage_by_job
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def estimate_per_job_memory_from_running_jobs():
     """Estimate one Abaqus job memory need from saved peaks and running samples."""
-    usage_by_job = get_abaqus_job_memory_usage()
+    usage_by_job = get_cached_abaqus_job_memory_usage()
     active_job_names = {
         state.get("job_name", "")
         for state in active_jobs.values()
@@ -1493,6 +730,74 @@ def update_external_job_memory_estimate(item):
     )
 
 
+def queue_ui_event(event_type, payload):
+    """Send a background worker result to the Tk main thread."""
+    if application_closing:
+        return
+    ui_event_queue.put((event_type, payload))
+
+
+def process_ui_event_queue():
+    """Apply queued worker results on the Tk main thread."""
+    global ui_event_poll_after_id
+
+    if application_closing:
+        ui_event_poll_after_id = None
+        return
+
+    queue_size_before = ui_event_queue.qsize()
+    started_at = time.perf_counter()
+    processed = 0
+    with measure_ui_callback("process_ui_event_queue"):
+        try:
+            while processed < UI_EVENT_QUEUE_MAX_EVENTS_PER_TICK:
+                try:
+                    event_type, payload = ui_event_queue.get_nowait()
+                except Empty:
+                    break
+
+                if event_type == "global_memory_scan_finished":
+                    apply_global_memory_scan_result(payload)
+                elif event_type == "global_memory_scan_failed":
+                    apply_global_memory_scan_failure(payload)
+                elif event_type == "external_job_scan_finished":
+                    apply_external_job_scan_result(payload)
+                elif event_type == "external_job_scan_failed":
+                    apply_external_job_scan_failure(payload)
+
+                processed += 1
+        except tk.TclError:
+            ui_event_poll_after_id = None
+            return
+
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    log_ui_queue_status(
+        queue_size_before=queue_size_before,
+        processed_count=processed,
+        remaining_count=ui_event_queue.qsize(),
+        elapsed_ms=elapsed_ms,
+    )
+
+    if not application_closing:
+        ui_event_poll_after_id = root.after(
+            UI_EVENT_POLL_INTERVAL_MS,
+            process_ui_event_queue
+        )
+
+
+def start_ui_event_queue_polling():
+    """Start the single main-thread event queue poller."""
+    global ui_event_poll_after_id
+
+    if application_closing or ui_event_poll_after_id is not None:
+        return
+
+    ui_event_poll_after_id = root.after(
+        UI_EVENT_POLL_INTERVAL_MS,
+        process_ui_event_queue
+    )
+
+
 def activate_job_memory_monitor(job_state):
     """Begin shared memory sampling once the job has generated its .sta file."""
     if (
@@ -1517,17 +822,96 @@ def start_global_memory_monitor():
     )
 
 
-def run_global_memory_monitor():
-    """Sample all Abaqus process memory once and distribute it to active jobs."""
-    memory_monitor_state["after_id"] = None
-    now = time.monotonic()
-    tracked_jobs = [
+def get_memory_tracked_jobs():
+    """Return active GUI jobs whose memory monitor is enabled."""
+    return [
         state for state in active_jobs.values()
         if (
                 not state.get("finalized")
                 and state.get("memory_monitor_active")
         )
     ]
+
+
+def schedule_next_global_memory_monitor(tracked_jobs=None, delay_ms=None):
+    """Schedule the next global memory monitor tick on the Tk main thread."""
+    if application_closing:
+        memory_monitor_state["running"] = False
+        memory_monitor_state["after_id"] = None
+        return
+
+    if tracked_jobs is None:
+        tracked_jobs = get_memory_tracked_jobs()
+
+    if not tracked_jobs:
+        memory_monitor_state["running"] = False
+        memory_monitor_state["after_id"] = None
+        return
+
+    if delay_ms is None:
+        now = time.monotonic()
+        active_due_times = [
+            float(state.get("next_memory_sample_at") or now)
+            for state in tracked_jobs
+            if not state.get("finalized")
+        ]
+        if not active_due_times:
+            memory_monitor_state["running"] = False
+            memory_monitor_state["after_id"] = None
+            return
+        next_due = min(active_due_times)
+        delay_ms = max(1000, int((next_due - time.monotonic()) * 1000))
+
+    memory_monitor_state["after_id"] = root.after(
+        delay_ms,
+        run_global_memory_monitor
+    )
+
+
+def run_global_memory_scan_worker(generation, due_job_refs):
+    """Collect Abaqus memory usage away from the Tk main thread."""
+    started_at = time.perf_counter()
+    try:
+        usage_by_job = get_abaqus_job_memory_usage(force=True)
+    except Exception as exc:
+        if not application_closing:
+            queue_ui_event(
+                "global_memory_scan_failed",
+                {
+                    "generation": generation,
+                    "error": str(exc),
+                }
+            )
+    else:
+        if not application_closing:
+            queue_ui_event(
+                "global_memory_scan_finished",
+                {
+                    "generation": generation,
+                    "due_job_refs": due_job_refs,
+                    "usage_by_job": usage_by_job,
+                }
+            )
+    finally:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        log_worker_performance(
+            "global_memory_scan_worker",
+            elapsed_ms,
+            due_job_count=len(due_job_refs),
+            usage_job_count=len(locals().get("usage_by_job", {}) or {}),
+            status="failed" if "exc" in locals() else "success",
+        )
+
+
+def run_global_memory_monitor():
+    """Start a background memory sample when one or more jobs are due."""
+    memory_monitor_state["after_id"] = None
+    if application_closing:
+        memory_monitor_state["running"] = False
+        return
+
+    now = time.monotonic()
+    tracked_jobs = get_memory_tracked_jobs()
 
     if not tracked_jobs:
         memory_monitor_state["running"] = False
@@ -1538,35 +922,76 @@ def run_global_memory_monitor():
         if float(state.get("next_memory_sample_at") or 0) <= now
     ]
 
-    if due_jobs:
-        usage_by_job = get_abaqus_job_memory_usage()
-    else:
-        usage_by_job = {}
+    if not due_jobs:
+        schedule_next_global_memory_monitor(tracked_jobs)
+        return
 
-    for job_state in due_jobs:
-        usage = usage_by_job.get(job_state.get("job_name", ""))
+    if memory_monitor_state.get("scanning"):
+        schedule_next_global_memory_monitor(tracked_jobs, delay_ms=1000)
+        return
+
+    memory_monitor_state["generation"] += 1
+    memory_monitor_state["scanning"] = True
+    generation = memory_monitor_state["generation"]
+    due_job_refs = [
+        {
+            "job_key": state.get("job_key", ""),
+            "job_name": state.get("job_name", ""),
+            "work_dir": state.get("work_dir", ""),
+        }
+        for state in due_jobs
+    ]
+    threading.Thread(
+        target=run_global_memory_scan_worker,
+        args=(generation, due_job_refs),
+        daemon=True
+    ).start()
+
+
+def reschedule_due_memory_jobs(due_job_refs):
+    """Move due jobs to their next sample time when a scan has no usable result."""
+    for ref in due_job_refs:
+        job_state = active_jobs.get(ref.get("job_key", ""))
+        if job_state is None or job_state.get("finalized"):
+            continue
+        mode = job_state.get("memory_monitor_mode", "learning")
+        interval_ms = (
+            JOB_MEMORY_PATROL_INTERVAL_MS
+            if mode == "patrol"
+            else JOB_MEMORY_LEARNING_INTERVAL_MS
+        )
+        job_state["next_memory_sample_at"] = time.monotonic() + interval_ms / 1000
+
+
+def apply_global_memory_scan_result(payload):
+    """Apply one background memory scan result on the Tk main thread."""
+    if payload.get("generation") != memory_monitor_state.get("generation"):
+        return
+
+    memory_monitor_state["scanning"] = False
+    usage_by_job = payload.get("usage_by_job") or {}
+    due_job_refs = payload.get("due_job_refs") or []
+
+    for ref in due_job_refs:
+        job_state = active_jobs.get(ref.get("job_key", ""))
+        if job_state is None or job_state.get("finalized"):
+            continue
+        usage = usage_by_job.get(ref.get("job_name", ""))
         if usage:
             update_job_memory_sample(job_state, usage)
         else:
-            mode = job_state.get("memory_monitor_mode", "learning")
-            interval_ms = (
-                JOB_MEMORY_PATROL_INTERVAL_MS
-                if mode == "patrol"
-                else JOB_MEMORY_LEARNING_INTERVAL_MS
-            )
-            job_state["next_memory_sample_at"] = time.monotonic() + interval_ms / 1000
+            reschedule_due_memory_jobs([ref])
 
-    active_due_times = [
-        float(state.get("next_memory_sample_at") or now)
-        for state in tracked_jobs
-        if not state.get("finalized")
-    ]
-    if active_due_times:
-        next_due = min(active_due_times)
-        delay_ms = max(1000, int((next_due - time.monotonic()) * 1000))
-        memory_monitor_state["after_id"] = root.after(delay_ms, run_global_memory_monitor)
-    else:
-        memory_monitor_state["running"] = False
+    schedule_next_global_memory_monitor()
+
+
+def apply_global_memory_scan_failure(payload):
+    """Recover the memory monitor after a background scan failure."""
+    if payload.get("generation") != memory_monitor_state.get("generation"):
+        return
+
+    memory_monitor_state["scanning"] = False
+    schedule_next_global_memory_monitor(delay_ms=JOB_MEMORY_LEARNING_INTERVAL_MS)
 
 
 def get_active_job_count():
@@ -1665,329 +1090,6 @@ def validate_abaqus_job_name(job_name, label="作业名称"):
     )
     return False
 
-def decode_abaqus_text(data):
-    """优先按 GBK 解码 Abaqus 文本，失败时退回 UTF-8。"""
-    for encoding in ("gbk", "utf-8", "mbcs"):
-        try:
-            return data.decode(encoding)
-        except UnicodeDecodeError:
-            continue
-
-    return data.decode("gbk", errors="replace")
-
-def read_file_tail(path, max_bytes=65536):
-    """读取诊断文件尾部，避免大文件阻塞界面。"""
-    try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as file:
-            if size > max_bytes:
-                file.seek(size - max_bytes)
-            data = file.read()
-
-        return decode_abaqus_text(data)
-    except OSError:
-        return ""
-
-
-def read_file_tail_cached(path, max_bytes=65536):
-    """Read a diagnostic file tail only when the file changed."""
-    try:
-        stat_result = os.stat(path)
-    except OSError:
-        diagnostic_file_cache.pop(path, None)
-        return ""
-
-    signature = (stat_result.st_mtime_ns, stat_result.st_size)
-    cached = diagnostic_file_cache.get(path)
-    if cached and cached.get("signature") == signature:
-        return cached.get("text", "")
-
-    text = read_file_tail(path, max_bytes=max_bytes)
-    diagnostic_file_cache[path] = {
-        "signature": signature,
-        "text": text,
-    }
-    return text
-
-
-def read_file_head(path, max_bytes=262144):
-    """读取文件开头部分，用于提取 Abaqus 提交时间。"""
-    try:
-        with open(path, "rb") as file:
-            data = file.read(max_bytes)
-        return decode_abaqus_text(data)
-    except OSError:
-        return ""
-
-
-def format_backup_time_tag(timestamp):
-    """将时间戳格式化为备份文件名使用的时间标签。"""
-    return time.strftime("%Y%m%d%H%M", time.localtime(timestamp))
-
-
-def parse_datetime_from_abaqus_text(text):
-    """从 Abaqus sta/msg/dat/log 文本中提取作业时间。"""
-    if not text:
-        return None
-
-    # 形式 1：
-    # .log 中常见：
-    # Begin Analysis Input File Processor
-    # 5/30/2026 1:13:49 AM
-    match = re.search(
-        r"BEGIN\s+ANALYSIS\s+INPUT\s+FILE\s+PROCESSOR\s*[\r\n]+"
-        r"\s*(\d{1,2})/(\d{1,2})/(\d{4})\s+"
-        r"(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM)?",
-        text,
-        re.IGNORECASE
-    )
-    if match:
-        month, day, year, hour, minute, second, ampm = match.groups()
-        hour = int(hour)
-
-        if ampm:
-            ampm = ampm.upper()
-            if ampm == "PM" and hour != 12:
-                hour += 12
-            elif ampm == "AM" and hour == 12:
-                hour = 0
-
-        try:
-            return datetime(
-                int(year),
-                int(month),
-                int(day),
-                hour,
-                int(minute),
-                int(second)
-            )
-        except ValueError:
-            pass
-
-    # 形式 2：
-    # Abaqus 2025 Date 30-5月-2026 Time 01:13:54
-    # Abaqus/Standard 2025 DATE 29-5月-2026 TIME 18:57:22
-    match = re.search(
-        r"\bDATE\s+(\d{1,2})[-/](\d{1,2})\D*[-/](\d{4})\s+"
-        r"TIME\s+(\d{1,2}):(\d{2}):(\d{2})",
-        text,
-        re.IGNORECASE
-    )
-    if match:
-        day, month, year, hour, minute, second = match.groups()
-
-        try:
-            return datetime(
-                int(year),
-                int(month),
-                int(day),
-                int(hour),
-                int(minute),
-                int(second)
-            )
-        except ValueError:
-            pass
-
-    # 形式 3：
-    # 普通英文日期时间：
-    # 5/30/2026 1:13:49 AM
-    match = re.search(
-        r"\b(\d{1,2})/(\d{1,2})/(\d{4})\s+"
-        r"(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM)?\b",
-        text,
-        re.IGNORECASE
-    )
-    if match:
-        month, day, year, hour, minute, second, ampm = match.groups()
-        hour = int(hour)
-
-        if ampm:
-            ampm = ampm.upper()
-            if ampm == "PM" and hour != 12:
-                hour += 12
-            elif ampm == "AM" and hour == 12:
-                hour = 0
-
-        try:
-            return datetime(
-                int(year),
-                int(month),
-                int(day),
-                hour,
-                int(minute),
-                int(second)
-            )
-        except ValueError:
-            pass
-
-    # 形式 4：
-    # 2026-05-30 01:13:38
-    match = re.search(
-        r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+"
-        r"(\d{1,2}):(\d{2}):(\d{2})\b",
-        text
-    )
-    if match:
-        year, month, day, hour, minute, second = match.groups()
-
-        try:
-            return datetime(
-                int(year),
-                int(month),
-                int(day),
-                int(hour),
-                int(minute),
-                int(second)
-            )
-        except ValueError:
-            pass
-
-    return None
-
-
-def get_existing_job_backup_time_tag(work_dir, job_name, odb_path=""):
-    """
-    获取旧作业备份时间标签。
-    优先从旧 sta/msg/log 中读取 Abaqus 作业时间；
-    如果读取不到，则使用旧 ODB 文件创建时间；
-    如果仍失败，则退回当前时间。
-    """
-    for extension in (".log", ".dat", ".msg", ".sta"):
-        path = os.path.join(work_dir, job_name + extension)
-
-        if not os.path.exists(path):
-            continue
-
-        text = read_file_head(path)
-        job_datetime = parse_datetime_from_abaqus_text(text)
-
-        if job_datetime:
-            return job_datetime.strftime("%Y%m%d%H%M"), extension
-
-    if odb_path and os.path.exists(odb_path):
-        try:
-            return format_backup_time_tag(os.path.getctime(odb_path)), "odb创建时间"
-        except OSError:
-            pass
-
-    return time.strftime("%Y%m%d%H%M"), "当前时间"
-
-def extract_key_diagnostic_line(text):
-    """从 Abaqus 输出中提取最关键的一行诊断信息。"""
-    important_words = ERROR_MARKERS + TERMINATE_MARKERS + (
-        "TOO MANY ATTEMPTS",
-        "NUMERICAL SINGULARITY",
-        "ZERO PIVOT",
-        "THE SYSTEM MATRIX HAS",
-        "TIME INCREMENT REQUIRED IS LESS THAN",
-        "EXCESSIVE DISTORTION",
-        "DUE TO ERRORS",
-        "ERRORS DETECTED",
-    )
-
-    for line in text.splitlines():
-        upper_line = line.upper()
-        if any(word in upper_line for word in important_words):
-            return line.strip()
-
-    return ""
-
-def classify_job_text(text):
-    """根据 Abaqus 输出文本判断作业最终状态。"""
-    upper_text = text.upper()
-
-    # 失败优先判断，避免 THE ANALYSIS HAS NOT BEEN COMPLETED 被 COMPLETED 误伤
-    if any(marker in upper_text for marker in ERROR_MARKERS):
-        detail = extract_key_diagnostic_line(text) or "检测到错误信息"
-        return "失败", detail
-
-    if any(marker in upper_text for marker in TERMINATE_MARKERS):
-        detail = extract_key_diagnostic_line(text) or "检测到终止信息"
-        return "终止", detail
-
-    # .log 中常见的真正完成标志
-    if re.search(r"ABAQUS\s+JOB\s+.+\s+COMPLETED", upper_text):
-        return "完成", "检测到 Abaqus Job 完成信息"
-
-    # .sta/.dat 中真正完成标志
-    if any(marker in upper_text for marker in COMPLETE_MARKERS):
-        return "完成", "检测到分析成功完成信息"
-
-    return "", ""
-
-
-def update_abaqus_stage_from_text(job_state, text):
-    """根据控制台输出记录 Abaqus 是否进入 pre 或 standard 阶段。"""
-    if job_state is None:
-        return
-
-    upper_text = text.upper()
-
-    if (
-        "BEGIN ANALYSIS INPUT FILE PROCESSOR" in upper_text
-        or "RUN PRE.EXE" in upper_text
-        or "END ANALYSIS INPUT FILE PROCESSOR" in upper_text
-    ):
-        job_state["pre_started"] = True
-
-    if "END ANALYSIS INPUT FILE PROCESSOR" in upper_text:
-        job_state["pre_finished"] = True
-
-    if (
-        "BEGIN ABAQUS/STANDARD ANALYSIS" in upper_text
-        or "RUN STANDARD.EXE" in upper_text
-    ):
-        job_state["standard_started"] = True
-
-
-def abaqus_stage_started(job_state):
-    """只要 pre 或 standard 启动过，就不能因为没有 sta 直接判失败。"""
-    return (
-        job_state.get("pre_started")
-        or job_state.get("pre_finished")
-        or job_state.get("standard_started")
-    )
-
-def inspect_job_files(work_dir, job_name, submitted_after=0):
-    """读取 sta/msg/dat/log 文件判断最终状态。"""
-    combined_text = ""
-
-    for extension in DIAGNOSTIC_EXTENSIONS:
-        path = os.path.join(work_dir, job_name + extension)
-
-        if not os.path.exists(path):
-            continue
-
-        if submitted_after:
-            try:
-                if os.path.getmtime(path) < submitted_after:
-                    continue
-            except OSError:
-                continue
-
-        combined_text += "\n" + read_file_tail_cached(path)
-
-    return classify_job_text(combined_text)
-
-
-def inspect_job_files_throttled(monitor_state, force=False, interval_seconds=20):
-    """Throttle diagnostic file inspection during normal polling."""
-    now = time.time()
-    if (
-            not force
-            and now - monitor_state.get("last_file_inspection_at", 0) < interval_seconds
-    ):
-        return "", ""
-
-    monitor_state["last_file_inspection_at"] = now
-    job_state = monitor_state["job_state"]
-    return inspect_job_files(
-        job_state["work_dir"],
-        job_state["job_name"],
-        monitor_state["submitted_at"]
-    )
-
-
 def collect_job_signals(job_state, monitor_state, sta_path, process):
     """集中收集当前 Abaqus 作业的关键信号。"""
     sta_exists = os.path.exists(sta_path)
@@ -2063,27 +1165,6 @@ def decide_job_status_before_sta(signals):
         )
 
     return "", ""
-
-def parse_sta_progress(text):
-    """从 sta 新增内容中提取 Step 和 Abaqus 总时间。"""
-    progress = None
-
-    for line in text.splitlines():
-        parts = line.split()
-
-        if len(parts) < 9:
-            continue
-
-        if not parts[0].isdigit() or not parts[1].isdigit():
-            continue
-
-        progress = {
-            "step": parts[0],
-            "total_time": parts[6],
-        }
-
-    return progress
-
 
 def format_progress_status(job_state, prefix="Running"):
     """格式化作业顶部状态栏文本。"""
@@ -2256,7 +1337,17 @@ def open_job_artifact(job_state, extension):
 
 def on_close():
     """关闭窗口。"""
+    global application_closing
+    global ui_event_poll_after_id
+
+    application_closing = True
     cancel_scheduled_formal_queue_save()
+    if ui_event_poll_after_id:
+        try:
+            root.after_cancel(ui_event_poll_after_id)
+        except tk.TclError:
+            pass
+        ui_event_poll_after_id = None
     for state in (memory_monitor_state, external_job_monitor_state):
         after_id = state.get("after_id")
         if after_id:
@@ -2264,12 +1355,14 @@ def on_close():
                 root.after_cancel(after_id)
             except tk.TclError:
                 pass
-            state["after_id"] = None
-            state["running"] = False
+        state["after_id"] = None
+        state["running"] = False
+        state["scanning"] = False
     try:
         save_formal_queue_file()
     except OSError:
         pass
+    stop_ui_lag_watchdog()
     root.destroy()
 
 
@@ -3012,11 +2105,10 @@ def finalize_job(job_state, status, detail=""):
     if is_memory_related_failure(status, detail):
         increase_memory_safety_factor(detail)
     active_jobs.pop(job_state["job_key"], None)
-    for extension in DIAGNOSTIC_EXTENSIONS:
-        diagnostic_file_cache.pop(
-            os.path.join(job_state["work_dir"], job_state["job_name"] + extension),
-            None
-        )
+    clear_diagnostic_file_cache(
+        work_dir=job_state["work_dir"],
+        job_name=job_state["job_name"],
+    )
     disable_job_controls(job_state)
     set_job_status(job_state, format_final_status_for_display(status, detail))
     append_job_final_history(job_state, status, detail)
@@ -3173,6 +2265,9 @@ def start_datacheck_monitor(process, submitted_at, job_state):
 def should_hide_console_line(line):
     """过滤子程序编译环境初始化中的冗余控制台输出。"""
     stripped = line.strip()
+    if not stripped:
+        return True
+
     if stripped and set(stripped) <= {"*", "="}:
         return True
 
@@ -3419,149 +2514,6 @@ def monitor_datacheck_files(monitor_state):
         lambda: monitor_datacheck_files(monitor_state)
     )
 
-def is_sta_progress_line(line):
-    """判断一行是否为 Abaqus .sta 中的增量进度行。"""
-    parts = line.split()
-
-    if len(parts) < 9:
-        return False
-
-    return parts[0].isdigit() and parts[1].isdigit()
-
-
-def append_sta_separator_once(output_lines, job_state):
-    """在日志中只插入一次 STA 输出区分隔线。"""
-    if not job_state.get("sta_separator_printed"):
-        output_lines.append("*" * LOG_SEPARATOR_WIDTH)
-        job_state["sta_separator_printed"] = True
-
-
-def build_sta_table_header():
-    return (
-        f"{'STEP':>4} {'INC':>3} {'ATT':>3} "
-        f"{'SEV':>3} {'EQUIL':>5} {'TOTAL':>5} "
-        f"{'TOTAL_TIME':>10} {'STEP_TIME':>9} {'INC_TIME':>8}"
-    )
-
-
-def get_display_width(text):
-    """估算等宽日志中含中文文本的显示宽度。"""
-    return sum(2 if ord(char) > 127 else 1 for char in text)
-
-
-def format_abaqus_standard_title(line):
-    """将 Abaqus 标题右侧日期时间对齐到日志分隔线右边界。"""
-    match = re.match(r"^(Abaqus/Standard\s+\S+)\s+(DATE\s+.+)$", line, re.IGNORECASE)
-    if match:
-        left_text = match.group(1)
-        right_text = match.group(2)
-        gap_width = max(
-            2,
-            LOG_SEPARATOR_WIDTH
-            - get_display_width(left_text)
-            - get_display_width(right_text)
-        )
-        return [f"{left_text}{' ' * gap_width}{right_text}"]
-
-    return [line]
-
-
-def format_sta_output_for_log(text, job_state):
-    """将 Abaqus .sta 原始输出整理为紧凑表格显示。"""
-    output_lines = []
-
-    for line in text.splitlines():
-        stripped = line.strip()
-        upper_line = stripped.upper()
-
-        if not stripped:
-            continue
-
-        # Abaqus 标题行
-        if "ABAQUS/STANDARD" in upper_line and "DATE" in upper_line:
-            if not job_state.get("sta_title_printed"):
-                append_sta_separator_once(output_lines, job_state)
-                output_lines.extend(format_abaqus_standard_title(stripped))
-                output_lines.append("")
-                job_state["sta_title_printed"] = True
-            continue
-
-        # 原始 SUMMARY 表头替换为自定义短表头
-        if "SUMMARY OF JOB INFORMATION" in upper_line:
-            if not job_state.get("sta_header_printed"):
-                append_sta_separator_once(output_lines, job_state)
-                output_lines.append(build_sta_table_header())
-                output_lines.append("-" * LOG_SEPARATOR_WIDTH)
-                job_state["sta_header_printed"] = True
-            continue
-
-        # 跳过 Abaqus 原始英文多行表头
-        skip_keywords = (
-            "STEP  INC ATT",
-            "DISCON ITERS",
-            "ITERS",
-            "TIME/",
-            "LPF",
-            "MONITOR RIKS",
-            "FREQ",
-            "DOF",
-        )
-
-        if any(keyword in upper_line for keyword in skip_keywords):
-            continue
-
-        # 整理增量行
-        if is_sta_progress_line(stripped):
-            if not job_state.get("sta_header_printed"):
-                append_sta_separator_once(output_lines, job_state)
-                output_lines.append(build_sta_table_header())
-                output_lines.append("-" * LOG_SEPARATOR_WIDTH)
-                job_state["sta_header_printed"] = True
-
-            parts = stripped.split()
-
-            step = parts[0]
-            inc = parts[1]
-            att = parts[2]
-            severe = parts[3]
-            equil = parts[4]
-            total_iter = parts[5]
-            total_time = parts[6]
-            step_time = parts[7]
-            inc_time = parts[8]
-
-            cutback_note = ""
-            if att.upper().endswith("U"):
-                cutback_note = "  cut"
-
-            output_lines.append(
-                f"{step:>4} {inc:>3} {att:>3} "
-                f"{severe:>3} {equil:>5} {total_iter:>5} "
-                f"{total_time:>10} {step_time:>9} {inc_time:>8}"
-                f"{cutback_note}"
-            )
-            continue
-
-        # 关键结束/错误信息保留
-        important_keywords = (
-            "THE ANALYSIS HAS",
-            "ERROR",
-            "WARNING",
-            "ABAQUS JOB",
-            "COMPLETED",
-            "ABORTED",
-            "TERMINATED",
-        )
-
-        if any(keyword in upper_line for keyword in important_keywords):
-            append_sta_separator_once(output_lines, job_state)
-            output_lines.append(stripped)
-
-    if output_lines:
-        return "\n".join(output_lines) + "\n"
-
-    return ""
-
 def refresh_runtime_status(job_state):
     """刷新单个作业的实际运行时间显示。"""
     if job_state.get("finalized"):
@@ -3590,198 +2542,201 @@ def start_global_runtime_status_monitor():
 
 def run_global_runtime_status_monitor():
     """Refresh runtime labels for all active jobs with one timer."""
-    active_states = [
-        state for state in active_jobs.values()
-        if not state.get("finalized")
-    ]
-
-    if not active_states:
-        runtime_status_state["running"] = False
-        return
-
-    for job_state in active_states:
-        refresh_runtime_status(job_state)
-
-    root.after(RUNTIME_STATUS_INTERVAL_MS, run_global_runtime_status_monitor)
+    with measure_ui_callback("run_global_runtime_status_monitor"):
+        active_states = [
+            state for state in active_jobs.values()
+            if not state.get("finalized")
+        ]
+    
+        if not active_states:
+            runtime_status_state["running"] = False
+            return
+    
+        for job_state in active_states:
+            refresh_runtime_status(job_state)
+    
+        root.after(RUNTIME_STATUS_INTERVAL_MS, run_global_runtime_status_monitor)
 
 
 def monitor_sta_file(monitor_state):
     """定时读取单个 sta 文件新增内容并显示到对应日志页。"""
-    sta_path = monitor_state["path"]
-    process = monitor_state["process"]
-    log_widget = monitor_state["log_widget"]
-    job_state = monitor_state["job_state"]
-
-    if job_state.get("finalized"):
-        return
-
-    if job_state.get("terminating"):
-        lock_exists = job_lock_exists(job_state)
-        set_job_status(job_state, "Terminating")
-
-        final_status, detail = inspect_job_files(
-            job_state["work_dir"],
-            job_state["job_name"],
-            monitor_state["submitted_at"]
-        )
-        if final_status:
-            finalize_job(job_state, "终止", "手动终止")
+    with measure_ui_callback("monitor_sta_file"):
+        sta_path = monitor_state["path"]
+        process = monitor_state["process"]
+        log_widget = monitor_state["log_widget"]
+        job_state = monitor_state["job_state"]
+    
+        if job_state.get("finalized"):
             return
-
-        if not lock_exists:
-            finalize_job(job_state, "终止", "手动终止，lck文件已释放")
+    
+        if job_state.get("terminating"):
+            lock_exists = job_lock_exists(job_state)
+            set_job_status(job_state, "Terminating")
+    
+            final_status, detail = inspect_job_files(
+                job_state["work_dir"],
+                job_state["job_name"],
+                monitor_state["submitted_at"]
+            )
+            if final_status:
+                finalize_job(job_state, "终止", "手动终止")
+                return
+    
+            if not lock_exists:
+                finalize_job(job_state, "终止", "手动终止，lck文件已释放")
+                return
+    
+            root.after(
+                STA_POLL_INTERVAL_MS,
+                lambda: monitor_sta_file(monitor_state)
+            )
             return
-
-        root.after(
-            STA_POLL_INTERVAL_MS,
-            lambda: monitor_sta_file(monitor_state)
-        )
-        return
-
-    if not os.path.exists(sta_path):
-        job_state["waiting_sta"] = True
-
-        signals = collect_job_signals(
-            job_state,
-            monitor_state,
-            sta_path,
-            process
-        )
-
-        if signals["lock_exists"]:
-            monitor_state["seen_lock"] = True
-
-        prefix = "Suspended" if job_state.get("suspended") else "Running"
-        set_job_status(job_state, format_progress_status(job_state, prefix))
-
-        if not monitor_state["missing_logged"]:
-            append_log(log_widget, "状态：等待 Abaqus 生成 .sta 文件...\n")
-            monitor_state["missing_logged"] = True
-
-        # 用户主动终止，并且 lck 文件已经释放，才判定终止
-        if (
-                job_state.get("terminating")
-                and time.time() - job_state.get("terminating_at", time.time()) > 20
-                and not signals["lock_exists"]
-        ):
-            finalize_job(job_state, "终止", "终止命令后 lck 文件已释放")
-            return
-
-        # Abaqus 询问覆盖旧结果时，如果用户选择否，结束为取消
-        if (
-                job_state.get("overwrite_answer_sent")
-                and not job_state["overwrite_existing"]
-        ):
-            finalize_job(job_state, "取消", "已有旧结果文件，已选择不覆盖")
-            return
-
-        status, detail = decide_job_status_before_sta(signals)
-
-        if status:
-            finalize_job(job_state, status, detail)
-            return
-
-        root.after(
-            STA_POLL_INTERVAL_MS,
-            lambda: monitor_sta_file(monitor_state)
-        )
-        return
-
-    try:
-        job_state["waiting_sta"] = False
-        activate_job_memory_monitor(job_state)
-        current_size = os.path.getsize(sta_path)
-        if current_size < monitor_state["position"]:
-            monitor_state["position"] = 0
-        if current_size == monitor_state["position"]:
-            new_text = ""
-        else:
-            with open(sta_path, "r", encoding=STA_FILE_ENCODING, errors="replace") as sta_file:
-                sta_file.seek(monitor_state["position"])
-                new_text = sta_file.read()
-                monitor_state["position"] = sta_file.tell()
-
-    except OSError as e:
-        append_log(log_widget, f"状态：暂时无法读取 .sta 文件，稍后重试：{e}\n")
-        root.after(
-            STA_POLL_INTERVAL_MS,
-            lambda: monitor_sta_file(monitor_state)
-        )
-        return
-
-    monitor_state["seen_sta"] = True
-
-    if new_text:
-        display_text = format_sta_output_for_log(new_text, job_state)
-
-        if display_text:
-            append_log(log_widget, display_text)
-
-        progress = parse_sta_progress(new_text)
-        if progress:
-            job_state["progress"] = progress
+    
+        if not os.path.exists(sta_path):
+            job_state["waiting_sta"] = True
+    
+            signals = collect_job_signals(
+                job_state,
+                monitor_state,
+                sta_path,
+                process
+            )
+    
+            if signals["lock_exists"]:
+                monitor_state["seen_lock"] = True
+    
             prefix = "Suspended" if job_state.get("suspended") else "Running"
             set_job_status(job_state, format_progress_status(job_state, prefix))
+    
+            if not monitor_state["missing_logged"]:
+                append_log(log_widget, "状态：等待 Abaqus 生成 .sta 文件...\n")
+                monitor_state["missing_logged"] = True
+    
+            # 用户主动终止，并且 lck 文件已经释放，才判定终止
+            if (
+                    job_state.get("terminating")
+                    and time.time() - job_state.get("terminating_at", time.time()) > 20
+                    and not signals["lock_exists"]
+            ):
+                finalize_job(job_state, "终止", "终止命令后 lck 文件已释放")
+                return
+    
+            # Abaqus 询问覆盖旧结果时，如果用户选择否，结束为取消
+            if (
+                    job_state.get("overwrite_answer_sent")
+                    and not job_state["overwrite_existing"]
+            ):
+                finalize_job(job_state, "取消", "已有旧结果文件，已选择不覆盖")
+                return
+    
+            status, detail = decide_job_status_before_sta(signals)
+    
+            if status:
+                finalize_job(job_state, status, detail)
+                return
+    
+            root.after(
+                STA_POLL_INTERVAL_MS,
+                lambda: monitor_sta_file(monitor_state)
+            )
+            return
+    
+        try:
+            job_state["waiting_sta"] = False
+            activate_job_memory_monitor(job_state)
+            current_size = os.path.getsize(sta_path)
+            if current_size < monitor_state["position"]:
+                monitor_state["position"] = 0
+            if current_size == monitor_state["position"]:
+                new_text = ""
+            else:
+                with open(sta_path, "r", encoding=STA_FILE_ENCODING, errors="replace") as sta_file:
+                    sta_file.seek(monitor_state["position"])
+                    new_text = sta_file.read()
+                    monitor_state["position"] = sta_file.tell()
+    
+        except OSError as e:
+            append_log(log_widget, f"状态：暂时无法读取 .sta 文件，稍后重试：{e}\n")
+            root.after(
+                STA_POLL_INTERVAL_MS,
+                lambda: monitor_sta_file(monitor_state)
+            )
+            return
+    
+        monitor_state["seen_sta"] = True
+    
+        if new_text:
+            display_text = format_sta_output_for_log(new_text, job_state)
 
-    final_status, detail = classify_job_text(new_text)
-    if final_status:
-        finalize_job(job_state, final_status, detail)
-        return
+            if display_text:
+                trim_log_trailing_blank_lines(log_widget)
+                append_log(log_widget, display_text)
 
-    final_status, detail = inspect_job_files_throttled(
-        monitor_state,
-        interval_seconds=20
-    )
-    if final_status:
-        finalize_job(job_state, final_status, detail)
-        return
-
-    lock_exists = job_lock_exists(job_state)
-
-    # 只要 .lck 存在，就认为 Abaqus 仍在运行
-    if lock_exists:
-        monitor_state["seen_lock"] = True
-        monitor_state["stable_no_lock_polls"] = 0
-
-        prefix = "Suspended" if job_state.get("suspended") else "Running"
-        set_job_status(job_state, format_progress_status(job_state, prefix))
-
-        monitor_state["last_size"] = current_size
-
-        root.after(
-            STA_POLL_INTERVAL_MS,
-            lambda: monitor_sta_file(monitor_state)
-        )
-        return
-
-    # 走到这里说明 .lck 已经不存在，再考虑收尾判断
-    if current_size == monitor_state["last_size"]:
-        monitor_state["stable_no_lock_polls"] += 1
-    else:
-        monitor_state["stable_no_lock_polls"] = 0
-
-    monitor_state["last_size"] = current_size
-
-    if monitor_state["seen_sta"] and monitor_state["stable_no_lock_polls"] >= 3:
-        final_status, detail = inspect_job_files(
-            job_state["work_dir"],
-            job_state["job_name"],
-            monitor_state["submitted_at"]
-        )
-
+            progress = parse_sta_progress(new_text)
+            if progress:
+                job_state["progress"] = progress
+                prefix = "Suspended" if job_state.get("suspended") else "Running"
+                set_job_status(job_state, format_progress_status(job_state, prefix))
+    
+        final_status, detail = classify_job_text(new_text)
         if final_status:
             finalize_job(job_state, final_status, detail)
-        elif job_state.get("terminating"):
-            finalize_job(job_state, "终止", "终止命令后lck文件已释放")
-        elif job_state.get("console_failed"):
-            finalize_job(
-                job_state,
-                "失败",
-                job_state.get("console_failed_detail", "控制台检测到错误信息")
+            return
+    
+        final_status, detail = inspect_job_files_throttled(
+            monitor_state,
+            interval_seconds=20
+        )
+        if final_status:
+            finalize_job(job_state, final_status, detail)
+            return
+    
+        lock_exists = job_lock_exists(job_state)
+    
+        # 只要 .lck 存在，就认为 Abaqus 仍在运行
+        if lock_exists:
+            monitor_state["seen_lock"] = True
+            monitor_state["stable_no_lock_polls"] = 0
+    
+            prefix = "Suspended" if job_state.get("suspended") else "Running"
+            set_job_status(job_state, format_progress_status(job_state, prefix))
+    
+            monitor_state["last_size"] = current_size
+    
+            root.after(
+                STA_POLL_INTERVAL_MS,
+                lambda: monitor_sta_file(monitor_state)
             )
+            return
+    
+        # 走到这里说明 .lck 已经不存在，再考虑收尾判断
+        if current_size == monitor_state["last_size"]:
+            monitor_state["stable_no_lock_polls"] += 1
         else:
-            finalize_job(job_state, "状态未知", "lck 文件已释放，但未检测到明确完成或错误信息")
-        return
+            monitor_state["stable_no_lock_polls"] = 0
+    
+        monitor_state["last_size"] = current_size
+    
+        if monitor_state["seen_sta"] and monitor_state["stable_no_lock_polls"] >= 3:
+            final_status, detail = inspect_job_files(
+                job_state["work_dir"],
+                job_state["job_name"],
+                monitor_state["submitted_at"]
+            )
+    
+            if final_status:
+                finalize_job(job_state, final_status, detail)
+            elif job_state.get("terminating"):
+                finalize_job(job_state, "终止", "终止命令后lck文件已释放")
+            elif job_state.get("console_failed"):
+                finalize_job(
+                    job_state,
+                    "失败",
+                    job_state.get("console_failed_detail", "控制台检测到错误信息")
+                )
+            else:
+                finalize_job(job_state, "状态未知", "lck 文件已释放，但未检测到明确完成或错误信息")
+            return
 
 
 def select_inp_file():
@@ -4601,9 +3556,6 @@ def refresh_joblist_restart_jobs():
     return restart_names
 
 
-def normalize_joblist_path(path):
-    """Return a stable absolute path for queue file comparisons."""
-    return os.path.normpath(os.path.abspath(path))
 
 
 def normalize_joblist_compare_path(path):
@@ -4740,19 +3692,77 @@ def classify_external_job_after_process_exit(item):
     return STATUS_UNKNOWN, "外部作业相关进程已消失，但未从诊断文件中识别出明确结束状态。"
 
 
-def sample_external_queue_item_processes(item):
-    """Update one external queue item from its tracked PIDs."""
-    if psutil is None:
-        return False
+def classify_external_job_after_process_exit_snapshot(snapshot, lck_exists):
+    """Classify an external job from immutable worker data."""
+    work_dir = snapshot.get("work_dir", "")
+    job_name = snapshot.get("job_name", "")
+    if not work_dir or not job_name:
+        return STATUS_UNKNOWN, "外部作业相关进程已消失，但缺少工作目录或作业名，无法读取诊断文件。"
 
-    old_pids = list(item.pids or [])
-    old_rss = int(item.rss_bytes or 0)
-    old_status = item.status
-    old_message = item.message
+    combined_text = ""
+    for extension in DIAGNOSTIC_EXTENSIONS:
+        path = os.path.join(work_dir, job_name + extension)
+        if os.path.exists(path):
+            combined_text += "\n" + read_file_tail(path)
+
+    final_status, detail = classify_job_text(combined_text)
+    if final_status == "完成":
+        return STATUS_COMPLETED, detail or "检测到外部作业完成信息"
+    if final_status == "终止":
+        return STATUS_TERMINATED, detail or "检测到外部作业终止信息"
+    if final_status == "失败":
+        return STATUS_FAILED, detail or "检测到外部作业错误信息"
+
+    if lck_exists:
+        return STATUS_UNKNOWN, "进程已消失，但仍存在 LCK 文件，可能为异常退出后的残留文件。"
+
+    return STATUS_UNKNOWN, "外部作业相关进程已消失，但未从诊断文件中识别出明确结束状态。"
+
+
+def build_external_job_monitor_snapshot(items):
+    """Copy external job fields needed by the background PID sampler."""
+    snapshots = []
+    for item in items:
+        snapshots.append(
+            {
+                "item_id": item.item_id,
+                "job_name": item.job_name,
+                "work_dir": item.external_work_dir or os.path.dirname(item.inp_path),
+                "status": item.status,
+                "pids": list(item.pids or []),
+                "pid_create_times": dict(item.pid_create_times or {}),
+            }
+        )
+
+    return snapshots
+
+
+def collect_external_job_process_sample(snapshot):
+    """Collect one external job PID sample away from the Tk main thread."""
+    if psutil is None:
+        return {
+            "item_id": snapshot.get("item_id", ""),
+            "alive_pids": [],
+            "pid_create_times": {},
+            "rss_bytes": 0,
+            "lck_exists": False,
+            "final_status": "",
+            "detail": "",
+        }
+
+    old_pids = list(snapshot.get("pids") or [])
+    old_status = snapshot.get("status", "")
+    pid_create_times = snapshot.get("pid_create_times") or {}
+    work_dir = snapshot.get("work_dir", "")
+    job_name = snapshot.get("job_name", "")
 
     alive_pids = []
     alive_create_times = {}
     rss_total = 0
+    lck_path = os.path.join(work_dir, job_name + ".lck") if work_dir and job_name else ""
+    lck_exists = bool(lck_path and os.path.exists(lck_path))
+    final_status = ""
+    detail = ""
 
     for raw_pid in old_pids:
         try:
@@ -4766,14 +3776,14 @@ def sample_external_queue_item_processes(item):
         try:
             process = psutil.Process(pid)
             create_time = process.create_time()
-            expected_create_time = item.pid_create_times.get(str(pid))
+            expected_create_time = pid_create_times.get(str(pid))
             if expected_create_time and abs(float(expected_create_time) - float(create_time)) > 0.01:
                 continue
             rss_total += int(process.memory_info().rss)
             process.name()
         except (psutil.AccessDenied, OSError):
             alive_pids.append(pid)
-            existing_create_time = item.pid_create_times.get(str(pid))
+            existing_create_time = pid_create_times.get(str(pid))
             if existing_create_time:
                 alive_create_times[str(pid)] = existing_create_time
             continue
@@ -4783,23 +3793,53 @@ def sample_external_queue_item_processes(item):
         alive_pids.append(pid)
         alive_create_times[str(pid)] = create_time
 
-    item.pids = sorted(alive_pids)
-    item.pid_create_times = alive_create_times
-    item.rss_bytes = rss_total
+    if old_pids and not alive_pids:
+        if old_status == STATUS_TERMINATING:
+            final_status = STATUS_TERMINATED
+            detail = (
+                "外部终止命令已生效，进程已退出；仍存在 LCK 残留。"
+                if lck_exists
+                else "外部终止命令已生效，进程已退出。"
+            )
+        else:
+            final_status, detail = classify_external_job_after_process_exit_snapshot(
+                snapshot,
+                lck_exists
+            )
+
+    return {
+        "item_id": snapshot.get("item_id", ""),
+        "alive_pids": sorted(alive_pids),
+        "pid_create_times": alive_create_times,
+        "rss_bytes": rss_total,
+        "lck_exists": lck_exists,
+        "final_status": final_status,
+        "detail": detail,
+    }
+
+
+def apply_external_job_process_sample(item, sample):
+    """Apply a background external PID sample on the Tk main thread."""
+    old_pids = list(item.pids or [])
+    old_rss = int(item.rss_bytes or 0)
+    old_status = item.status
+    old_message = item.message
+
+    item.pids = list(sample.get("alive_pids") or [])
+    item.pid_create_times = dict(sample.get("pid_create_times") or {})
+    item.rss_bytes = int(sample.get("rss_bytes") or 0)
     if item.pids:
         update_external_job_memory_estimate(item)
 
-    if old_pids and not item.pids and old_status == STATUS_TERMINATING:
+    final_status = sample.get("final_status", "")
+    detail = sample.get("detail", "")
+
+    if old_pids and not item.pids and final_status == STATUS_TERMINATED:
         item.status = STATUS_TERMINATED
-        lck_path = get_external_job_lck_path(item)
-        if lck_path and os.path.exists(lck_path):
-            item.message = "外部终止命令已生效，进程已退出；仍存在 LCK 残留。"
-        else:
-            item.message = "外部终止命令已生效，进程已退出。"
+        item.message = detail or "外部终止命令已生效，进程已退出。"
         item.valid = True
         joblist_state["statuses"][item.item_id] = item.status
     elif old_pids and not item.pids:
-        final_status, detail = classify_external_job_after_process_exit(item)
         item.status = final_status
         item.message = detail
         item.valid = final_status not in (STATUS_FAILED, STATUS_UNKNOWN)
@@ -4848,25 +3888,118 @@ def stop_external_job_monitor_if_idle():
 
     external_job_monitor_state["running"] = False
     external_job_monitor_state["after_id"] = None
+    external_job_monitor_state["scanning"] = False
     return True
 
 
+def run_external_job_scan_worker(generation, snapshots):
+    """Collect external job PID samples away from the Tk main thread."""
+    started_at = time.perf_counter()
+    try:
+        samples = [
+            collect_external_job_process_sample(snapshot)
+            for snapshot in snapshots
+        ]
+    except Exception as exc:
+        if not application_closing:
+            queue_ui_event(
+                "external_job_scan_failed",
+                {
+                    "generation": generation,
+                    "error": str(exc),
+                }
+            )
+    else:
+        if not application_closing:
+            queue_ui_event(
+                "external_job_scan_finished",
+                {
+                    "generation": generation,
+                    "samples": samples,
+                }
+            )
+    finally:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        sampled_pid_count = sum(
+            len(sample.get("alive_pids") or [])
+            for sample in locals().get("samples", []) or []
+        )
+        log_worker_performance(
+            "external_job_scan_worker",
+            elapsed_ms,
+            snapshot_count=len(snapshots),
+            sampled_pid_count=sampled_pid_count,
+            status="failed" if "exc" in locals() else "success",
+        )
+
+
 def run_external_job_monitor():
-    """Refresh imported external jobs from their tracked PIDs."""
+    """Start one background scan for imported external jobs."""
     external_job_monitor_state["after_id"] = None
+    if application_closing:
+        external_job_monitor_state["running"] = False
+        return
+
     monitored_items = external_job_items_to_monitor()
     if not monitored_items or psutil is None:
         external_job_monitor_state["running"] = False
         return
 
+    if external_job_monitor_state.get("scanning"):
+        external_job_monitor_state["after_id"] = root.after(
+            EXTERNAL_JOB_MONITOR_INTERVAL_MS,
+            run_external_job_monitor
+        )
+        return
+
+    external_job_monitor_state["generation"] += 1
+    external_job_monitor_state["scanning"] = True
+    generation = external_job_monitor_state["generation"]
+    snapshots = build_external_job_monitor_snapshot(monitored_items)
+    threading.Thread(
+        target=run_external_job_scan_worker,
+        args=(generation, snapshots),
+        daemon=True
+    ).start()
+
+
+def apply_external_job_scan_result(payload):
+    """Apply external job PID samples on the Tk main thread."""
+    if payload.get("generation") != external_job_monitor_state.get("generation"):
+        return
+
+    external_job_monitor_state["scanning"] = False
+    item_by_id = {item.item_id: item for item in queue_items}
     changed = False
-    for item in monitored_items:
-        changed = sample_external_queue_item_processes(item) or changed
+    for sample in payload.get("samples") or []:
+        item = item_by_id.get(sample.get("item_id", ""))
+        if item is None:
+            continue
+        changed = apply_external_job_process_sample(item, sample) or changed
 
     if changed:
         sync_joblist_state_from_queue_items()
         schedule_save_formal_queue_file()
         schedule_dispatch_joblist(100)
+
+    schedule_next_external_job_monitor()
+
+
+def apply_external_job_scan_failure(payload):
+    """Recover the external monitor after a background scan failure."""
+    if payload.get("generation") != external_job_monitor_state.get("generation"):
+        return
+
+    external_job_monitor_state["scanning"] = False
+    schedule_next_external_job_monitor()
+
+
+def schedule_next_external_job_monitor():
+    """Schedule or stop the next external job monitor tick."""
+    if application_closing:
+        external_job_monitor_state["running"] = False
+        external_job_monitor_state["after_id"] = None
+        return
 
     if external_job_items_to_monitor():
         external_job_monitor_state["after_id"] = root.after(
@@ -4997,14 +4130,6 @@ def build_formal_queue_payload():
     ]
 
 
-def atomic_write_json(path, payload):
-    """Atomically write JSON so joblist.json is never half-written."""
-    temp_path = path + ".tmp"
-    with open(temp_path, "w", encoding="utf-8") as file:
-        json.dump(payload, file, ensure_ascii=False, indent=2)
-        file.flush()
-        os.fsync(file.fileno())
-    os.replace(temp_path, path)
 
 
 def save_formal_queue_file():
@@ -5649,84 +4774,86 @@ def queue_item_row_values(item, index, candidate=False):
 
 def sync_treeview_rows(tree, rows):
     """Synchronize Treeview rows without rebuilding unchanged items."""
-    if tree is None or not tree.winfo_exists():
-        return
-
-    try:
-        selection = set(tree.selection())
-        yview = tree.yview()
-        existing_ids = set(tree.get_children())
-        incoming_ids = [item_id for item_id, _values in rows]
-        incoming_id_set = set(incoming_ids)
-
-        for item_id in existing_ids - incoming_id_set:
-            tree.delete(item_id)
-
-        for position, (item_id, values) in enumerate(rows):
-            if item_id in existing_ids:
-                if tuple(tree.item(item_id, "values")) != tuple(str(value) for value in values):
-                    tree.item(item_id, values=values)
-            else:
-                tree.insert("", "end", iid=item_id, values=values)
-
-            current_index = tree.index(item_id)
-            if current_index != position:
-                tree.move(item_id, "", position)
-
-        kept_selection = [item_id for item_id in selection if item_id in incoming_id_set]
-        if kept_selection:
-            tree.selection_set(kept_selection)
-        if yview:
-            tree.yview_moveto(yview[0])
-    except tk.TclError:
-        pass
+    with measure_ui_callback("sync_treeview_rows"):
+        if tree is None or not tree.winfo_exists():
+            return
+    
+        try:
+            selection = set(tree.selection())
+            yview = tree.yview()
+            existing_ids = set(tree.get_children())
+            incoming_ids = [item_id for item_id, _values in rows]
+            incoming_id_set = set(incoming_ids)
+    
+            for item_id in existing_ids - incoming_id_set:
+                tree.delete(item_id)
+    
+            for position, (item_id, values) in enumerate(rows):
+                if item_id in existing_ids:
+                    if tuple(tree.item(item_id, "values")) != tuple(str(value) for value in values):
+                        tree.item(item_id, values=values)
+                else:
+                    tree.insert("", "end", iid=item_id, values=values)
+    
+                current_index = tree.index(item_id)
+                if current_index != position:
+                    tree.move(item_id, "", position)
+    
+            kept_selection = [item_id for item_id in selection if item_id in incoming_id_set]
+            if kept_selection:
+                tree.selection_set(kept_selection)
+            if yview:
+                tree.yview_moveto(yview[0])
+        except tk.TclError:
+            pass
 
 
 def refresh_queue_manager_views():
     """Refresh candidate/formal queue Treeviews and summaries."""
-    try:
-        if queue_candidate_tree is not None and queue_candidate_tree.winfo_exists():
-            candidate_rows = tuple(
-                (
-                    item.item_id,
-                    queue_item_row_values(item, index, candidate=True)
+    with measure_ui_callback("refresh_queue_manager_views"):
+        try:
+            if queue_candidate_tree is not None and queue_candidate_tree.winfo_exists():
+                candidate_rows = tuple(
+                    (
+                        item.item_id,
+                        queue_item_row_values(item, index, candidate=True)
+                    )
+                    for index, item in enumerate(queue_candidates, start=1)
                 )
-                for index, item in enumerate(queue_candidates, start=1)
-            )
-            if (
-                    candidate_rows != queue_manager_view_signature["candidate"]
-                    or (candidate_rows and not queue_candidate_tree.get_children())
-            ):
-                sync_treeview_rows(queue_candidate_tree, candidate_rows)
-                queue_manager_view_signature["candidate"] = candidate_rows
-        if queue_formal_tree is not None and queue_formal_tree.winfo_exists():
-            formal_rows = tuple(
-                (
-                    item.item_id,
-                    queue_item_row_values(item, index, candidate=False)
+                if (
+                        candidate_rows != queue_manager_view_signature["candidate"]
+                        or (candidate_rows and not queue_candidate_tree.get_children())
+                ):
+                    sync_treeview_rows(queue_candidate_tree, candidate_rows)
+                    queue_manager_view_signature["candidate"] = candidate_rows
+            if queue_formal_tree is not None and queue_formal_tree.winfo_exists():
+                formal_rows = tuple(
+                    (
+                        item.item_id,
+                        queue_item_row_values(item, index, candidate=False)
+                    )
+                    for index, item in enumerate(queue_items, start=1)
                 )
-                for index, item in enumerate(queue_items, start=1)
-            )
-            if (
-                    formal_rows != queue_manager_view_signature["formal"]
-                    or (formal_rows and not queue_formal_tree.get_children())
-            ):
-                sync_treeview_rows(queue_formal_tree, formal_rows)
-                queue_manager_view_signature["formal"] = formal_rows
-        if queue_candidate_summary_var is not None:
-            total = len(queue_candidates)
-            selected = sum(1 for item in queue_candidates if item.selected)
-            invalid = sum(1 for item in queue_candidates if not item.valid)
-            queue_candidate_summary_var.set(f"候选：{total} | 已选 {selected} | 异常 {invalid}")
-        if queue_formal_summary_var is not None:
-            counts = {}
-            for item in queue_items:
-                counts[item.status] = counts.get(item.status, 0) + 1
-            queue_formal_summary_var.set(
-                "正式队列：" + (" | ".join(f"{status} {count}" for status, count in counts.items()) if counts else "空")
-            )
-    except tk.TclError:
-        pass
+                if (
+                        formal_rows != queue_manager_view_signature["formal"]
+                        or (formal_rows and not queue_formal_tree.get_children())
+                ):
+                    sync_treeview_rows(queue_formal_tree, formal_rows)
+                    queue_manager_view_signature["formal"] = formal_rows
+            if queue_candidate_summary_var is not None:
+                total = len(queue_candidates)
+                selected = sum(1 for item in queue_candidates if item.selected)
+                invalid = sum(1 for item in queue_candidates if not item.valid)
+                queue_candidate_summary_var.set(f"候选：{total} | 已选 {selected} | 异常 {invalid}")
+            if queue_formal_summary_var is not None:
+                counts = {}
+                for item in queue_items:
+                    counts[item.status] = counts.get(item.status, 0) + 1
+                queue_formal_summary_var.set(
+                    "正式队列：" + (" | ".join(f"{status} {count}" for status, count in counts.items()) if counts else "空")
+                )
+        except tk.TclError:
+            pass
 
 
 def confirm_selected_candidates_to_queue():
@@ -6172,9 +5299,26 @@ def create_queue_table(parent, columns, widths):
     x_scroll.grid(row=1, column=0, sticky="ew")
     frame.rowconfigure(0, weight=1)
     frame.columnconfigure(0, weight=1)
+    left_aligned_columns = {
+        "INP 文件路径",
+    }
+
     for column, width in zip(columns, widths):
-        tree.heading(column, text=column)
-        tree.column(column, width=width, minwidth=45, anchor="w")
+        anchor = "w" if column in left_aligned_columns else "center"
+
+        tree.heading(
+            column,
+            text=column,
+            anchor=anchor,
+        )
+
+        tree.column(
+            column,
+            width=width,
+            minwidth=45,
+            anchor=anchor,
+        )
+
     return tree
 
 
@@ -6198,7 +5342,7 @@ def open_queue_manager_window():
     queue_manager_window.geometry("1280x720")
     queue_manager_window.minsize(1180, 680)
     queue_manager_window.configure(bg="#f8fafc")
-    queue_manager_window.transient(root)
+    # queue_manager_window.transient(root)
 
     main = ttk.Frame(queue_manager_window, style="Main.TFrame")
     main.pack(fill="both", expand=True, padx=12, pady=12)
@@ -6334,8 +5478,7 @@ def save_joblist_file(work_dir, inp_names):
     else:
         payload = inp_names
 
-    with open(path, "w", encoding="utf-8") as file:
-        json.dump(payload, file, ensure_ascii=False, indent=2)
+    atomic_write_json(path, payload)
 
     return path
 
@@ -6977,111 +6120,113 @@ def maybe_log_external_slot_notice(external_active_count, submit_slots, waiting)
 
 def schedule_dispatch_joblist(delay_ms=100):
     """Schedule one queue dispatch pass, coalescing duplicate timers."""
-    if not joblist_state.get("active"):
-        return
-
-    due_time = time.monotonic() + max(0, delay_ms) / 1000
-    existing_after_id = joblist_state.get("dispatch_after_id")
-    existing_due_time = float(joblist_state.get("dispatch_due_time") or 0)
-
-    if existing_after_id and existing_due_time and existing_due_time <= due_time:
-        return
-
-    if existing_after_id:
-        try:
-            root.after_cancel(existing_after_id)
-        except tk.TclError:
-            pass
-
-    def run_scheduled_dispatch():
-        joblist_state["dispatch_after_id"] = None
-        joblist_state["dispatch_due_time"] = 0.0
-        dispatch_joblist()
-
-    joblist_state["dispatch_due_time"] = due_time
-    joblist_state["dispatch_after_id"] = root.after(
-        max(0, delay_ms),
-        run_scheduled_dispatch
-    )
+    with measure_ui_callback("schedule_dispatch_joblist"):
+        if not joblist_state.get("active"):
+            return
+    
+        due_time = time.monotonic() + max(0, delay_ms) / 1000
+        existing_after_id = joblist_state.get("dispatch_after_id")
+        existing_due_time = float(joblist_state.get("dispatch_due_time") or 0)
+    
+        if existing_after_id and existing_due_time and existing_due_time <= due_time:
+            return
+    
+        if existing_after_id:
+            try:
+                root.after_cancel(existing_after_id)
+            except tk.TclError:
+                pass
+    
+        def run_scheduled_dispatch():
+            joblist_state["dispatch_after_id"] = None
+            joblist_state["dispatch_due_time"] = 0.0
+            dispatch_joblist()
+    
+        joblist_state["dispatch_due_time"] = due_time
+        joblist_state["dispatch_after_id"] = root.after(
+            max(0, delay_ms),
+            run_scheduled_dispatch
+        )
 
 
 def dispatch_joblist():
     """按当前资源状态补位提交队列作业。"""
-    if not joblist_state["active"]:
-        return
-
-    sync_joblist_state_from_queue_items()
-
-    slots, _ = estimate_available_job_slots()
-    queue_room = max(0, joblist_state["max_parallel"] - len(joblist_state["running"]))
-    external_active_count = get_external_active_job_count()
-    total_job_room = max(0, joblist_state["max_parallel"] - get_total_managed_active_job_count())
-    submit_slots = max(0, min(slots, queue_room, total_job_room))
-    waiting = any(
-        joblist_state["statuses"].get(name) in (STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY, "等待", "等待前置")
-        for name in joblist_state["jobs"]
-    )
-    maybe_log_external_slot_notice(external_active_count, submit_slots, waiting)
-
-    while submit_slots > 0:
-        next_name = get_next_ready_joblist_name()
-
-        if not next_name:
-            break
-
-        queue_item = get_queue_item(next_name)
-        if queue_item is None:
-            joblist_state["statuses"][next_name] = STATUS_FAILED
-            continue
-
-        if not validate_formal_queue_item_before_submit(queue_item):
-            joblist_state["statuses"][next_name] = queue_item.status
-            refresh_queue_manager_views()
-            submit_slots -= 1
-            continue
-
-        inp_file = get_joblist_item_path(next_name)
-        queue_item.status = STATUS_STARTING
-        queue_item.message = "正在启动 Abaqus"
-        joblist_state["statuses"][next_name] = STATUS_STARTING
-        update_joblist_status_label()
-        refresh_queue_manager_views()
-
-        submitted_job = submit_job(
-            inp_file_override=inp_file,
-            queue_mode=True,
-            oldjob_path_override=joblist_state["oldjob_paths"].get(next_name, ""),
-            queue_job_key_override=next_name,
-            queue_item_override=queue_item
+    with measure_ui_callback("dispatch_joblist"):
+        if not joblist_state["active"]:
+            return
+    
+        sync_joblist_state_from_queue_items()
+    
+        slots, _ = estimate_available_job_slots()
+        queue_room = max(0, joblist_state["max_parallel"] - len(joblist_state["running"]))
+        external_active_count = get_external_active_job_count()
+        total_job_room = max(0, joblist_state["max_parallel"] - get_total_managed_active_job_count())
+        submit_slots = max(0, min(slots, queue_room, total_job_room))
+        waiting = any(
+            joblist_state["statuses"].get(name) in (STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY, "等待", "等待前置")
+            for name in joblist_state["jobs"]
         )
-        if submitted_job:
-            joblist_state["running"].add(next_name)
-            queue_item.status = STATUS_RUNNING
-            queue_item.message = "运行中"
-            joblist_state["statuses"][next_name] = STATUS_RUNNING
+        maybe_log_external_slot_notice(external_active_count, submit_slots, waiting)
+    
+        while submit_slots > 0:
+            next_name = get_next_ready_joblist_name()
+    
+            if not next_name:
+                break
+    
+            queue_item = get_queue_item(next_name)
+            if queue_item is None:
+                joblist_state["statuses"][next_name] = STATUS_FAILED
+                continue
+    
+            if not validate_formal_queue_item_before_submit(queue_item):
+                joblist_state["statuses"][next_name] = queue_item.status
+                refresh_queue_manager_views()
+                submit_slots -= 1
+                continue
+    
+            inp_file = get_joblist_item_path(next_name)
+            queue_item.status = STATUS_STARTING
+            queue_item.message = "正在启动 Abaqus"
+            joblist_state["statuses"][next_name] = STATUS_STARTING
+            update_joblist_status_label()
+            refresh_queue_manager_views()
+    
+            submitted_job = submit_job(
+                inp_file_override=inp_file,
+                queue_mode=True,
+                oldjob_path_override=joblist_state["oldjob_paths"].get(next_name, ""),
+                queue_job_key_override=next_name,
+                queue_item_override=queue_item
+            )
+            if submitted_job:
+                joblist_state["running"].add(next_name)
+                queue_item.status = STATUS_RUNNING
+                queue_item.message = "运行中"
+                joblist_state["statuses"][next_name] = STATUS_RUNNING
+            else:
+                queue_item.status = STATUS_FAILED
+                queue_item.message = "提交失败"
+                queue_item.active_job_key = ""
+                joblist_state["statuses"][next_name] = STATUS_FAILED
+    
+            submit_slots -= 1
+    
+        waiting = any(
+            joblist_state["statuses"].get(name) in (STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY, "等待", "等待前置")
+            for name in joblist_state["jobs"]
+        )
+    
+        if not waiting and not joblist_state["running"]:
+            joblist_state["active"] = False
+            update_joblist_status_label("队列：全部完成")
+            update_joblist_button_mode()
+            append_history_text("队列提交结束。\n\n")
         else:
-            queue_item.status = STATUS_FAILED
-            queue_item.message = "提交失败"
-            queue_item.active_job_key = ""
-            joblist_state["statuses"][next_name] = STATUS_FAILED
-
-        submit_slots -= 1
-
-    waiting = any(
-        joblist_state["statuses"].get(name) in (STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY, "等待", "等待前置")
-        for name in joblist_state["jobs"]
-    )
-
-    if not waiting and not joblist_state["running"]:
-        joblist_state["active"] = False
-        update_joblist_status_label("队列：全部完成")
-        update_joblist_button_mode()
-        append_history_text("队列提交结束。\n\n")
-    else:
-        update_joblist_status_label()
-        refresh_queue_manager_views()
-        if waiting and has_runnable_joblist_item() and (not joblist_state["running"] or submit_slots <= 0):
-            schedule_dispatch_joblist(5000)
+            update_joblist_status_label()
+            refresh_queue_manager_views()
+            if waiting and has_runnable_joblist_item() and (not joblist_state["running"] or submit_slots <= 0):
+                schedule_dispatch_joblist(5000)
 
 
 def finish_joblist_job(job_state, status, detail=""):
@@ -7508,6 +6653,9 @@ root.maxsize(*LEFT_ONLY_MIN_SIZE)
 root.resizable(False, False)
 root.configure(bg=APP_BG)
 root.option_add("*Font", FONT_ENTRY)
+configure_ui_performance(root)
+if ENABLE_UI_PERFORMANCE_LOG:
+    start_ui_lag_watchdog()
 
 # ================= 变量 =================
 
@@ -7589,6 +6737,90 @@ style.configure(
     "TEntry",
     padding=6,
     font=FONT_ENTRY
+)
+
+style.configure(
+    "Light.TButton",
+    font=FONT_BUTTON_BOLD,
+    padding=(4, 4),
+    background=BTN_LIGHT_FG,
+    foreground=BTN_LIGHT_TEXT,
+    borderwidth=0,
+    focusthickness=0,
+)
+
+style.map(
+    "Light.TButton",
+    background=[
+        ("active", BTN_LIGHT_HOVER),
+        ("pressed", BTN_LIGHT_HOVER),
+        ("disabled", "#e5e7eb"),
+        ("!disabled", BTN_LIGHT_FG),
+    ],
+    foreground=[
+        ("disabled", "#94a3b8"),
+        ("!disabled", BTN_LIGHT_TEXT),
+    ],
+)
+
+style.configure(
+    "Primary.TButton",
+    font=FONT_BUTTON_BOLD,
+    padding=(4, 4),
+    background="#2563eb",
+    foreground="#ffffff",
+    borderwidth=0,
+    focusthickness=0,
+)
+
+style.map(
+    "Primary.TButton",
+    background=[
+        ("active", "#1d4ed8"),
+        ("pressed", "#1d4ed8"),
+        ("disabled", "#93c5fd"),
+        ("!disabled", "#2563eb"),
+    ],
+    foreground=[
+        ("disabled", "#e0f2fe"),
+        ("!disabled", "#ffffff"),
+    ],
+)
+
+style.configure(
+    "Danger.TButton",
+    font=FONT_BUTTON_BOLD,
+    padding=(4, 4),
+    background="#7f1d1d",
+    foreground="#ffffff",
+    borderwidth=0,
+    focusthickness=0,
+)
+
+style.map(
+    "Danger.TButton",
+    background=[
+        ("active", "#991b1b"),
+        ("pressed", "#991b1b"),
+        ("disabled", "#e5e7eb"),
+        ("!disabled", "#7f1d1d"),
+    ],
+    foreground=[
+        ("disabled", "#94a3b8"),
+        ("!disabled", "#ffffff"),
+    ],
+)
+
+style.configure(
+    "Main.TCheckbutton",
+    font=FONT_HINT,
+    background="#ffffff",
+    foreground="#111827",
+)
+
+style.map(
+    "Main.TCheckbutton",
+    background=[("active", "#ffffff"), ("selected", "#ffffff")],
 )
 
 style.configure(
@@ -8172,9 +7404,11 @@ history_text.tag_configure(
 )
 history_text.grid(row=1, column=0, sticky="nsew")
 history_text.insert(tk.END, "等待提交作业...\n")
+history_text.placeholder_visible = True
 
 # ================= 启动程序 =================
 
+start_ui_event_queue_polling()
 root.after_idle(lambda: root.after(1000, detect_abaqus_command))
 root.protocol("WM_DELETE_WINDOW", on_close)
 root.mainloop()

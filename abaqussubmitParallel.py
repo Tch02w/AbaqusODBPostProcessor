@@ -79,6 +79,15 @@ RUNTIME_STATUS_INTERVAL_MS = 3000
 OUTPUT_FLUSH_INTERVAL_MS = 150
 ABAQUS_MEMORY_POLL_INTERVAL_SECONDS = 10
 JOB_MEMORY_MONITOR_INTERVAL_MS = 15000
+JOB_MEMORY_LEARNING_INTERVAL_MS = 15000
+JOB_MEMORY_PATROL_INTERVAL_MS = 90000
+EXTERNAL_JOB_MONITOR_INTERVAL_MS = 5000
+PROCESS_SNAPSHOT_CACHE_SECONDS = 5
+FORMAL_QUEUE_SAVE_DEBOUNCE_MS = 500
+MAX_JOB_LOG_LINES = 5000
+MAX_HISTORY_LOG_LINES = 2000
+LOG_TRIM_CHECK_INTERVAL = 50
+ENABLE_PERFORMANCE_LOG = False
 JOB_MEMORY_MIN_SAMPLES = 4
 JOB_MEMORY_STABLE_POLLS = 4
 JOB_MEMORY_STABLE_RELATIVE_DELTA = 0.08
@@ -248,12 +257,14 @@ STATUS_CANCELED = "已取消"
 STATUS_TERMINATING = "正在终止"
 STATUS_TERMINATED = "已终止"
 STATUS_WAITING_DEPENDENCY = "等待前置"
+STATUS_UNKNOWN = "状态未知"
 
 TERMINAL_QUEUE_STATUSES = {
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_CANCELED,
     STATUS_TERMINATED,
+    STATUS_UNKNOWN,
     "Datacheck Completed",
     "Datacheck Failed",
 }
@@ -285,6 +296,7 @@ class QueueItem:
     is_external: bool = False
     external_work_dir: str = ""
     pids: list = field(default_factory=list)
+    pid_create_times: dict = field(default_factory=dict)
     rss_bytes: int = 0
 
 
@@ -326,6 +338,7 @@ joblist_state = {
     "existing_odb_action": "",
     "dispatch_after_id": None,
     "dispatch_due_time": 0.0,
+    "external_slot_notice_signature": "",
 }
 job_tab_records = {}
 job_selector_var = None
@@ -338,8 +351,21 @@ abaqus_memory_cache = {
     "timestamp": 0.0,
     "usage": {},
 }
+process_snapshot_cache = {
+    "timestamp": 0.0,
+    "rows": [],
+    "include_details": False,
+}
 memory_monitor_state = {
     "running": False,
+    "after_id": None,
+}
+external_job_monitor_state = {
+    "running": False,
+    "after_id": None,
+}
+formal_queue_save_state = {
+    "after_id": None,
 }
 runtime_status_state = {
     "running": False,
@@ -365,6 +391,47 @@ class MemoryStatusEx(ctypes.Structure):
     ]
 
 
+def refresh_sta_header_index_after_trim(log_widget, job_state):
+    """Re-find the STA header after old log lines are trimmed."""
+    if job_state is None or not job_state.get("sta_fixed_header_ready"):
+        return
+
+    try:
+        header_text = build_sta_table_header()
+        header_index = log_widget.search(header_text, "1.0", tk.END)
+        if header_index:
+            job_state["sta_header_index"] = log_widget.index(f"{header_index} linestart")
+        else:
+            job_state["sta_header_index"] = ""
+            job_state["sta_fixed_header_ready"] = False
+            header_label = job_state.get("sta_header_label")
+            if header_label is not None and header_label.winfo_exists():
+                header_label.grid_remove()
+    except tk.TclError:
+        pass
+
+
+def trim_text_widget(widget, max_lines):
+    """Keep only recent lines in a Tk text widget."""
+    try:
+        line_count = int(widget.index("end-1c").split(".", 1)[0])
+    except (tk.TclError, ValueError):
+        return
+
+    if line_count <= max_lines:
+        return
+
+    delete_to_line = line_count - max_lines + 1
+    try:
+        widget.delete("1.0", f"{delete_to_line}.0")
+        job_state = getattr(widget, "job_state", None)
+        if job_state is not None:
+            refresh_sta_header_index_after_trim(widget, job_state)
+            update_sta_fixed_header_visibility(job_state)
+    except tk.TclError:
+        pass
+
+
 def append_log(log_widget, text):
     """向指定日志页追加文本并滚动到底部。"""
     try:
@@ -375,6 +442,9 @@ def append_log(log_widget, text):
             job_state = getattr(log_widget, "job_state", None)
             if job_state is not None:
                 remember_sta_header_index(log_widget, job_state, insert_start, text)
+                job_state["log_append_count"] = job_state.get("log_append_count", 0) + 1
+                if job_state["log_append_count"] % LOG_TRIM_CHECK_INTERVAL == 0:
+                    trim_text_widget(log_widget, MAX_JOB_LOG_LINES)
                 update_sta_fixed_header_visibility(job_state)
     except tk.TclError:
         pass
@@ -456,6 +526,11 @@ def append_history_text(text, tag=None):
         history_text.insert(tk.END, text, tag)
     else:
         history_text.insert(tk.END, text)
+
+    append_count = getattr(history_text, "append_count", 0) + 1
+    history_text.append_count = append_count
+    if append_count % LOG_TRIM_CHECK_INTERVAL == 0:
+        trim_text_widget(history_text, MAX_HISTORY_LOG_LINES)
 
     history_text.see(tk.END)
 
@@ -885,32 +960,49 @@ def detect_external_job_type(process_chain):
     return "Abaqus"
 
 
-def fetch_psutil_process_rows_for_external_scan():
-    """Read process data needed to import externally launched Abaqus jobs."""
+def log_performance(message):
+    """Print performance diagnostics only when explicitly enabled."""
+    if ENABLE_PERFORMANCE_LOG:
+        print(f"[perf] {message}")
+
+
+def get_psutil_process_snapshot(force=False, include_details=False):
+    """Return a cached psutil process snapshot with optional Abaqus-only details."""
     if psutil is None:
         return []
 
+    now = time.monotonic()
+    cache_has_details = bool(process_snapshot_cache.get("include_details"))
+    cache_valid = (
+        not force
+        and now - process_snapshot_cache.get("timestamp", 0.0) < PROCESS_SNAPSHOT_CACHE_SECONDS
+        and (cache_has_details or not include_details)
+    )
+    if cache_valid:
+        log_performance(
+            f"process snapshot cache hit; rows={len(process_snapshot_cache['rows'])}; "
+            f"details={cache_has_details}"
+        )
+        return process_snapshot_cache["rows"]
+
+    started_at = time.perf_counter()
     rows = []
     rows_by_pid = {}
     process_by_pid = {}
     detail_pids = set()
 
-    # Fast pass: avoid reading cmdline/cwd for every Windows process.
-    # Those calls can be slow or access-denied; only Abaqus-like processes and
-    # their parent chain need the expensive details for job-name detection.
-    for process in psutil.process_iter(["pid", "ppid", "name", "memory_info", "create_time"]):
+    for process in psutil.process_iter(["pid", "ppid", "name"]):
         try:
             info = process.info
-            memory_info = info.get("memory_info")
             pid = int(info.get("pid") or 0)
             row = {
                 "Name": info.get("name") or "",
                 "ProcessId": pid,
                 "ParentProcessId": info.get("ppid") or 0,
                 "CommandLine": "",
-                "WorkingSetSize": getattr(memory_info, "rss", 0) if memory_info else 0,
-                "PrivatePageCount": getattr(memory_info, "private", 0) if memory_info else 0,
-                "CreateTime": info.get("create_time") or 0,
+                "WorkingSetSize": 0,
+                "PrivatePageCount": 0,
+                "CreateTime": 0,
                 "Cwd": "",
             }
             rows.append(row)
@@ -930,6 +1022,35 @@ def fetch_psutil_process_rows_for_external_scan():
             detail_pids.add(current_pid)
             current_pid = int(rows_by_pid[current_pid].get("ParentProcessId") or 0)
 
+    # Include descendants of Abaqus launchers/solvers, so helper processes that
+    # do not have Abaqus-looking names still contribute to memory totals.
+    changed = True
+    while changed:
+        changed = False
+        for row in rows:
+            try:
+                pid = int(row.get("ProcessId") or 0)
+                parent_pid = int(row.get("ParentProcessId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if pid not in detail_pids and parent_pid in detail_pids:
+                detail_pids.add(pid)
+                changed = True
+
+    if not include_details:
+        process_snapshot_cache.update(
+            {
+                "timestamp": now,
+                "rows": rows,
+                "include_details": False,
+            }
+        )
+        log_performance(
+            f"process snapshot light; rows={len(rows)}; abaqus_pids={len(detail_pids)}; "
+            f"elapsed={(time.perf_counter() - started_at) * 1000:.1f} ms"
+        )
+        return rows
+
     for pid in detail_pids:
         process = process_by_pid.get(pid)
         if process is None:
@@ -937,6 +1058,16 @@ def fetch_psutil_process_rows_for_external_scan():
         row = rows_by_pid.get(pid)
         if row is None:
             continue
+        try:
+            memory_info = process.memory_info()
+            row["WorkingSetSize"] = getattr(memory_info, "rss", 0)
+            row["PrivatePageCount"] = getattr(memory_info, "private", 0)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            pass
+        try:
+            row["CreateTime"] = process.create_time()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            pass
         try:
             row["CommandLine"] = join_process_command_line(process.cmdline())
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
@@ -946,13 +1077,29 @@ def fetch_psutil_process_rows_for_external_scan():
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
             row["Cwd"] = ""
 
+    process_snapshot_cache.update(
+        {
+            "timestamp": now,
+            "rows": rows,
+            "include_details": include_details,
+        }
+    )
+    log_performance(
+        f"process snapshot full; rows={len(rows)}; abaqus_pids={len(detail_pids)}; "
+        f"elapsed={(time.perf_counter() - started_at) * 1000:.1f} ms"
+    )
     return rows
 
 
-def scan_running_abaqus_jobs_by_psutil(work_dir):
+def fetch_psutil_process_rows_for_external_scan(force=True):
+    """Read process data needed to import externally launched Abaqus jobs."""
+    return get_psutil_process_snapshot(force=force, include_details=True)
+
+
+def scan_running_abaqus_jobs_by_psutil(work_dir, force=True):
     """Scan running Abaqus jobs in one work directory using psutil."""
     normalized_work_dir = normalize_work_dir(work_dir)
-    rows = fetch_psutil_process_rows_for_external_scan()
+    rows = get_psutil_process_snapshot(force=force, include_details=True)
     process_by_pid = {}
     for row in rows:
         try:
@@ -1027,6 +1174,7 @@ def scan_running_abaqus_jobs_by_psutil(work_dir):
                 "source": "external_psutil",
                 "is_external": True,
                 "pids": [],
+                "pid_create_times": {},
                 "rss_bytes": 0,
             }
         )
@@ -1049,6 +1197,7 @@ def scan_running_abaqus_jobs_by_psutil(work_dir):
         if row_pid and row_pid not in counted_pids.setdefault(job_key, set()):
             counted_pids[job_key].add(row_pid)
             job_info["pids"].append(row_pid)
+            job_info.setdefault("pid_create_times", {})[str(row_pid)] = row.get("CreateTime") or 0
             try:
                 job_info["rss_bytes"] += int(row.get("WorkingSetSize") or 0)
             except (TypeError, ValueError):
@@ -1062,55 +1211,7 @@ def scan_running_abaqus_jobs_by_psutil(work_dir):
 
 def fetch_psutil_process_rows():
     """Read process rows with psutil, avoiding PowerShell startup overhead."""
-    if psutil is None:
-        return []
-
-    rows = []
-    rows_by_pid = {}
-    for process in psutil.process_iter(["pid", "ppid", "name", "memory_info"]):
-        try:
-            info = process.info
-            memory_info = info.get("memory_info")
-            row = {
-                "Name": info.get("name") or "",
-                "ProcessId": info.get("pid") or 0,
-                "ParentProcessId": info.get("ppid") or 0,
-                "CommandLine": "",
-                "WorkingSetSize": getattr(memory_info, "rss", 0) if memory_info else 0,
-                "PrivatePageCount": getattr(memory_info, "private", 0) if memory_info else 0,
-            }
-            rows.append(row)
-            rows_by_pid[int(row["ProcessId"])] = row
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
-            continue
-
-    cmdline_pids = set()
-    for row in rows:
-        if not is_abaqus_process_name(row.get("Name") or ""):
-            continue
-
-        current_pid = int(row.get("ProcessId") or 0)
-        visited = set()
-        while current_pid and current_pid in rows_by_pid and current_pid not in visited:
-            visited.add(current_pid)
-            cmdline_pids.add(current_pid)
-            current_pid = int(rows_by_pid[current_pid].get("ParentProcessId") or 0)
-
-    for pid in cmdline_pids:
-        try:
-            cmdline = psutil.Process(pid).cmdline()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
-            continue
-
-        if isinstance(cmdline, (list, tuple)):
-            command_line = " ".join(str(part) for part in cmdline)
-        else:
-            command_line = str(cmdline or "")
-
-        if pid in rows_by_pid:
-            rows_by_pid[pid]["CommandLine"] = command_line
-
-    return rows
+    return get_psutil_process_snapshot(force=False, include_details=True)
 
 
 def fetch_windows_process_rows():
@@ -1265,7 +1366,6 @@ def update_job_memory_sample(job_state, usage):
     """Update one running job from a shared memory sample."""
     if (
             job_state.get("finalized")
-            or job_state.get("memory_monitor_stopped")
             or not usage
     ):
         return
@@ -1276,8 +1376,13 @@ def update_job_memory_sample(job_state, usage):
         return
 
     samples = job_state.setdefault("memory_samples", [])
+    mode = job_state.get("memory_monitor_mode", "learning")
     peak_before = int(job_state.get("memory_peak", 0))
     peak_after = max(peak_before, memory)
+    new_peak_ratio = (
+        memory / peak_before
+        if peak_before > 0 else 999
+    )
     job_state["memory_peak"] = peak_after
     samples.append(memory)
     if len(samples) > JOB_MEMORY_MAX_SAMPLES:
@@ -1308,24 +1413,42 @@ def update_job_memory_sample(job_state, usage):
         }
     )
 
-    if peak_after > peak_before * (1 + JOB_MEMORY_STABLE_RELATIVE_DELTA):
+    if mode == "patrol" and peak_before > 0 and new_peak_ratio > 1 + JOB_MEMORY_STABLE_RELATIVE_DELTA:
+        job_state["memory_monitor_mode"] = "learning"
         job_state["memory_stable_polls"] = 0
-    elif len(samples) >= JOB_MEMORY_MIN_SAMPLES:
+        job_memory_estimates[job_name]["stable"] = False
+        job_state["memory_stable_logged"] = False
+    elif peak_after > peak_before * (1 + JOB_MEMORY_STABLE_RELATIVE_DELTA):
+        job_state["memory_stable_polls"] = 0
+    elif mode == "learning" and len(samples) >= JOB_MEMORY_MIN_SAMPLES:
         job_state["memory_stable_polls"] = job_state.get("memory_stable_polls", 0) + 1
 
     if (
+            mode == "learning"
+            and (
             job_state.get("memory_stable_polls", 0) >= JOB_MEMORY_STABLE_POLLS
             or len(samples) >= JOB_MEMORY_MAX_SAMPLES
+            )
     ):
         job_memory_estimates[job_name]["stable"] = True
-        job_state["memory_monitor_stopped"] = True
-        monitor_time = time.strftime("%Y-%m-%d %H:%M:%S")
-        append_history_text(f"[{monitor_time}]\n", "history_time")
-        append_history_text(
-            f"{job_name}：状态：内存监测已稳定，"
-            f"峰值 {format_memory_size(peak_after)}，"
-            f"估算 {format_memory_size(job_memory_estimates[job_name]['estimated_memory'])}。\n\n"
-        )
+        job_state["memory_monitor_mode"] = "patrol"
+        if not job_state.get("memory_stable_logged"):
+            job_state["memory_stable_logged"] = True
+            monitor_time = time.strftime("%Y-%m-%d %H:%M:%S")
+            append_history_text(f"[{monitor_time}]\n", "history_time")
+            append_history_text(
+                f"{job_name}：状态：内存监测已稳定，"
+                f"峰值 {format_memory_size(peak_after)}，"
+                f"估算 {format_memory_size(job_memory_estimates[job_name]['estimated_memory'])}，"
+                "转入低频巡检。\n\n"
+            )
+
+    interval_ms = (
+        JOB_MEMORY_PATROL_INTERVAL_MS
+        if job_state.get("memory_monitor_mode") == "patrol"
+        else JOB_MEMORY_LEARNING_INTERVAL_MS
+    )
+    job_state["next_memory_sample_at"] = time.monotonic() + interval_ms / 1000
 
 
 def start_job_memory_monitor(job_state):
@@ -1334,13 +1457,46 @@ def start_job_memory_monitor(job_state):
     job_state["memory_peak"] = 0
     job_state["memory_stable_polls"] = 0
     job_state["memory_monitor_stopped"] = False
+    job_state["memory_monitor_mode"] = "learning"
+    job_state["memory_stable_logged"] = False
+    job_state["next_memory_sample_at"] = 0.0
+
+
+def update_external_job_memory_estimate(item):
+    """Use imported external job RSS samples as low-frequency memory references."""
+    memory = int(item.rss_bytes or 0)
+    if memory <= 0 or not item.job_name:
+        return
+
+    estimate = job_memory_estimates.setdefault(
+        item.job_name,
+        {
+            "group": infer_model_group(item.job_name),
+            "step_peaks": {},
+        }
+    )
+    peak_before = int(estimate.get("peak_memory") or 0)
+    peak_after = max(peak_before, memory)
+    estimate.update(
+        {
+            "estimated_memory": max(
+                int(estimate.get("estimated_memory") or 0),
+                int(peak_after * get_memory_safety_factor())
+            ),
+            "peak_memory": peak_after,
+            "sample_count": int(estimate.get("sample_count") or 0) + 1,
+            "process_count": len(item.pids or []),
+            "process_names": "external",
+            "updated_at": time.time(),
+            "stable": estimate.get("stable", False),
+        }
+    )
 
 
 def activate_job_memory_monitor(job_state):
     """Begin shared memory sampling once the job has generated its .sta file."""
     if (
             job_state.get("finalized")
-            or job_state.get("memory_monitor_stopped")
             or job_state.get("memory_monitor_active")
     ):
         return
@@ -1355,17 +1511,21 @@ def start_global_memory_monitor():
         return
 
     memory_monitor_state["running"] = True
-    root.after(JOB_MEMORY_MONITOR_INTERVAL_MS, run_global_memory_monitor)
+    memory_monitor_state["after_id"] = root.after(
+        JOB_MEMORY_LEARNING_INTERVAL_MS,
+        run_global_memory_monitor
+    )
 
 
 def run_global_memory_monitor():
     """Sample all Abaqus process memory once and distribute it to active jobs."""
+    memory_monitor_state["after_id"] = None
+    now = time.monotonic()
     tracked_jobs = [
         state for state in active_jobs.values()
         if (
                 not state.get("finalized")
                 and state.get("memory_monitor_active")
-                and not state.get("memory_monitor_stopped")
         )
     ]
 
@@ -1373,21 +1533,38 @@ def run_global_memory_monitor():
         memory_monitor_state["running"] = False
         return
 
-    usage_by_job = get_abaqus_job_memory_usage()
-    for job_state in tracked_jobs:
-        update_job_memory_sample(
-            job_state,
-            usage_by_job.get(job_state.get("job_name", ""))
-        )
+    due_jobs = [
+        state for state in tracked_jobs
+        if float(state.get("next_memory_sample_at") or 0) <= now
+    ]
 
-    still_tracking = any(
-        not state.get("finalized")
-        and state.get("memory_monitor_active")
-        and not state.get("memory_monitor_stopped")
-        for state in active_jobs.values()
-    )
-    if still_tracking:
-        root.after(JOB_MEMORY_MONITOR_INTERVAL_MS, run_global_memory_monitor)
+    if due_jobs:
+        usage_by_job = get_abaqus_job_memory_usage()
+    else:
+        usage_by_job = {}
+
+    for job_state in due_jobs:
+        usage = usage_by_job.get(job_state.get("job_name", ""))
+        if usage:
+            update_job_memory_sample(job_state, usage)
+        else:
+            mode = job_state.get("memory_monitor_mode", "learning")
+            interval_ms = (
+                JOB_MEMORY_PATROL_INTERVAL_MS
+                if mode == "patrol"
+                else JOB_MEMORY_LEARNING_INTERVAL_MS
+            )
+            job_state["next_memory_sample_at"] = time.monotonic() + interval_ms / 1000
+
+    active_due_times = [
+        float(state.get("next_memory_sample_at") or now)
+        for state in tracked_jobs
+        if not state.get("finalized")
+    ]
+    if active_due_times:
+        next_due = min(active_due_times)
+        delay_ms = max(1000, int((next_due - time.monotonic()) * 1000))
+        memory_monitor_state["after_id"] = root.after(delay_ms, run_global_memory_monitor)
     else:
         memory_monitor_state["running"] = False
 
@@ -1398,6 +1575,46 @@ def get_active_job_count():
         1 for state in active_jobs.values()
         if not state.get("finalized")
     )
+
+
+def get_active_job_keys():
+    """Return unique keys for non-finalized jobs submitted by this GUI."""
+    keys = set()
+    for state in active_jobs.values():
+        if state.get("finalized"):
+            continue
+        work_dir = state.get("work_dir", "")
+        job_name = state.get("job_name", "")
+        if work_dir and job_name:
+            keys.add(get_job_key(work_dir, job_name))
+
+    return keys
+
+
+def get_external_active_job_count(active_job_keys=None):
+    """Return active imported external jobs, excluding GUI-managed duplicates."""
+    if active_job_keys is None:
+        active_job_keys = get_active_job_keys()
+
+    count = 0
+    for item in queue_items:
+        if not item.is_external or not is_managed_active_queue_status(item.status):
+            continue
+
+        work_dir = item.external_work_dir or os.path.dirname(item.inp_path)
+        item_key = get_job_key(work_dir, item.job_name) if work_dir and item.job_name else ""
+        if item_key and item_key in active_job_keys:
+            continue
+
+        count += 1
+
+    return count
+
+
+def get_total_managed_active_job_count():
+    """Return GUI-submitted plus imported external active jobs without duplicates."""
+    active_job_keys = get_active_job_keys()
+    return len(active_job_keys) + get_external_active_job_count(active_job_keys)
 
 
 def estimate_available_job_slots():
@@ -2039,6 +2256,20 @@ def open_job_artifact(job_state, extension):
 
 def on_close():
     """关闭窗口。"""
+    cancel_scheduled_formal_queue_save()
+    for state in (memory_monitor_state, external_job_monitor_state):
+        after_id = state.get("after_id")
+        if after_id:
+            try:
+                root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+            state["after_id"] = None
+            state["running"] = False
+    try:
+        save_formal_queue_file()
+    except OSError:
+        pass
     root.destroy()
 
 
@@ -2821,7 +3052,7 @@ def send_abaqus_job_control(action, job_state):
     try:
         control_process = run_command_hidden(cmd, work_dir)
         start_process_output_monitor(control_process, log_widget)
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError) as e:
         append_log(log_widget, f"状态：{action_name}命令执行失败：{e}\n")
 
 
@@ -4466,6 +4697,186 @@ def final_status_from_queue_status(status):
     return status in (STATUS_COMPLETED, "完成", "Datacheck Completed")
 
 
+def is_managed_active_queue_status(status):
+    """Return True for queue statuses that still occupy a running slot."""
+    return status in (STATUS_STARTING, STATUS_RUNNING, STATUS_TERMINATING)
+
+
+def external_job_items_to_monitor():
+    """Return imported external jobs whose PID lifecycle should be monitored."""
+    return [
+        item for item in queue_items
+        if item.is_external and is_managed_active_queue_status(item.status)
+    ]
+
+
+def get_external_job_lck_path(item):
+    """Return the expected LCK path for an external job."""
+    work_dir = item.external_work_dir or os.path.dirname(item.inp_path)
+    if not work_dir or not item.job_name:
+        return ""
+
+    return os.path.join(work_dir, item.job_name + ".lck")
+
+
+def classify_external_job_after_process_exit(item):
+    """Classify an external job after all tracked processes disappeared."""
+    work_dir = item.external_work_dir or os.path.dirname(item.inp_path)
+    if not work_dir or not item.job_name:
+        return STATUS_UNKNOWN, "外部作业相关进程已消失，但缺少工作目录或作业名，无法读取诊断文件。"
+
+    final_status, detail = inspect_job_files(work_dir, item.job_name)
+    if final_status == "完成":
+        return STATUS_COMPLETED, detail or "检测到外部作业完成信息"
+    if final_status == "终止":
+        return STATUS_TERMINATED, detail or "检测到外部作业终止信息"
+    if final_status == "失败":
+        return STATUS_FAILED, detail or "检测到外部作业错误信息"
+
+    lck_path = get_external_job_lck_path(item)
+    if lck_path and os.path.exists(lck_path):
+        return STATUS_UNKNOWN, "进程已消失，但仍存在 LCK 文件，可能为异常退出后的残留文件。"
+
+    return STATUS_UNKNOWN, "外部作业相关进程已消失，但未从诊断文件中识别出明确结束状态。"
+
+
+def sample_external_queue_item_processes(item):
+    """Update one external queue item from its tracked PIDs."""
+    if psutil is None:
+        return False
+
+    old_pids = list(item.pids or [])
+    old_rss = int(item.rss_bytes or 0)
+    old_status = item.status
+    old_message = item.message
+
+    alive_pids = []
+    alive_create_times = {}
+    rss_total = 0
+
+    for raw_pid in old_pids:
+        try:
+            pid = int(raw_pid)
+        except (TypeError, ValueError):
+            continue
+
+        if not psutil.pid_exists(pid):
+            continue
+
+        try:
+            process = psutil.Process(pid)
+            create_time = process.create_time()
+            expected_create_time = item.pid_create_times.get(str(pid))
+            if expected_create_time and abs(float(expected_create_time) - float(create_time)) > 0.01:
+                continue
+            rss_total += int(process.memory_info().rss)
+            process.name()
+        except (psutil.AccessDenied, OSError):
+            alive_pids.append(pid)
+            existing_create_time = item.pid_create_times.get(str(pid))
+            if existing_create_time:
+                alive_create_times[str(pid)] = existing_create_time
+            continue
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+
+        alive_pids.append(pid)
+        alive_create_times[str(pid)] = create_time
+
+    item.pids = sorted(alive_pids)
+    item.pid_create_times = alive_create_times
+    item.rss_bytes = rss_total
+    if item.pids:
+        update_external_job_memory_estimate(item)
+
+    if old_pids and not item.pids and old_status == STATUS_TERMINATING:
+        item.status = STATUS_TERMINATED
+        lck_path = get_external_job_lck_path(item)
+        if lck_path and os.path.exists(lck_path):
+            item.message = "外部终止命令已生效，进程已退出；仍存在 LCK 残留。"
+        else:
+            item.message = "外部终止命令已生效，进程已退出。"
+        item.valid = True
+        joblist_state["statuses"][item.item_id] = item.status
+    elif old_pids and not item.pids:
+        final_status, detail = classify_external_job_after_process_exit(item)
+        item.status = final_status
+        item.message = detail
+        item.valid = final_status not in (STATUS_FAILED, STATUS_UNKNOWN)
+        joblist_state["statuses"][item.item_id] = item.status
+    elif item.pids and item.status == STATUS_TERMINATING:
+        item.message = "正在终止（等待外部进程退出）"
+    elif item.pids and item.status in (STATUS_STARTING, STATUS_RUNNING):
+        item.status = STATUS_RUNNING
+        item.message = "外部导入运行中"
+        joblist_state["statuses"][item.item_id] = item.status
+
+    return (
+        old_pids != item.pids
+        or old_rss != int(item.rss_bytes or 0)
+        or old_status != item.status
+        or old_message != item.message
+    )
+
+
+def start_external_job_monitor():
+    """Start the shared external job lifecycle monitor."""
+    if psutil is None or external_job_monitor_state.get("running"):
+        return
+
+    if not external_job_items_to_monitor():
+        return
+
+    external_job_monitor_state["running"] = True
+    external_job_monitor_state["after_id"] = root.after(
+        EXTERNAL_JOB_MONITOR_INTERVAL_MS,
+        run_external_job_monitor
+    )
+
+
+def stop_external_job_monitor_if_idle():
+    """Stop the external monitor when no imported external jobs are active."""
+    if external_job_items_to_monitor():
+        return False
+
+    after_id = external_job_monitor_state.get("after_id")
+    if after_id:
+        try:
+            root.after_cancel(after_id)
+        except tk.TclError:
+            pass
+
+    external_job_monitor_state["running"] = False
+    external_job_monitor_state["after_id"] = None
+    return True
+
+
+def run_external_job_monitor():
+    """Refresh imported external jobs from their tracked PIDs."""
+    external_job_monitor_state["after_id"] = None
+    monitored_items = external_job_items_to_monitor()
+    if not monitored_items or psutil is None:
+        external_job_monitor_state["running"] = False
+        return
+
+    changed = False
+    for item in monitored_items:
+        changed = sample_external_queue_item_processes(item) or changed
+
+    if changed:
+        sync_joblist_state_from_queue_items()
+        schedule_save_formal_queue_file()
+        schedule_dispatch_joblist(100)
+
+    if external_job_items_to_monitor():
+        external_job_monitor_state["after_id"] = root.after(
+            EXTERNAL_JOB_MONITOR_INTERVAL_MS,
+            run_external_job_monitor
+        )
+    else:
+        stop_external_job_monitor_if_idle()
+
+
 def validate_formal_queue_item_before_submit(item):
     """Validate one formal queue item immediately before it is submitted."""
     item.valid = True
@@ -4562,17 +4973,9 @@ def sync_joblist_state_from_queue_items():
     refresh_queue_manager_views()
 
 
-def save_formal_queue_file():
-    """Persist the formal queue as joblist.json without changing any model files."""
-    if not queue_items:
-        return ""
-
-    work_dir = get_common_joblist_dir([item.inp_path for item in queue_items])
-    if not work_dir:
-        return ""
-
-    path = os.path.join(work_dir, JOBLIST_FILENAME)
-    payload = [
+def build_formal_queue_payload():
+    """Build the JSON payload for the formal queue."""
+    return [
         {
             "job_name": item.job_name,
             "inp_path": item.inp_path,
@@ -4587,16 +4990,70 @@ def save_formal_queue_file():
             "is_external": item.is_external,
             "external_work_dir": item.external_work_dir,
             "pids": item.pids,
+            "pid_create_times": item.pid_create_times,
             "rss_bytes": item.rss_bytes,
         }
         for item in queue_items
     ]
-    with open(path, "w", encoding="utf-8") as file:
+
+
+def atomic_write_json(path, payload):
+    """Atomically write JSON so joblist.json is never half-written."""
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as file:
         json.dump(payload, file, ensure_ascii=False, indent=2)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temp_path, path)
+
+
+def save_formal_queue_file():
+    """Persist the formal queue as joblist.json without changing any model files."""
+    if not queue_items:
+        return ""
+
+    work_dir = get_common_joblist_dir([item.inp_path for item in queue_items])
+    if not work_dir:
+        return ""
+
+    path = os.path.join(work_dir, JOBLIST_FILENAME)
+    try:
+        atomic_write_json(path, build_formal_queue_payload())
+    except (OSError, PermissionError) as exc:
+        append_history_text(f"保存正式队列失败：{exc}\n\n")
+        raise
 
     joblist_state["work_dir"] = work_dir
     joblist_state["joblist_path"] = path
     return path
+
+
+def cancel_scheduled_formal_queue_save():
+    """Cancel a pending debounced formal queue save."""
+    after_id = formal_queue_save_state.get("after_id")
+    if after_id:
+        try:
+            root.after_cancel(after_id)
+        except tk.TclError:
+            pass
+    formal_queue_save_state["after_id"] = None
+
+
+def schedule_save_formal_queue_file():
+    """Debounce frequent formal queue saves."""
+    cancel_scheduled_formal_queue_save()
+
+    def run_save():
+        formal_queue_save_state["after_id"] = None
+        try:
+            save_formal_queue_file()
+        except OSError:
+            pass
+
+    formal_queue_save_state["after_id"] = root.after(
+        FORMAL_QUEUE_SAVE_DEBOUNCE_MS,
+        run_save
+    )
 
 
 def get_queue_item_external_key(item):
@@ -4639,6 +5096,7 @@ def update_queue_item_from_external_job(item, job_info):
     item.valid = True
     item.message = "外部导入运行中"
     item.pids = list(job_info.get("pids") or [])
+    item.pid_create_times = dict(job_info.get("pid_create_times") or {})
     item.rss_bytes = int(job_info.get("rss_bytes") or 0)
     item.active_job_key = ""
 
@@ -4663,6 +5121,7 @@ def create_external_queue_item(job_info):
         is_external=True,
         external_work_dir=job_info["work_dir"],
         pids=list(job_info.get("pids") or []),
+        pid_create_times=dict(job_info.get("pid_create_times") or {}),
         rss_bytes=int(job_info.get("rss_bytes") or 0),
     )
     try:
@@ -4694,6 +5153,8 @@ def import_or_update_external_jobs(scanned_jobs):
         save_formal_queue_file()
     except OSError:
         pass
+    if added or updated:
+        start_external_job_monitor()
     return added, updated
 
 
@@ -4742,10 +5203,7 @@ def update_queue_item_from_final_job_status(job_state, status, detail=""):
         item.elapsed = format_duration(job_state["end_time"] - job_state["start_time"])
     joblist_state["statuses"][item.item_id] = item.status
     refresh_queue_manager_views()
-    try:
-        save_formal_queue_file()
-    except OSError:
-        pass
+    schedule_save_formal_queue_file()
 
 
 def get_common_joblist_dir(paths):
@@ -5189,6 +5647,41 @@ def queue_item_row_values(item, index, candidate=False):
     )
 
 
+def sync_treeview_rows(tree, rows):
+    """Synchronize Treeview rows without rebuilding unchanged items."""
+    if tree is None or not tree.winfo_exists():
+        return
+
+    try:
+        selection = set(tree.selection())
+        yview = tree.yview()
+        existing_ids = set(tree.get_children())
+        incoming_ids = [item_id for item_id, _values in rows]
+        incoming_id_set = set(incoming_ids)
+
+        for item_id in existing_ids - incoming_id_set:
+            tree.delete(item_id)
+
+        for position, (item_id, values) in enumerate(rows):
+            if item_id in existing_ids:
+                if tuple(tree.item(item_id, "values")) != tuple(str(value) for value in values):
+                    tree.item(item_id, values=values)
+            else:
+                tree.insert("", "end", iid=item_id, values=values)
+
+            current_index = tree.index(item_id)
+            if current_index != position:
+                tree.move(item_id, "", position)
+
+        kept_selection = [item_id for item_id in selection if item_id in incoming_id_set]
+        if kept_selection:
+            tree.selection_set(kept_selection)
+        if yview:
+            tree.yview_moveto(yview[0])
+    except tk.TclError:
+        pass
+
+
 def refresh_queue_manager_views():
     """Refresh candidate/formal queue Treeviews and summaries."""
     try:
@@ -5204,9 +5697,7 @@ def refresh_queue_manager_views():
                     candidate_rows != queue_manager_view_signature["candidate"]
                     or (candidate_rows and not queue_candidate_tree.get_children())
             ):
-                queue_candidate_tree.delete(*queue_candidate_tree.get_children())
-                for item_id, values in candidate_rows:
-                    queue_candidate_tree.insert("", "end", iid=item_id, values=values)
+                sync_treeview_rows(queue_candidate_tree, candidate_rows)
                 queue_manager_view_signature["candidate"] = candidate_rows
         if queue_formal_tree is not None and queue_formal_tree.winfo_exists():
             formal_rows = tuple(
@@ -5220,9 +5711,7 @@ def refresh_queue_manager_views():
                     formal_rows != queue_manager_view_signature["formal"]
                     or (formal_rows and not queue_formal_tree.get_children())
             ):
-                queue_formal_tree.delete(*queue_formal_tree.get_children())
-                for item_id, values in formal_rows:
-                    queue_formal_tree.insert("", "end", iid=item_id, values=values)
+                sync_treeview_rows(queue_formal_tree, formal_rows)
                 queue_manager_view_signature["formal"] = formal_rows
         if queue_candidate_summary_var is not None:
             total = len(queue_candidates)
@@ -5355,6 +5844,12 @@ def terminate_selected_running_queue_items():
             changed = True
             terminate_job(active_jobs[item.active_job_key])
     if changed:
+        sync_joblist_state_from_queue_items()
+        try:
+            save_formal_queue_file()
+        except OSError:
+            pass
+        start_external_job_monitor()
         refresh_queue_manager_views()
 
 
@@ -5363,6 +5858,7 @@ def clear_finished_queue_items():
     with queue_lock:
         queue_items[:] = [item for item in queue_items if item.status not in TERMINAL_QUEUE_STATUSES]
     sync_joblist_state_from_queue_items()
+    stop_external_job_monitor_if_idle()
 
 
 def get_default_queue_work_dir():
@@ -5800,6 +6296,7 @@ def open_queue_manager_window():
         (50, 130, 280, 80, 120, 110, 60, 80, 90, 180),
     )
     queue_formal_tree.bind("<Double-1>", show_queue_item_details)
+    start_external_job_monitor()
 
     def on_close():
         global queue_manager_window
@@ -6458,6 +6955,26 @@ def has_runnable_joblist_item():
     return False
 
 
+def maybe_log_external_slot_notice(external_active_count, submit_slots, waiting):
+    """Log once when external jobs consume queue parallel slots."""
+    if external_active_count <= 0 or submit_slots > 0 or not waiting:
+        return
+
+    signature = (
+        external_active_count,
+        joblist_state.get("max_parallel"),
+        len(joblist_state.get("running", set())),
+    )
+    if joblist_state.get("external_slot_notice_signature") == signature:
+        return
+
+    joblist_state["external_slot_notice_signature"] = signature
+    append_history_text(
+        f"检测到 {external_active_count} 个外部运行作业，已计入并行槽位。"
+        "当前暂无可用队列槽位。\n\n"
+    )
+
+
 def schedule_dispatch_joblist(delay_ms=100):
     """Schedule one queue dispatch pass, coalescing duplicate timers."""
     if not joblist_state.get("active"):
@@ -6497,8 +7014,14 @@ def dispatch_joblist():
 
     slots, _ = estimate_available_job_slots()
     queue_room = max(0, joblist_state["max_parallel"] - len(joblist_state["running"]))
-    total_job_room = max(0, joblist_state["max_parallel"] - get_active_job_count())
+    external_active_count = get_external_active_job_count()
+    total_job_room = max(0, joblist_state["max_parallel"] - get_total_managed_active_job_count())
     submit_slots = max(0, min(slots, queue_room, total_job_room))
+    waiting = any(
+        joblist_state["statuses"].get(name) in (STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY, "等待", "等待前置")
+        for name in joblist_state["jobs"]
+    )
+    maybe_log_external_slot_notice(external_active_count, submit_slots, waiting)
 
     while submit_slots > 0:
         next_name = get_next_ready_joblist_name()
@@ -6614,10 +7137,7 @@ def finish_joblist_job(job_state, status, detail=""):
     update_joblist_status_label()
     update_joblist_button_mode()
     refresh_queue_manager_views()
-    try:
-        save_formal_queue_file()
-    except OSError:
-        pass
+    schedule_save_formal_queue_file()
     schedule_dispatch_joblist(500)
 
 
@@ -6971,7 +7491,7 @@ def submit_job(inp_file_override="", queue_mode=False, oldjob_path_override="", 
 
         return job_name
 
-    except Exception as e:
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
         messagebox.showerror("提交失败", str(e))
         append_log(log_widget, f"提交失败：{e}\n")
         finalize_job(job_state, "失败", "提交命令执行失败")

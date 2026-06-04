@@ -7,10 +7,11 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from abaqus_submitter.constants import DEFAULT_CPUS, MAX_CPUS
+from .constants import DEFAULT_CPUS, MAX_CPUS
+from .models import QueueItem
 
 
-MEMORY_OPTIONS = ("默认", "MB", "GB", "%")
+MEMORY_OPTIONS = ("%", "GB", "MB")
 
 
 @dataclass(frozen=True)
@@ -23,7 +24,7 @@ class SubmitOptions:
     interactive: bool = False
     datacheck: bool = False
     memory_value: str = ""
-    memory_unit: str = "默认"
+    memory_unit: str = "%"
     ask_delete_off: bool = False
 
 
@@ -66,9 +67,9 @@ def validate_cpus(cpus_text: str) -> tuple[bool, int, str]:
 
 def memory_argument(memory_value: str, memory_unit: str) -> str:
     """Build the Abaqus memory argument."""
-    unit = (memory_unit or "默认").strip()
+    unit = (memory_unit or "%").strip()
     value = (memory_value or "").strip()
-    if unit == "默认" or not value:
+    if not value:
         return ""
     if unit == "%":
         return f"{value}%"
@@ -144,3 +145,68 @@ def validate_options(options: SubmitOptions) -> tuple[bool, str]:
         return False, message
 
     return True, ""
+
+
+def parse_memory_text(memory: str) -> tuple[str, str]:
+    value = (memory or "").strip()
+    if not value:
+        return "", "%"
+    lower = value.lower()
+    if lower.endswith("gb"):
+        return value[:-2].strip(), "GB"
+    if lower.endswith("mb"):
+        return value[:-2].strip(), "MB"
+    if lower.endswith("%"):
+        return value[:-1].strip(), "%"
+    return value, "%"
+
+
+def queue_item_to_options(
+    item: QueueItem,
+    *,
+    default_cpus: int,
+) -> SubmitOptions:
+    memory_value, memory_unit = parse_memory_text(item.memory)
+    return SubmitOptions(
+        inp_file=item.inp_path,
+        job_name=item.job_name or derive_job_name(item.inp_path),
+        cpus=item.cores or default_cpus,
+        oldjob_path=item.oldjob_path,
+        for_file=item.fortran_path,
+        interactive=item.interactive,
+        datacheck=item.datacheck_only,
+        memory_value=memory_value,
+        memory_unit=memory_unit,
+    )
+
+
+def build_direct_submit_queue_item(
+    options: SubmitOptions,
+    *,
+    notify: bool,
+) -> QueueItem:
+    memory = ""
+
+    if options.memory_value:
+        memory = f"{options.memory_value}{'%' if options.memory_unit == '%' else options.memory_unit.lower()}"
+
+    return QueueItem(
+        inp_path=options.inp_file,
+        source_inp_path=options.inp_file,
+        job_name=options.job_name,
+        source="direct_submit",
+        status="启动中",
+        selected=False,
+        valid=True,
+        message="正在提交",
+        run_mode=("restart" if options.oldjob_path else "normal"),
+        oldjob_name=derive_oldjob_name(options.oldjob_path),
+        oldjob_path=options.oldjob_path,
+        fortran_path=options.for_file,
+        cores=options.cpus,
+        memory=memory,
+        interactive=options.interactive,
+        datacheck_only=options.datacheck,
+        complete_notify=notify,
+        is_external=False,
+    )

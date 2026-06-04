@@ -20,10 +20,7 @@ except ImportError as pyside_error:  # pragma: no cover - depends on environment
         QT_BINDING = "PyQt6"
     except ImportError as pyqt_error:
         raise ImportError(
-            "未安装 Qt 绑定。请先安装 PySide6 或 PyQt6，例如：\n"
-            "    pip install PySide6\n"
-            "或：\n"
-            "    pip install PyQt6"
+            "未安装 Qt 绑定。请先安装 PySide6 或 PyQt6，例如：\n    pip install PySide6\n或：\n    pip install PyQt6"
         ) from pyqt_error
 
 

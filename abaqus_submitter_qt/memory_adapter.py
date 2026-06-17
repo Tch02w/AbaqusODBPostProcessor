@@ -13,9 +13,24 @@ except ImportError:  # pragma: no cover - depends on user environment
     psutil = None
 
 from .memory_monitor import MemoryMonitorService, format_memory_size
-from .models import MemoryStatusEx
 from .process_scanner import get_abaqus_job_memory_usage
 from .qt_compat import QtCore, Signal, Slot
+
+
+class MemoryStatusEx(ctypes.Structure):
+    """Windows GlobalMemoryStatusEx structure used by this adapter."""
+
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
 
 
 @dataclass(frozen=True)

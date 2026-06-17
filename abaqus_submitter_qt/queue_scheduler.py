@@ -6,39 +6,138 @@ import os
 from pathlib import Path
 
 from .constants import (
-    STATUS_CONFIRMING,
-    STATUS_RUNNING,
-    STATUS_STARTING,
-    STATUS_TERMINATING,
+    ACTIVE_STATUSES,
+    STATUS_COMPLETED,
+    STATUS_DATACHECK_COMPLETED,
+    STATUS_DATACHECK_FAILED,
+    STATUS_FAILED,
+    STATUS_PENDING_RUN,
+    STATUS_WAITING_DEPENDENCY,
+    TERMINAL_STATUSES,
 )
 from .models import QueueItem
 
 
+def normalize_work_dir(work_dir: str) -> str:
+    value = str(work_dir or "").strip()
+    if not value:
+        return ""
+    return os.path.normcase(os.path.abspath(os.path.normpath(value)))
+
+
 def managed_job_key(work_dir: str, job_name: str) -> tuple[str, str]:
     return (
-        os.path.normcase(os.path.abspath(work_dir or "")),
+        normalize_work_dir(work_dir),
         (job_name or "").lower(),
     )
 
 
+def effective_queue_item_work_dir(item: QueueItem) -> str:
+    effective_work_dir = (item.effective_work_dir or "").strip()
+    if effective_work_dir:
+        return effective_work_dir
+    if item.is_external:
+        return item.external_work_dir or os.path.dirname(item.inp_path)
+    calculation_root = (item.calculation_root_dir or "").strip()
+    if calculation_root:
+        return str(Path(calculation_root) / item.job_name)
+    return os.path.dirname(item.inp_path)
+
+
+def queue_item_conflict_key(item: QueueItem) -> tuple[str, str]:
+    return managed_job_key(
+        effective_queue_item_work_dir(item),
+        item.job_name,
+    )
+
+
+def submit_effective_work_dir(inp_file: str, job_name: str, queue_item: QueueItem | None = None) -> str:
+    if queue_item is not None:
+        effective_work_dir = (queue_item.effective_work_dir or "").strip()
+        if effective_work_dir:
+            return effective_work_dir
+        calculation_root = (queue_item.calculation_root_dir or "").strip()
+        if calculation_root:
+            return str(Path(calculation_root) / job_name)
+    return str(Path(inp_file).parent) if inp_file else ""
+
+
+def submit_conflict_key(inp_file: str, job_name: str, queue_item: QueueItem | None = None) -> tuple[str, str]:
+    return managed_job_key(
+        submit_effective_work_dir(inp_file, job_name, queue_item),
+        job_name,
+    )
+
+
+def find_formal_queue_conflict(
+    target_item: QueueItem,
+    queue_items: list[QueueItem],
+) -> QueueItem | None:
+    target_key = queue_item_conflict_key(target_item)
+    if not target_key[0] or not target_key[1]:
+        return None
+    for item in queue_items:
+        if item.item_id == target_item.item_id:
+            continue
+        if queue_item_is_finished(item):
+            continue
+        if queue_item_conflict_key(item) == target_key:
+            return item
+    return None
+
+
+def find_queue_item_by_key(
+    *,
+    work_dir: str,
+    job_name: str,
+    queue_items: list[QueueItem],
+) -> QueueItem | None:
+    target_key = managed_job_key(work_dir, job_name)
+    for item in queue_items:
+        if queue_item_conflict_key(item) == target_key:
+            return item
+    return None
+
+
+def queue_status_counts(queue_items: list[QueueItem]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in queue_items:
+        counts[item.status] = counts.get(item.status, 0) + 1
+    return counts
+
+
+def active_submit_conflict_message(
+    *,
+    inp_file: str,
+    job_name: str,
+    queue_item: QueueItem | None,
+    active_runs: dict[str, dict],
+    queue_items: list[QueueItem],
+) -> str:
+    target_key = submit_conflict_key(
+        inp_file,
+        job_name,
+        queue_item,
+    )
+    active_keys = get_managed_active_job_keys(
+        active_runs,
+        queue_items,
+        exclude_item_id=queue_item.item_id if queue_item is not None else "",
+    )
+    if target_key not in active_keys:
+        return ""
+    return (
+        f"无法提交作业 {job_name}：\n"
+        "同一计算目录中已经存在同名运行作业。"
+    )
+
+
 def managed_active_statuses() -> set[str]:
-    return {
-        STATUS_RUNNING,
-        STATUS_STARTING,
-        STATUS_CONFIRMING,
-        STATUS_TERMINATING,
-    }
+    return set(ACTIVE_STATUSES)
 
 
 def queue_item_is_finished(item: QueueItem) -> bool:
-    return item.status in {
-        "已完成",
-        "运行失败",
-        "已取消",
-        "已终止",
-        "疑似异常中断",
-        "状态未知",
-    }
+    return item.status in TERMINAL_STATUSES
 
 
 def oldjob_name_from_item(item: QueueItem) -> str:
@@ -75,7 +174,7 @@ def queue_item_dependency_state(
     )
     if dependency is None:
         return "ready", None
-    if dependency.status == "已完成":
+    if dependency.status == STATUS_COMPLETED:
         return "ready", dependency
     if queue_item_is_finished(dependency):
         return "failed", dependency
@@ -86,24 +185,24 @@ def refresh_queue_dependencies(
     queue_items: list[QueueItem],
 ) -> None:
     for item in queue_items:
-        if item.status not in {"待运行", "等待前置"}:
+        if item.status not in {STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY}:
             continue
         state, dependency = queue_item_dependency_state(
             item,
             queue_items,
         )
         if state == "ready":
-            if item.status == "等待前置":
-                item.status = "待运行"
+            if item.status == STATUS_WAITING_DEPENDENCY:
+                item.status = STATUS_PENDING_RUN
                 item.message = "前置作业已完成，等待提交"
             continue
         if dependency is None:
             continue
         if state == "waiting":
-            item.status = "等待前置"
+            item.status = STATUS_WAITING_DEPENDENCY
             item.message = f"等待前置作业完成：{dependency.job_name}"
             continue
-        item.status = "运行失败"
+        item.status = STATUS_FAILED
         item.message = f"前置作业未完成，跳过重启动：{dependency.job_name} ({dependency.status})"
 
 
@@ -150,6 +249,8 @@ def unfinished_restart_dependents(
 def get_managed_active_job_keys(
     active_runs: dict[str, dict],
     queue_items: list[QueueItem],
+    *,
+    exclude_item_id: str = "",
 ) -> set[tuple[str, str]]:
     keys: set[tuple[str, str]] = set()
     for run in active_runs.values():
@@ -160,12 +261,11 @@ def get_managed_active_job_keys(
             )
         )
     for item in queue_items:
-        if not item.is_external:
+        if exclude_item_id and item.item_id == exclude_item_id:
             continue
-        if item.status not in managed_active_statuses():
+        if item.status not in ACTIVE_STATUSES:
             continue
-        work_dir = item.external_work_dir or os.path.dirname(item.inp_path)
-        keys.add(managed_job_key(work_dir, item.job_name))
+        keys.add(queue_item_conflict_key(item))
     return keys
 
 
@@ -188,10 +288,7 @@ def get_managed_active_job_names(
             names.add(job_name)
 
     for item in queue_items:
-        if not item.is_external:
-            continue
-
-        if item.status not in managed_active_statuses():
+        if item.status not in ACTIVE_STATUSES:
             continue
 
         job_name = str(item.job_name or "").strip()

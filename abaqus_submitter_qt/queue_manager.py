@@ -6,34 +6,38 @@ import os
 import json
 from pathlib import Path
 
+from .constants import (
+    STATUS_CANCELED,
+    STATUS_COMPLETED,
+    STATUS_CONFIRMING,
+    STATUS_DATACHECK_COMPLETED,
+    STATUS_DATACHECK_FAILED,
+    STATUS_FAILED,
+    STATUS_INTERRUPTED,
+    STATUS_PENDING_CONFIRM,
+    STATUS_PENDING_RUN,
+    STATUS_RUNNING,
+    STATUS_STARTING,
+    STATUS_TERMINATED,
+    STATUS_TERMINATING,
+    STATUS_UNKNOWN,
+    STATUS_WAITING_DEPENDENCY,
+    TERMINAL_STATUSES,
+)
 from .models import QueueItem
 
-from .command import derive_job_name
-from .qt_compat import QtCore, QtWidgets, Signal
-
-
-STATUS_PENDING = "待运行"
-STATUS_WAITING = "等待前置"
-STATUS_RUNNING = "运行中"
-STATUS_STARTING = "启动中"
-STATUS_TERMINATING = "正在终止"
-STATUS_COMPLETED = "已完成"
-STATUS_FAILED = "运行失败"
-STATUS_CANCELED = "已取消"
-STATUS_TERMINATED = "已终止"
-STATUS_INTERRUPTED = "疑似异常中断"
-STATUS_CONFIRMING = "状态确认中"
-STATUS_UNKNOWN = "状态未知"
-
-TERMINAL_STATUSES = {
-    STATUS_COMPLETED,
-    STATUS_FAILED,
-    STATUS_CANCELED,
-    STATUS_TERMINATED,
-}
+from .command import derive_job_name, derive_oldjob_name, inp_has_restart_keyword, validate_job_name
+from .qt_compat import QtCore, QtWidgets, Signal, Slot, hang_probe_function
+from .queue_scheduler import (
+    effective_queue_item_work_dir,
+    queue_item_conflict_key,
+    queue_status_counts,
+)
 
 RESULT_EXTENSIONS = (".odb", ".sta", ".msg", ".dat", ".log")
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+ADD_STATS_DETAIL_LIMIT = 10
+TABLE_ROW_KEY_ROLE = QtCore.Qt.ItemDataRole.UserRole
 CANDIDATE_COLUMNS = (
     "勾选",
     "序号",
@@ -45,6 +49,9 @@ CANDIDATE_COLUMNS = (
     "FOR 文件",
     "检查结果",
 )
+CANDIDATE_CHECK_COLUMN = 0
+CANDIDATE_RESTART_COLUMN = 6
+CANDIDATE_FORTRAN_COLUMN = 7
 FORMAL_COLUMNS = (
     "序号",
     "作业名称",
@@ -69,6 +76,45 @@ def atomic_write_json(path, payload):
     os.replace(temp_path, path)
 
 
+class FolderScanWorker(QtCore.QObject):
+    """Discover INP files outside the UI thread."""
+
+    finished = Signal(list)
+    failed = Signal(str)
+    done = Signal()
+
+    def __init__(self, folder: str, recursive: bool):
+        super().__init__()
+        self.folder = folder
+        self.recursive = recursive
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            root = Path(self.folder)
+            if not root.exists():
+                raise FileNotFoundError(self.folder)
+            if not root.is_dir():
+                raise NotADirectoryError(self.folder)
+            pattern = "**/*.inp" if self.recursive else "*.inp"
+            paths = [str(path) for path in sorted(root.glob(pattern)) if path.is_file()]
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.finished.emit(paths)
+        finally:
+            self.done.emit()
+
+
+class NoHighlightCheckBoxDelegate(QtWidgets.QStyledItemDelegate):
+    def paint(self, painter, option, index):  # noqa: ANN001
+        view_option = QtWidgets.QStyleOptionViewItem(option)
+        view_option.state &= ~QtWidgets.QStyle.StateFlag.State_Selected
+        view_option.state &= ~QtWidgets.QStyle.StateFlag.State_HasFocus
+        view_option.state &= ~QtWidgets.QStyle.StateFlag.State_MouseOver
+        super().paint(painter, view_option, index)
+
+
 class QueueManagerDialog(QtWidgets.QDialog):
     """Manage candidate INP files and the formal run queue."""
 
@@ -85,6 +131,9 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.candidates: list[QueueItem] = []
         self.saved_paths = self.load_saved_paths()
         self.external_scan_busy = False
+        self.folder_scan_thread: QtCore.QThread | None = None
+        self.folder_scan_worker: FolderScanWorker | None = None
+        self.folder_scan_closing = False
         self.candidate_columns_initialized = False
         self.formal_columns_initialized = False
 
@@ -157,6 +206,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
         self.candidate_table = QtWidgets.QTableWidget(0, len(CANDIDATE_COLUMNS))
         self.setup_table(self.candidate_table, CANDIDATE_COLUMNS)
+        self.candidate_table.setItemDelegateForColumn(0, NoHighlightCheckBoxDelegate(self.candidate_table))
         self.candidate_table.cellChanged.connect(self.on_candidate_cell_changed)
         self.candidate_table.itemDoubleClicked.connect(self.on_candidate_item_double_clicked)
         candidate_layout.addWidget(self.candidate_table, 1)
@@ -343,6 +393,163 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
         table_item.setTextAlignment(alignment)
 
+    @staticmethod
+    def item_row_key(item: QueueItem) -> str:
+        return item.item_id
+
+    @staticmethod
+    def table_row_key(table: QtWidgets.QTableWidget, row: int) -> str:
+        table_item = table.item(row, 0)
+        if table_item is None:
+            return ""
+        value = table_item.data(TABLE_ROW_KEY_ROLE)
+        return str(value or "")
+
+    def table_row_key_map(self, table: QtWidgets.QTableWidget) -> dict[str, int]:
+        row_by_key: dict[str, int] = {}
+        for row in range(table.rowCount()):
+            row_key = self.table_row_key(table, row)
+            if row_key:
+                row_by_key[row_key] = row
+        return row_by_key
+
+    def selected_table_row_keys(self, table: QtWidgets.QTableWidget) -> set[str]:
+        selected_keys = set()
+        for index in table.selectedIndexes():
+            row_key = self.table_row_key(table, index.row())
+            if row_key:
+                selected_keys.add(row_key)
+        return selected_keys
+
+    def current_table_row_key(self, table: QtWidgets.QTableWidget) -> str:
+        row = table.currentRow()
+        if row < 0:
+            return ""
+        return self.table_row_key(table, row)
+
+    def resize_table_to_count(self, table: QtWidgets.QTableWidget, target_count: int) -> None:
+        while table.rowCount() > target_count:
+            table.removeRow(table.rowCount() - 1)
+        while table.rowCount() < target_count:
+            table.insertRow(table.rowCount())
+
+    def update_table_cell(
+        self,
+        table: QtWidgets.QTableWidget,
+        row: int,
+        column: int,
+        value: str,
+        column_name: str,
+        row_key: str,
+        check_state: QtCore.Qt.CheckState | None = None,
+    ) -> None:
+        table_item = table.item(row, column)
+        if table_item is None:
+            table_item = QtWidgets.QTableWidgetItem()
+            self.apply_table_item_alignment(table_item, column_name)
+            table.setItem(row, column, table_item)
+
+        table_item.setData(TABLE_ROW_KEY_ROLE, row_key)
+
+        if check_state is not None:
+            flags = table_item.flags()
+            flags |= QtCore.Qt.ItemFlag.ItemIsEnabled
+            flags |= QtCore.Qt.ItemFlag.ItemIsUserCheckable
+            if table is self.candidate_table and column == 0:
+                flags &= ~QtCore.Qt.ItemFlag.ItemIsSelectable
+            table_item.setFlags(flags)
+            if table_item.checkState() != check_state:
+                table_item.setCheckState(check_state)
+
+        if table_item.text() != value:
+            table_item.setText(value)
+
+    def restore_table_view_state(
+        self,
+        table: QtWidgets.QTableWidget,
+        selected_keys: set[str],
+        current_key: str,
+        scroll_value: int,
+    ) -> None:
+        table.clearSelection()
+        row_by_key = self.table_row_key_map(table)
+
+        selection_model = table.selectionModel()
+        if selection_model is not None:
+            for row_key in selected_keys:
+                row = row_by_key.get(row_key)
+                if row is None:
+                    continue
+                top_left = table.model().index(row, 0)
+                bottom_right = table.model().index(row, table.columnCount() - 1)
+                selection = QtCore.QItemSelection(top_left, bottom_right)
+                selection_model.select(
+                    selection,
+                    QtCore.QItemSelectionModel.SelectionFlag.Select
+                    | QtCore.QItemSelectionModel.SelectionFlag.Rows,
+                )
+
+        if current_key in row_by_key:
+            table.setCurrentCell(row_by_key[current_key], 0)
+        else:
+            remaining_selected_rows = [
+                row_by_key[row_key]
+                for row_key in selected_keys
+                if row_key in row_by_key
+            ]
+            if remaining_selected_rows:
+                table.setCurrentCell(min(remaining_selected_rows), 0)
+
+        scroll_bar = table.verticalScrollBar()
+        scroll_bar.setValue(min(scroll_value, scroll_bar.maximum()))
+
+    def sync_table_rows(
+        self,
+        table: QtWidgets.QTableWidget,
+        items: list[QueueItem],
+        columns: tuple[str, ...],
+        row_value_builder,
+        *,
+        checkable_first_column: bool = False,
+    ) -> None:
+        selected_keys = self.selected_table_row_keys(table)
+        current_key = self.current_table_row_key(table)
+        scroll_value = table.verticalScrollBar().value()
+        sorting_enabled = table.isSortingEnabled()
+
+        table.blockSignals(True)
+        table.setUpdatesEnabled(False)
+        table.setSortingEnabled(False)
+        try:
+            self.resize_table_to_count(table, len(items))
+            for row, item in enumerate(items):
+                row_key = self.item_row_key(item)
+                values = row_value_builder(item, row + 1)
+                for column, value in enumerate(values):
+                    check_state = None
+                    if checkable_first_column and column == 0:
+                        check_state = (
+                            QtCore.Qt.CheckState.Checked
+                            if item.selected
+                            else QtCore.Qt.CheckState.Unchecked
+                        )
+                    self.update_table_cell(
+                        table,
+                        row,
+                        column,
+                        value,
+                        columns[column],
+                        row_key,
+                        check_state,
+                    )
+        finally:
+            table.setSortingEnabled(sorting_enabled)
+            table.setUpdatesEnabled(True)
+            table.blockSignals(False)
+
+        self.restore_table_view_state(table, selected_keys, current_key, scroll_value)
+        table.viewport().update()
+
     def load_saved_paths(self) -> dict:
         try:
             with CONFIG_PATH.open("r", encoding="utf-8") as stream:
@@ -369,6 +576,8 @@ class QueueManagerDialog(QtWidgets.QDialog):
         if folder:
             self.ssd_dir_edit.setText(os.path.normpath(folder))
             self.save_saved_paths()
+            self.revalidate_candidates()
+            self.refresh_candidate_table()
 
     def choose_archive_dir(self) -> None:
         folder = QtWidgets.QFileDialog.getExistingDirectory(
@@ -407,7 +616,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             inp_path=normalized,
             job_name=derive_job_name(normalized),
             source=source,
-            status="候选",
+            status=STATUS_PENDING_CONFIRM,
             selected=True,
             valid=True,
             message="可加入",
@@ -419,7 +628,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             datacheck_only=self.current_settings["datacheck"],
             complete_notify=self.current_settings["notify"],
             source_inp_path=normalized,
-            calculation_work_dir=self.ssd_dir_edit.text().strip(),
+            calculation_root_dir=self.ssd_dir_edit.text().strip(),
             archive_dir=self.archive_dir_edit.text().strip(),
             archive_after_complete=bool(self.archive_dir_edit.text().strip()),
             cleanup_after_archive=True,
@@ -429,12 +638,130 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.candidates.append(item)
         existing_paths.add(normalized_key)
         if refresh:
+            self.revalidate_candidates()
             self.refresh_candidate_table()
         return True
 
+    @staticmethod
+    def new_candidate_add_stats(scanned: int = 0) -> dict:
+        return {
+            "scanned": scanned,
+            "added": 0,
+            "duplicate": 0,
+            "restart_name": 0,
+            "existing_result": 0,
+            "invalid": 0,
+            "details": {
+                "duplicate": [],
+                "restart_name": [],
+                "existing_result": [],
+                "invalid": [],
+            },
+        }
+
+    @staticmethod
+    def add_skip_detail(stats: dict, reason: str, path: str) -> None:
+        details = stats.get("details", {}).get(reason)
+        if details is not None and len(details) < ADD_STATS_DETAIL_LIMIT:
+            details.append(os.path.basename(path) or path)
+
+    def candidate_skip_reason(self, path: str, existing_paths: set[str]) -> tuple[str, str]:
+        normalized = os.path.normpath(os.path.abspath(path))
+        if not normalized.lower().endswith(".inp"):
+            return "invalid", normalized
+        if self.skip_restart_check.isChecked() and "restart" in os.path.basename(normalized).lower():
+            return "restart_name", normalized
+        if self.skip_existing_check.isChecked() and self.has_result_files(normalized):
+            return "existing_result", normalized
+        if os.path.normcase(normalized) in existing_paths:
+            return "duplicate", normalized
+        return "", normalized
+
+    def add_candidate_batch(self, paths: list[str], source: str) -> dict:
+        stats = self.new_candidate_add_stats(len(paths))
+        existing_paths = {os.path.normcase(item.inp_path) for item in self.candidates + self.queue_items}
+        changed = False
+
+        for path in paths:
+            reason, normalized = self.candidate_skip_reason(path, existing_paths)
+
+            if reason:
+                stats[reason] += 1
+                self.add_skip_detail(stats, reason, normalized)
+                continue
+
+            if self.add_candidate(
+                normalized,
+                source,
+                refresh=False,
+                existing_paths=existing_paths,
+            ):
+                changed = True
+                stats["added"] += 1
+            else:
+                stats["invalid"] += 1
+                self.add_skip_detail(stats, "invalid", normalized)
+
+        if changed:
+            self.revalidate_candidates()
+            self.refresh_candidate_table()
+        else:
+            self.refresh_summaries()
+
+        return stats
+
+    def format_candidate_add_stats_message(self, stats: dict) -> str:
+        skipped = (
+            int(stats["duplicate"])
+            + int(stats["restart_name"])
+            + int(stats["existing_result"])
+            + int(stats["invalid"])
+        )
+
+        if skipped == 0 and stats["added"] > 0:
+            return f"已新增 {stats['added']} 个候选作业。"
+
+        lines = [
+            "候选作业添加完成",
+            "",
+            f"扫描到 .inp 文件：{stats['scanned']}",
+            f"新增候选：{stats['added']}",
+            f"重复跳过：{stats['duplicate']}",
+            f"Restart 名称跳过：{stats['restart_name']}",
+            f"已有结果跳过：{stats['existing_result']}",
+            f"其他跳过：{stats['invalid']}",
+        ]
+
+        detail_labels = {
+            "duplicate": "重复跳过",
+            "restart_name": "Restart 名称跳过",
+            "existing_result": "已有结果跳过",
+            "invalid": "其他跳过",
+        }
+        detail_lines = []
+        for reason, label in detail_labels.items():
+            names = stats.get("details", {}).get(reason, [])
+            if names:
+                detail_lines.append(f"{label}：" + "，".join(names))
+        if detail_lines:
+            lines.extend(["", *detail_lines])
+
+        return "\n".join(lines)
+
+    def show_candidate_add_stats(self, stats: dict, *, force: bool = False) -> None:
+        if not force and stats["scanned"] <= 0 and stats["added"] <= 0:
+            return
+
+        QtWidgets.QMessageBox.information(
+            self,
+            "候选作业添加完成",
+            self.format_candidate_add_stats_message(stats),
+        )
+
     def add_current_inp(self) -> None:
         if self.current_inp:
-            self.add_candidate(self.current_inp, "当前 INP")
+            stats = self.add_candidate_batch([self.current_inp], "当前 INP")
+            self.show_candidate_add_stats(stats)
 
     def add_inp_files(self) -> None:
         paths, _ = QtWidgets.QFileDialog.getOpenFileNames(
@@ -443,40 +770,68 @@ class QueueManagerDialog(QtWidgets.QDialog):
             self.default_work_dir(),
             "Abaqus INP (*.inp);;所有文件 (*.*)",
         )
-        existing_paths = {os.path.normcase(item.inp_path) for item in self.candidates + self.queue_items}
-        changed = False
-        for path in paths:
-            changed = (
-                self.add_candidate(
-                    path,
-                    "文件",
-                    refresh=False,
-                    existing_paths=existing_paths,
-                )
-                or changed
-            )
-        if changed:
-            self.refresh_candidate_table()
+        if not paths:
+            return
+        stats = self.add_candidate_batch(list(paths), "文件")
+        self.show_candidate_add_stats(stats)
 
     def scan_folder(self) -> None:
+        if self.folder_scan_thread is not None:
+            QtWidgets.QMessageBox.information(self, "扫描文件夹", "文件夹扫描正在进行，请稍候。")
+            return
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "扫描文件夹", self.default_work_dir())
         if not folder:
             return
-        pattern = "**/*.inp" if self.scan_subdirs_check.isChecked() else "*.inp"
-        existing_paths = {os.path.normcase(item.inp_path) for item in self.candidates + self.queue_items}
-        changed = False
-        for path in sorted(Path(folder).glob(pattern)):
-            changed = (
-                self.add_candidate(
-                    str(path),
-                    "文件夹",
-                    refresh=False,
-                    existing_paths=existing_paths,
-                )
-                or changed
-            )
-        if changed:
-            self.refresh_candidate_table()
+        self.start_folder_scan(folder, self.scan_subdirs_check.isChecked())
+
+    def start_folder_scan(self, folder: str, recursive: bool) -> None:
+        if self.folder_scan_thread is not None:
+            QtWidgets.QMessageBox.information(self, "扫描文件夹", "文件夹扫描正在进行，请稍候。")
+            return
+
+        self.folder_scan_closing = False
+        thread = QtCore.QThread(QtWidgets.QApplication.instance())
+        worker = FolderScanWorker(folder, recursive)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(self.handle_folder_scan_finished)
+        worker.failed.connect(self.handle_folder_scan_failed)
+        worker.done.connect(thread.quit)
+        worker.done.connect(worker.deleteLater)
+        thread.finished.connect(self.handle_folder_scan_done)
+        thread.finished.connect(thread.deleteLater)
+
+        self.folder_scan_thread = thread
+        self.folder_scan_worker = worker
+        self.set_folder_scan_busy(True)
+        thread.start()
+
+    def set_folder_scan_busy(self, busy: bool) -> None:
+        self.scan_folder_btn.setEnabled(not busy)
+        self.scan_folder_btn.setText("扫描中..." if busy else "扫描文件夹")
+
+    def handle_folder_scan_finished(self, paths: list[str]) -> None:
+        if self.folder_scan_closing:
+            return
+        stats = self.add_candidate_batch(paths, "文件夹")
+        self.show_candidate_add_stats(stats, force=True)
+
+    def handle_folder_scan_failed(self, message: str) -> None:
+        if self.folder_scan_closing:
+            return
+        QtWidgets.QMessageBox.warning(self, "扫描文件夹失败", f"扫描文件夹失败：\n{message}")
+
+    def handle_folder_scan_done(self) -> None:
+        self.folder_scan_thread = None
+        self.folder_scan_worker = None
+        if self.folder_scan_closing:
+            return
+        self.set_folder_scan_busy(False)
+
+    def closeEvent(self, event) -> None:
+        self.folder_scan_closing = True
+        super().closeEvent(event)
 
     def has_result_files(self, inp_path: str) -> bool:
         base = Path(inp_path).with_suffix("")
@@ -485,14 +840,11 @@ class QueueManagerDialog(QtWidgets.QDialog):
     def detect_restart(self, item: QueueItem) -> None:
         item.run_mode = "normal"
         item.job_type = "普通"
-        try:
-            with open(item.inp_path, "r", encoding="gbk", errors="ignore") as stream:
-                head = stream.read(32768)
-        except OSError:
+        if not os.path.isfile(item.inp_path):
             item.valid = False
             item.message = "INP 文件不可读"
             return
-        if "*restart" in head.lower():
+        if inp_has_restart_keyword(item.inp_path):
             item.run_mode = "restart"
             item.job_type = "重启动"
             if item.oldjob_path:
@@ -504,16 +856,60 @@ class QueueManagerDialog(QtWidgets.QDialog):
             item.valid = False
             item.message = "INP 文件不存在"
             return
-        if item.job_name.lower() in {entry.job_name.lower() for entry in self.queue_items}:
+        ok, message = validate_job_name(item.job_name)
+        if not ok:
             item.valid = False
-            item.message = "正式队列中已存在同名作业"
+            item.message = f"作业名不合法：{item.job_name or '空'}（{message}）"
             return
         if item.fortran_path and not os.path.isfile(item.fortran_path):
             item.valid = False
             item.message = "FOR 文件不存在"
             return
+        pending_restart_dependency = False
+        oldjob_name = item.oldjob_name or derive_oldjob_name(item.oldjob_path)
+        if item.run_mode == "restart" and not oldjob_name:
+            pending_restart_dependency = True
+        if oldjob_name:
+            ok, message = validate_job_name(oldjob_name)
+            if not ok:
+                item.valid = False
+                item.message = f"Restart 依赖作业名不合法：{oldjob_name}（{message}）"
+                return
+            if oldjob_name == item.job_name:
+                item.valid = False
+                item.message = "当前作业名称不能与 Restart 依赖作业名相同。"
+                return
+        conflict_item = self.candidate_conflict_item(item)
+        if conflict_item is not None:
+            item.valid = False
+            item.message = (
+                f"作业冲突：同一计算目录中已存在同名作业 {item.job_name}，"
+                f"冲突来源：{conflict_item.inp_path}"
+            )
+            return
         item.valid = True
-        item.message = "可加入"
+        item.message = "确认加入前选择 Restart 依赖" if pending_restart_dependency else "可加入"
+
+    def candidate_conflict_item(self, item: QueueItem) -> QueueItem | None:
+        key = queue_item_conflict_key(item)
+        if not key[0] or not key[1]:
+            return None
+        queue_item_ids = {entry.item_id for entry in self.queue_items}
+        for other in self.candidates + self.queue_items:
+            if other.item_id == item.item_id:
+                continue
+            if other.item_id in queue_item_ids and other.status in TERMINAL_STATUSES:
+                continue
+            if queue_item_conflict_key(other) == key:
+                return other
+        return None
+
+    def revalidate_candidates(self) -> None:
+        current_calculation_root_dir = self.ssd_dir_edit.text().strip()
+        for item in self.candidates:
+            item.calculation_root_dir = current_calculation_root_dir
+            item.effective_work_dir = ""
+            self.validate_candidate(item)
 
     # ---------- Candidate actions ----------
 
@@ -528,9 +924,65 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
     def on_candidate_item_double_clicked(self, item: QtWidgets.QTableWidgetItem) -> None:
         row = item.row()
-        if 0 <= row < len(self.candidates):
+        column = item.column()
+        if row < 0 or row >= len(self.candidates):
+            return
+
+        if column == CANDIDATE_CHECK_COLUMN:
             self.candidates[row].selected = not self.candidates[row].selected
             self.refresh_candidate_table()
+        elif column == CANDIDATE_RESTART_COLUMN:
+            self.choose_candidate_restart_dependency(row)
+        elif column == CANDIDATE_FORTRAN_COLUMN:
+            self.choose_candidate_fortran_file(row)
+
+    def select_oldjob_odb_file(self, initial_path: str = "") -> str:
+        start_dir = ""
+        if initial_path:
+            initial = Path(initial_path)
+            start_dir = str(initial.parent if initial.suffix else initial)
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择 Restart 前置 ODB",
+            start_dir or self.default_work_dir(),
+            "Abaqus ODB (*.odb);;所有文件 (*.*)",
+        )
+        return os.path.normpath(path) if path else ""
+
+    def apply_oldjob_file_to_item(self, item: QueueItem, oldjob_path: str) -> None:
+        if not oldjob_path:
+            return
+        path = Path(oldjob_path)
+        item.oldjob_path = os.path.normpath(str(path))
+        item.oldjob_name = path.stem
+        item.oldjob_dir = os.path.normpath(str(path.parent))
+
+    def choose_candidate_restart_dependency(self, row: int) -> None:
+        item = self.candidates[row]
+        if item.run_mode != "restart":
+            return
+        initial_path = item.oldjob_path or item.oldjob_dir
+        oldjob_path = self.select_oldjob_odb_file(initial_path)
+        if not oldjob_path:
+            return
+        self.apply_oldjob_file_to_item(item, oldjob_path)
+        self.detect_restart(item)
+        self.validate_candidate(item)
+        self.refresh_candidate_table()
+
+    def choose_candidate_fortran_file(self, row: int) -> None:
+        item = self.candidates[row]
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择 FOR 文件",
+            item.fortran_path or self.default_work_dir(),
+            "Fortran (*.for *.f *.f90);;所有文件 (*.*)",
+        )
+        if not path:
+            return
+        item.fortran_path = os.path.normpath(path)
+        self.validate_candidate(item)
+        self.refresh_candidate_table()
 
     def set_candidate_selection(self, selected: bool) -> None:
         for item in self.candidates:
@@ -552,10 +1004,306 @@ class QueueManagerDialog(QtWidgets.QDialog):
             self.candidates[:] = [item for item in self.candidates if not item.selected]
         self.refresh_candidate_table()
 
+    @staticmethod
+    def format_count_distribution(values: list[str], empty_text: str = "默认") -> str:
+        counts: dict[str, int] = {}
+        for value in values:
+            label = value or empty_text
+            counts[label] = counts.get(label, 0) + 1
+
+        if not counts:
+            return "无"
+
+        if len(counts) == 1:
+            return next(iter(counts))
+
+        return "，".join(f"{label} × {count}" for label, count in counts.items())
+
+    def expected_oldjob_path_for_item(self, item: QueueItem) -> str:
+        source_odb = str(Path(item.source_inp_path or item.inp_path).with_suffix(".odb"))
+        if Path(source_odb).exists():
+            return source_odb
+
+        effective_work_dir = effective_queue_item_work_dir(item)
+        if effective_work_dir:
+            return str(Path(effective_work_dir) / f"{item.job_name}.odb")
+
+        return source_odb
+
+    def restart_dependency_source_items(
+        self,
+        current_item: QueueItem,
+        preceding_candidates: list[QueueItem] | None = None,
+    ) -> list[QueueItem]:
+        sources: list[QueueItem] = []
+        seen_ids: set[str] = set()
+        for item in self.queue_items + list(preceding_candidates or []):
+            if item.item_id == current_item.item_id or item.item_id in seen_ids:
+                continue
+            if not item.job_name:
+                continue
+            if item.run_mode == "restart" and item.status not in TERMINAL_STATUSES:
+                continue
+            sources.append(item)
+            seen_ids.add(item.item_id)
+        return sources
+
+    def restart_dependency_resolved(
+        self,
+        item: QueueItem,
+        preceding_candidates: list[QueueItem] | None = None,
+    ) -> bool:
+        if item.run_mode != "restart":
+            return True
+
+        oldjob_name = item.oldjob_name or derive_oldjob_name(item.oldjob_path)
+        if not oldjob_name:
+            return False
+
+        for source_item in self.restart_dependency_source_items(item, preceding_candidates):
+            if source_item.job_name.lower() == oldjob_name.lower():
+                return True
+
+        candidate_paths = [
+            item.oldjob_path,
+            str(Path(item.oldjob_dir) / f"{oldjob_name}.odb") if item.oldjob_dir else "",
+        ]
+        for raw_path in candidate_paths:
+            if not raw_path:
+                continue
+            path = Path(raw_path)
+            if path.suffix.lower() == ".odb" and path.stem.lower() == oldjob_name.lower() and path.is_file():
+                return True
+        return False
+
+    def build_restart_dependency_options(
+        self,
+        current_item: QueueItem,
+        preceding_candidates: list[QueueItem],
+    ) -> list[dict[str, str]]:
+        options: list[dict[str, str]] = []
+        for source_item in self.restart_dependency_source_items(current_item, preceding_candidates):
+            oldjob_path = self.expected_oldjob_path_for_item(source_item)
+            oldjob_dir = str(Path(oldjob_path).parent) if oldjob_path else ""
+            label = f"{source_item.job_name} — {oldjob_dir or '队列前置作业'}"
+            options.append(
+                {
+                    "label": label,
+                    "oldjob_name": source_item.job_name,
+                    "oldjob_path": oldjob_path,
+                    "oldjob_dir": oldjob_dir,
+                    "allow_missing": "1",
+                }
+            )
+        return options
+
+    def prompt_restart_dependency(
+        self,
+        item: QueueItem,
+        preceding_candidates: list[QueueItem],
+    ) -> bool:
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("选择 Restart 前置作业")
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.addWidget(QtWidgets.QLabel(f"当前 Restart 作业：\n{item.job_name}"))
+
+        form = QtWidgets.QFormLayout()
+        dependency_combo = QtWidgets.QComboBox()
+        dependency_combo.addItem("手动选择 oldjob ODB 文件", None)
+        for option in self.build_restart_dependency_options(item, preceding_candidates):
+            dependency_combo.addItem(option["label"], option)
+
+        oldjob_name_edit = QtWidgets.QLineEdit(item.oldjob_name or derive_oldjob_name(item.oldjob_path))
+        oldjob_path_edit = QtWidgets.QLineEdit(item.oldjob_path)
+        oldjob_path_edit.setReadOnly(True)
+        choose_odb_btn = QtWidgets.QPushButton("选择 ODB 文件")
+        file_row = QtWidgets.QHBoxLayout()
+        file_row.addWidget(oldjob_path_edit, 1)
+        file_row.addWidget(choose_odb_btn)
+
+        form.addRow("请选择前置作业", dependency_combo)
+        form.addRow("oldjob 名称", oldjob_name_edit)
+        form.addRow("前置 ODB 文件", file_row)
+        layout.addLayout(form)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok | QtWidgets.QDialogButtonBox.StandardButton.Cancel
+        )
+        layout.addWidget(buttons)
+
+        selected_result: dict[str, str] = {}
+
+        def apply_combo_selection(index: int) -> None:
+            data = dependency_combo.itemData(index)
+            if not data:
+                return
+            oldjob_name_edit.setText(str(data.get("oldjob_name", "")))
+            oldjob_path_edit.setText(str(data.get("oldjob_path", "")))
+
+        def choose_oldjob_file() -> None:
+            oldjob_path = self.select_oldjob_odb_file(oldjob_path_edit.text() or item.oldjob_dir)
+            if oldjob_path:
+                oldjob_path_edit.setText(oldjob_path)
+                oldjob_name_edit.setText(Path(oldjob_path).stem)
+                dependency_combo.setCurrentIndex(0)
+
+        def accept_dialog() -> None:
+            oldjob_path = oldjob_path_edit.text().strip()
+            if oldjob_path:
+                oldjob_name_edit.setText(Path(oldjob_path).stem)
+            oldjob_name = oldjob_name_edit.text().strip()
+            ok, message = validate_job_name(oldjob_name)
+            if not ok:
+                QtWidgets.QMessageBox.warning(dialog, "Restart 依赖无效", f"oldjob 名称不合法：{message}")
+                return
+            if oldjob_name.lower() == item.job_name.lower():
+                QtWidgets.QMessageBox.warning(dialog, "Restart 依赖无效", "oldjob 不能与当前作业同名。")
+                return
+
+            if not oldjob_path:
+                QtWidgets.QMessageBox.warning(dialog, "Restart 依赖无效", "请选择前置 ODB 文件。")
+                return
+
+            data = dependency_combo.itemData(dependency_combo.currentIndex())
+            allow_missing = bool(data and str(data.get("allow_missing", "")) == "1")
+            if Path(oldjob_path).stem.lower() != oldjob_name.lower():
+                oldjob_path = str(Path(oldjob_path).with_name(f"{oldjob_name}.odb"))
+
+            if not allow_missing and not Path(oldjob_path).is_file():
+                QtWidgets.QMessageBox.warning(
+                    dialog,
+                    "Restart 依赖无效",
+                    f"目录中未找到前置 ODB：\n{oldjob_path}",
+                )
+                return
+
+            selected_result.update(
+                {
+                    "oldjob_name": oldjob_name,
+                    "oldjob_dir": os.path.normpath(str(Path(oldjob_path).parent)),
+                    "oldjob_path": os.path.normpath(oldjob_path),
+                }
+            )
+            dialog.accept()
+
+        dependency_combo.currentIndexChanged.connect(apply_combo_selection)
+        choose_odb_btn.clicked.connect(choose_oldjob_file)
+        buttons.accepted.connect(accept_dialog)
+        buttons.rejected.connect(dialog.reject)
+
+        if dependency_combo.count() > 1 and not oldjob_name_edit.text().strip():
+            dependency_combo.setCurrentIndex(1)
+            apply_combo_selection(1)
+
+        if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return False
+
+        item.oldjob_name = selected_result["oldjob_name"]
+        item.oldjob_dir = selected_result["oldjob_dir"]
+        item.oldjob_path = selected_result["oldjob_path"]
+        self.validate_candidate(item)
+        return item.valid
+
+    def ensure_restart_dependencies_for_candidates(self, selected_items: list[QueueItem]) -> bool:
+        for index, item in enumerate(selected_items):
+            if item.run_mode != "restart":
+                continue
+            preceding_candidates = [
+                candidate
+                for candidate in selected_items[:index]
+                if candidate.run_mode != "restart"
+            ]
+            if self.restart_dependency_resolved(item, preceding_candidates):
+                continue
+            if not self.prompt_restart_dependency(item, preceding_candidates):
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "已取消",
+                    "已取消加入队列，Restart 作业未选择有效前置作业。",
+                )
+                self.refresh_candidate_table()
+                return False
+        return True
+
+    def build_confirm_candidates_summary(self, selected_items: list[QueueItem]) -> str:
+        total_cores = sum(int(item.cores or 0) for item in selected_items)
+        memory_summary = self.format_count_distribution([item.memory for item in selected_items])
+        fortran_items = [item for item in selected_items if item.fortran_path]
+        fortran_summary = self.format_count_distribution(
+            [os.path.basename(item.fortran_path) for item in fortran_items],
+            empty_text="无",
+        )
+        restart_items = [item for item in selected_items if item.run_mode == "restart"]
+
+        lines = [
+            "确认将以下候选作业加入正式队列？",
+            "",
+            f"作业数量：{len(selected_items)}",
+            f"总核心数：{total_cores}",
+            f"内存设置：{memory_summary}",
+            f"FOR 文件：{len(fortran_items)} 个",
+        ]
+
+        if fortran_items:
+            lines.append(f"FOR 分布：{fortran_summary}")
+
+        lines.append(f"Restart 作业：{len(restart_items)} 个")
+
+        if restart_items:
+            lines.extend(["", "Restart 依赖："])
+            for item in restart_items[:10]:
+                dependency = item.oldjob_name or (Path(item.oldjob_path).stem if item.oldjob_path else "启动前选择")
+                lines.append(f"- {item.job_name} 依赖 {dependency}")
+
+            hidden_count = len(restart_items) - 10
+            if hidden_count > 0:
+                lines.append(f"……另有 {hidden_count} 条依赖关系")
+
+        return "\n".join(lines)
+
+    def confirm_selected_candidates_action(self, selected_items: list[QueueItem]) -> bool:
+        result = QtWidgets.QMessageBox.question(
+            self,
+            "确认加入队列",
+            self.build_confirm_candidates_summary(selected_items),
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.Yes,
+        )
+        return result == QtWidgets.QMessageBox.StandardButton.Yes
+
+    @hang_probe_function("QueueManagerDialog.confirm_candidates")
     def confirm_candidates(self) -> None:
+        self.revalidate_candidates()
+        blocked_items = [item for item in self.candidates if item.selected and not item.valid]
+        if blocked_items:
+            lines = ["检测到冲突或无效候选，无法加入正式队列："]
+            for item in blocked_items[:10]:
+                lines.append(f"- {item.job_name}: {item.message}")
+            hidden_count = len(blocked_items) - 10
+            if hidden_count > 0:
+                lines.append(f"……另有 {hidden_count} 个候选作业无法加入")
+            self.refresh_candidate_table()
+            QtWidgets.QMessageBox.warning(self, "无法加入队列", "\n".join(lines))
+            return
         selected_items = [item for item in self.candidates if item.selected and item.valid]
         if not selected_items:
             QtWidgets.QMessageBox.warning(self, "没有可加入作业", "请先勾选有效的候选作业。")
+            return
+        if not self.ensure_restart_dependencies_for_candidates(selected_items):
+            return
+        self.revalidate_candidates()
+        blocked_items = [item for item in selected_items if not item.valid]
+        if blocked_items:
+            lines = ["Restart 依赖设置后仍存在无效候选，无法加入正式队列："]
+            for item in blocked_items[:10]:
+                lines.append(f"- {item.job_name}: {item.message}")
+            hidden_count = len(blocked_items) - 10
+            if hidden_count > 0:
+                lines.append(f"……另有 {hidden_count} 个候选作业无法加入")
+            self.refresh_candidate_table()
+            QtWidgets.QMessageBox.warning(self, "无法加入队列", "\n".join(lines))
+            return
+        if not self.confirm_selected_candidates_action(selected_items):
             return
         existing = {os.path.normcase(item.inp_path) for item in self.queue_items}
         added_ids = set()
@@ -563,11 +1311,13 @@ class QueueManagerDialog(QtWidgets.QDialog):
             if os.path.normcase(item.inp_path) in existing:
                 continue
             item.source_inp_path = item.source_inp_path or item.inp_path
-            item.calculation_work_dir = self.ssd_dir_edit.text().strip()
+            item.calculation_root_dir = self.ssd_dir_edit.text().strip()
+            item.effective_work_dir = ""
+            item.effective_work_dir = effective_queue_item_work_dir(item)
             item.archive_dir = self.archive_dir_edit.text().strip()
             item.archive_after_complete = bool(item.archive_dir)
             item.cleanup_after_archive = True
-            item.status = STATUS_PENDING
+            item.status = STATUS_PENDING_RUN
             item.message = "待提交"
             item.source = item.source or "候选"
             self.queue_items.append(item)
@@ -587,7 +1337,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             if row >= len(self.queue_items):
                 continue
             item = self.queue_items[row]
-            if item.status in (STATUS_PENDING, STATUS_WAITING):
+            if item.status in (STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY):
                 item.status = STATUS_CANCELED
                 item.message = "用户取消"
             elif item.status in (STATUS_RUNNING, STATUS_STARTING, STATUS_TERMINATING):
@@ -602,7 +1352,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             QtWidgets.QMessageBox.information(self, "编辑队列作业", "请选择一个待运行作业。")
             return
         item = self.queue_items[rows[0]]
-        if item.status not in (STATUS_PENDING, STATUS_WAITING):
+        if item.status not in (STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY):
             QtWidgets.QMessageBox.information(self, "编辑队列作业", "只能编辑待运行或等待前置的作业。")
             return
 
@@ -633,8 +1383,12 @@ class QueueManagerDialog(QtWidgets.QDialog):
         item.fortran_path = fortran_edit.text().strip()
         self.detect_restart(item)
         self.validate_candidate(item)
-        item.status = STATUS_PENDING if item.valid else STATUS_FAILED
-        item.message = "待提交" if item.valid else item.message
+        if item.run_mode == "restart" and not self.restart_dependency_resolved(item):
+            item.status = STATUS_WAITING_DEPENDENCY
+            item.message = "未选择有效的 Restart 前置作业"
+        else:
+            item.status = STATUS_PENDING_RUN if item.valid else STATUS_FAILED
+            item.message = "待提交" if item.valid else item.message
         self.refresh_queue_table()
 
     def terminate_selected_running(self) -> None:
@@ -715,70 +1469,26 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.refresh_candidate_table()
         self.refresh_queue_table()
 
+    @hang_probe_function("QueueManagerDialog.refresh_candidate_table")
     def refresh_candidate_table(self) -> None:
-        self.candidate_table.blockSignals(True)
-        try:
-            self.candidate_table.setRowCount(len(self.candidates))
-
-            for row, item in enumerate(self.candidates):
-                values = self.candidate_row_values(
-                    item,
-                    row + 1,
-                )
-
-                for column, value in enumerate(values):
-                    table_item = QtWidgets.QTableWidgetItem(value)
-
-                    self.apply_table_item_alignment(
-                        table_item,
-                        CANDIDATE_COLUMNS[column],
-                    )
-
-                    if column == 0:
-                        table_item.setFlags(table_item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
-
-                        table_item.setCheckState(
-                            QtCore.Qt.CheckState.Checked if item.selected else QtCore.Qt.CheckState.Unchecked
-                        )
-
-                    self.candidate_table.setItem(
-                        row,
-                        column,
-                        table_item,
-                    )
-
-        finally:
-            self.candidate_table.blockSignals(False)
+        self.sync_table_rows(
+            self.candidate_table,
+            self.candidates,
+            CANDIDATE_COLUMNS,
+            self.candidate_row_values,
+            checkable_first_column=True,
+        )
         self.ensure_candidate_columns_initialized()
         self.refresh_summaries()
 
+    @hang_probe_function("QueueManagerDialog.refresh_queue_table")
     def refresh_queue_table(self) -> None:
-        self.queue_table.blockSignals(True)
-        try:
-            self.queue_table.setRowCount(len(self.queue_items))
-
-            for row, item in enumerate(self.queue_items):
-                values = self.formal_row_values(
-                    item,
-                    row + 1,
-                )
-
-                for column, value in enumerate(values):
-                    table_item = QtWidgets.QTableWidgetItem(value)
-
-                    self.apply_table_item_alignment(
-                        table_item,
-                        FORMAL_COLUMNS[column],
-                    )
-
-                    self.queue_table.setItem(
-                        row,
-                        column,
-                        table_item,
-                    )
-
-        finally:
-            self.queue_table.blockSignals(False)
+        self.sync_table_rows(
+            self.queue_table,
+            self.queue_items,
+            FORMAL_COLUMNS,
+            self.formal_row_values,
+        )
         self.ensure_formal_columns_initialized()
         self.refresh_summaries()
 
@@ -787,9 +1497,14 @@ class QueueManagerDialog(QtWidgets.QDialog):
         if not updated_item_ids:
             return
         self.queue_table.blockSignals(True)
+        self.queue_table.setUpdatesEnabled(False)
         try:
-            for row, item in enumerate(self.queue_items):
+            row_by_key = self.table_row_key_map(self.queue_table)
+            for item in self.queue_items:
                 if item.item_id not in updated_item_ids:
+                    continue
+                row = row_by_key.get(item.item_id)
+                if row is None:
                     continue
                 updates = {
                     7: self.format_runtime_memory(item.rss_bytes),
@@ -797,14 +1512,18 @@ class QueueManagerDialog(QtWidgets.QDialog):
                     9: item.message,
                 }
                 for column, value in updates.items():
-                    table_item = self.queue_table.item(row, column)
-                    if table_item is None:
-                        table_item = QtWidgets.QTableWidgetItem()
-                        self.apply_table_item_alignment(table_item, FORMAL_COLUMNS[column])
-                        self.queue_table.setItem(row, column, table_item)
-                    table_item.setText(value)
+                    self.update_table_cell(
+                        self.queue_table,
+                        row,
+                        column,
+                        value,
+                        FORMAL_COLUMNS[column],
+                        item.item_id,
+                    )
         finally:
+            self.queue_table.setUpdatesEnabled(True)
             self.queue_table.blockSignals(False)
+        self.queue_table.viewport().update()
         self.refresh_summaries()
 
     def refresh_summaries(self) -> None:
@@ -830,10 +1549,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
             return
 
-        counts: dict[str, int] = {}
-
-        for item in self.queue_items:
-            counts[item.status] = counts.get(item.status, 0) + 1
+        counts = queue_status_counts(self.queue_items)
 
         if counts.get(STATUS_RUNNING, 0) > 0:
             short_status = "状态：运行中"
@@ -844,10 +1560,10 @@ class QueueManagerDialog(QtWidgets.QDialog):
         elif counts.get(STATUS_STARTING, 0) > 0:
             short_status = "状态：正在启动"
 
-        elif counts.get(STATUS_PENDING, 0) > 0:
+        elif counts.get(STATUS_PENDING_RUN, 0) > 0:
             short_status = "状态：存在待运行作业"
 
-        elif counts.get(STATUS_WAITING, 0) > 0:
+        elif counts.get(STATUS_WAITING_DEPENDENCY, 0) > 0:
             short_status = "状态：等待前置作业"
 
         elif counts.get(STATUS_CONFIRMING, 0) > 0:
@@ -950,7 +1666,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
     def work_dir_from_queue(self) -> str:
         for item in self.queue_items:
-            path = item.external_work_dir or os.path.dirname(item.inp_path)
+            path = effective_queue_item_work_dir(item)
             if path and os.path.isdir(path):
                 return path
         return ""

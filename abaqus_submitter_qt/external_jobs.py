@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import os
 
+from .constants import ACTIVE_STATUSES, STATUS_UNKNOWN
 from .models import QueueItem
 from .process_scanner import scan_running_abaqus_jobs_by_psutil
 from .qt_compat import QtCore, Signal
-from .queue_scheduler import managed_active_statuses, managed_job_key
+from .queue_scheduler import (
+    effective_queue_item_work_dir,
+    managed_job_key,
+    normalize_work_dir,
+    queue_item_conflict_key,
+)
 
 
 class ExternalJobScanWorker(QtCore.QObject):
@@ -38,15 +44,15 @@ def collect_known_external_jobs(
     queue_items: list[QueueItem],
     work_dir: str,
 ) -> list[dict]:
-    normalized_work_dir = os.path.normcase(os.path.abspath(work_dir))
+    normalized_work_dir = normalize_work_dir(work_dir)
     jobs = []
     for item in queue_items:
         if not item.is_external:
             continue
-        item_work_dir = item.external_work_dir or os.path.dirname(item.inp_path)
+        item_work_dir = effective_queue_item_work_dir(item)
         if not item_work_dir:
             continue
-        if os.path.normcase(os.path.abspath(item_work_dir)) != normalized_work_dir:
+        if normalize_work_dir(item_work_dir) != normalized_work_dir:
             continue
         jobs.append(
             {
@@ -64,15 +70,10 @@ def build_queue_item_index(
 ) -> dict[tuple[str, str], QueueItem]:
     index = {}
     for item in queue_items:
-        work_dir = item.external_work_dir or item.calculation_work_dir or os.path.dirname(item.inp_path)
-        if not work_dir:
+        key = queue_item_conflict_key(item)
+        if not key[0]:
             continue
-        index[
-            managed_job_key(
-                work_dir,
-                item.job_name,
-            )
-        ] = item
+        index[key] = item
     return index
 
 
@@ -102,7 +103,7 @@ def merge_external_scan_results(
             job_name,
         )
         matched = queue_item_by_key.get(key)
-        runtime_status = job.get("runtime_status") or "状态未知"
+        runtime_status = job.get("runtime_status") or STATUS_UNKNOWN
         runtime_message = job.get("runtime_message") or "外部作业状态待确认"
 
         if job.get("status_only_update"):
@@ -122,7 +123,7 @@ def merge_external_scan_results(
                         "work_dir": job_work_dir,
                     }
                 )
-                if matched.status in managed_active_statuses():
+                if matched.status in ACTIVE_STATUSES:
                     active_external_items.append(matched)
                 debug_records.append(
                     {
@@ -153,6 +154,7 @@ def merge_external_scan_results(
                 job_type=job.get("job_type", "Abaqus"),
                 is_external=True,
                 external_work_dir=job_work_dir,
+                effective_work_dir=job_work_dir,
                 pids=job.get("pids", []),
                 pid_create_times=job.get("pid_create_times", {}),
                 rss_bytes=int(job.get("rss_bytes") or 0),
@@ -167,6 +169,8 @@ def merge_external_scan_results(
             matched.rss_bytes = int(job.get("rss_bytes") or matched.rss_bytes or 0)
             matched.status = runtime_status
             matched.message = runtime_message
+            matched.external_work_dir = job_work_dir
+            matched.effective_work_dir = job_work_dir
             target_item = matched
             updated += 1
 
@@ -180,7 +184,7 @@ def merge_external_scan_results(
                     "work_dir": job_work_dir,
                 }
             )
-            if target_item.status in managed_active_statuses():
+            if target_item.status in ACTIVE_STATUSES:
                 active_external_items.append(target_item)
 
         debug_records.append(

@@ -11,10 +11,55 @@ except ImportError:
 
 from .abaqus_diagnostics import inspect_job_files
 from .constants import *
+from .qt_compat import hang_probe_log
+from .queue_scheduler import normalize_work_dir
 
 
 abaqus_memory_cache = {"timestamp": 0.0, "usage": {}}
-process_snapshot_cache = {"timestamp": 0.0, "rows": [], "include_details": False}
+process_snapshot_cache = {
+    False: {"timestamp": 0.0, "rows": []},
+    True: {"timestamp": 0.0, "rows": []},
+}
+
+DETAIL_PROCESS_EXACT_NAMES = {
+    "abaqus",
+    "abq",
+    "standard",
+    "explicit",
+    "package",
+    "packager",
+    "pre",
+    "smalauncher",
+    "smapython",
+    "smasimutility",
+    "eqsequationsolver",
+}
+DETAIL_PROCESS_PREFIXES = (
+    "standard",
+    "explicit",
+    "sma",
+)
+GENERIC_PROCESS_NAMES_REQUIRING_CMDLINE = {
+    "cmd",
+    "python",
+    "pythonw",
+    "powershell",
+    "pwsh",
+    "smapython",
+}
+ABAQUS_COMMAND_LINE_MARKERS = (
+    "abaqus",
+    "job=",
+    "oldjob=",
+    "input=",
+    "run standard",
+    "run explicit",
+    "standard.exe",
+    "explicit.exe",
+    "datacheck",
+    "interactive",
+    "simulia",
+)
 
 
 def normalize_joblist_path(path):
@@ -62,14 +107,6 @@ def find_process_abaqus_job_name(process_row, process_by_pid):
     return ""
 
 
-def normalize_work_dir(path):
-    """Normalize a work directory for Windows-safe comparisons."""
-    if not path:
-        return ""
-
-    return os.path.normcase(os.path.abspath(os.path.normpath(path)))
-
-
 def join_process_command_line(cmdline):
     """Return a readable command line from psutil cmdline data."""
     if isinstance(cmdline, (list, tuple)):
@@ -91,6 +128,29 @@ def is_abaqus_process_name(process_name):
         return True
 
     return any(marker in stem for marker in ABAQUS_PROCESS_SUBSTRINGS)
+
+
+def is_detail_candidate_name(process_name):
+    """Return True when a process name deserves expensive psutil details."""
+    stem = normalize_process_name(process_name)
+    if not stem:
+        return False
+    if stem in DETAIL_PROCESS_EXACT_NAMES:
+        return True
+    if stem in GENERIC_PROCESS_NAMES_REQUIRING_CMDLINE:
+        return False
+    return any(stem.startswith(prefix) for prefix in DETAIL_PROCESS_PREFIXES)
+
+
+def is_generic_detail_candidate_name(process_name):
+    """Return True for common launchers that need cmdline confirmation."""
+    return normalize_process_name(process_name) in GENERIC_PROCESS_NAMES_REQUIRING_CMDLINE
+
+
+def is_abaqus_command_line(command_line):
+    """Return True when a generic launcher command line looks Abaqus-related."""
+    text = str(command_line or "").lower()
+    return any(marker in text for marker in ABAQUS_COMMAND_LINE_MARKERS)
 
 
 def normalize_process_name(name: str) -> str:
@@ -381,27 +441,40 @@ def log_performance(message):
 
 def get_psutil_process_snapshot(force=False, include_details=False):
     """Return a cached psutil process snapshot with optional Abaqus-only details."""
+    probe_start = time.monotonic()
     if psutil is None:
         return []
 
     now = time.monotonic()
-    cache_has_details = bool(process_snapshot_cache.get("include_details"))
+    cache_key = bool(include_details)
+    cache_entry = process_snapshot_cache[cache_key]
     cache_valid = (
         not force
-        and now - process_snapshot_cache.get("timestamp", 0.0) < PROCESS_SNAPSHOT_CACHE_SECONDS
-        and (cache_has_details or not include_details)
+        and now - cache_entry.get("timestamp", 0.0) < PROCESS_SNAPSHOT_CACHE_SECONDS
     )
     if cache_valid:
         log_performance(
-            f"process snapshot cache hit; rows={len(process_snapshot_cache['rows'])}; details={cache_has_details}"
+            f"process snapshot cache hit; rows={len(cache_entry['rows'])}; details={cache_key}"
         )
-        return process_snapshot_cache["rows"]
+        rows = cache_entry["rows"]
+        hang_probe_log(
+            "get_psutil_process_snapshot",
+            time.monotonic() - probe_start,
+            threshold=0.2,
+            rows=len(rows),
+            include_details=include_details,
+            cache_hit=True,
+            ttl=PROCESS_SNAPSHOT_CACHE_SECONDS,
+        )
+        return rows
 
     started_at = time.perf_counter()
     rows = []
     rows_by_pid = {}
     process_by_pid = {}
     detail_pids = set()
+    candidate_pids = set()
+    cmdline_checked = 0
 
     for process in psutil.process_iter(["pid", "ppid", "name"]):
         try:
@@ -434,10 +507,26 @@ def get_psutil_process_snapshot(force=False, include_details=False):
             children_by_parent.setdefault(parent_pid, []).append(pid)
 
     for row in rows:
-        if not is_abaqus_process_name(row.get("Name") or ""):
+        process_name = row.get("Name") or ""
+        is_generic_candidate = is_generic_detail_candidate_name(process_name)
+        if not is_detail_candidate_name(process_name) and not is_generic_candidate:
             continue
 
         current_pid = int(row.get("ProcessId") or 0)
+        if is_generic_candidate:
+            process = process_by_pid.get(current_pid)
+            if process is None:
+                continue
+            try:
+                command_line = join_process_command_line(process.cmdline())
+                cmdline_checked += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+                command_line = ""
+            if not is_abaqus_command_line(command_line):
+                continue
+            row["CommandLine"] = command_line
+
+        candidate_pids.add(current_pid)
         visited = set()
         while current_pid and current_pid in rows_by_pid and current_pid not in visited:
             visited.add(current_pid)
@@ -446,7 +535,7 @@ def get_psutil_process_snapshot(force=False, include_details=False):
 
     # Include descendants of Abaqus launchers/solvers, so helper processes that
     # do not have Abaqus-looking names still contribute to memory totals.
-    pending_parent_pids = list(detail_pids)
+    pending_parent_pids = list(candidate_pids)
     while pending_parent_pids:
         parent_pid = pending_parent_pids.pop()
         for child_pid in children_by_parent.get(parent_pid, ()):
@@ -456,19 +545,28 @@ def get_psutil_process_snapshot(force=False, include_details=False):
             pending_parent_pids.append(child_pid)
 
     if not include_details:
-        process_snapshot_cache.update(
-            {
-                "timestamp": now,
-                "rows": rows,
-                "include_details": False,
-            }
+        process_snapshot_cache[False].update(
+            {"timestamp": now, "rows": rows}
         )
         log_performance(
             f"process snapshot light; rows={len(rows)}; abaqus_pids={len(detail_pids)}; "
-            f"elapsed={(time.perf_counter() - started_at) * 1000:.1f} ms"
+            f"cmdline_checked={cmdline_checked}; elapsed={(time.perf_counter() - started_at) * 1000:.1f} ms"
+        )
+        hang_probe_log(
+            "get_psutil_process_snapshot",
+            time.monotonic() - probe_start,
+            threshold=0.2,
+            rows=len(rows),
+            include_details=include_details,
+            cache_hit=False,
+            abaqus_pids=len(detail_pids),
+            detail_checked=0,
+            cmdline_checked=cmdline_checked,
+            ttl=PROCESS_SNAPSHOT_CACHE_SECONDS,
         )
         return rows
 
+    detail_checked = 0
     for pid in detail_pids:
         process = process_by_pid.get(pid)
         if process is None:
@@ -476,6 +574,7 @@ def get_psutil_process_snapshot(force=False, include_details=False):
         row = rows_by_pid.get(pid)
         if row is None:
             continue
+        detail_checked += 1
         try:
             memory_info = process.memory_info()
             row["WorkingSetSize"] = getattr(memory_info, "rss", 0)
@@ -495,18 +594,199 @@ def get_psutil_process_snapshot(force=False, include_details=False):
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
             row["Cwd"] = ""
 
-    process_snapshot_cache.update(
-        {
-            "timestamp": now,
-            "rows": rows,
-            "include_details": include_details,
-        }
+    process_snapshot_cache[True].update(
+        {"timestamp": now, "rows": rows}
     )
     log_performance(
         f"process snapshot full; rows={len(rows)}; abaqus_pids={len(detail_pids)}; "
+        f"detail_checked={detail_checked}; cmdline_checked={cmdline_checked}; "
         f"elapsed={(time.perf_counter() - started_at) * 1000:.1f} ms"
     )
+    hang_probe_log(
+        "get_psutil_process_snapshot",
+        time.monotonic() - probe_start,
+        threshold=0.2,
+            rows=len(rows),
+            include_details=include_details,
+            cache_hit=False,
+            abaqus_pids=len(detail_pids),
+            detail_checked=detail_checked,
+            cmdline_checked=cmdline_checked,
+            ttl=PROCESS_SNAPSHOT_CACHE_SECONDS,
+        )
     return rows
+
+
+def get_runtime_process_evidence(
+    work_dir: str,
+    job_name: str,
+    *,
+    process_rows: list[dict] | None = None,
+    snapshot_available: bool = True,
+    known_solver_pids: tuple[int, ...] | list[int] | set[int] = (),
+) -> dict:
+    """Return high-confidence solver processes for one internal job."""
+    probe_start = time.monotonic()
+    normalized_work_dir = normalize_work_dir(work_dir)
+    normalized_job_name = str(job_name or "").strip().lower()
+    if not normalized_work_dir or not normalized_job_name:
+        result = {
+            "active": False,
+            "confidence": "",
+            "pids": (),
+            "solver_kind": "",
+            "known_pid_active": False,
+            "fallback_match_used": False,
+        }
+        hang_probe_log(
+            "get_runtime_process_evidence",
+            time.monotonic() - probe_start,
+            threshold=0.2,
+            job_name=job_name,
+            active=False,
+            reason="missing_key",
+        )
+        return result
+
+    if not snapshot_available:
+        result = {
+            "active": True,
+            "confidence": "snapshot_pending",
+            "pids": (),
+            "solver_kind": "",
+            "known_pid_active": False,
+            "fallback_match_used": False,
+        }
+        hang_probe_log(
+            "get_runtime_process_evidence",
+            time.monotonic() - probe_start,
+            threshold=0.2,
+            job_name=job_name,
+            active=True,
+            reason="snapshot_pending",
+        )
+        return result
+
+    rows = process_rows if process_rows is not None else get_psutil_process_snapshot(force=False, include_details=True)
+    process_by_pid = {}
+    for row in rows:
+        try:
+            process_by_pid[int(row.get("ProcessId") or 0)] = row
+        except (TypeError, ValueError):
+            continue
+
+    known_active_pids = []
+    known_solver_kinds = set()
+    for pid in known_solver_pids or ():
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        row = process_by_pid.get(pid)
+        if row is None:
+            continue
+        process_name = row.get("Name") or ""
+        command_line = row.get("CommandLine") or ""
+        if not is_active_solver_process(process_name, command_line):
+            continue
+        chain = get_process_and_parent_chain(row, process_by_pid)
+        chain_job_name = get_first_chain_parameter(chain, "job")
+        if not chain_job_name:
+            input_value = get_first_chain_parameter(chain, "input")
+            chain_job_name = os.path.splitext(os.path.basename(input_value))[0] if input_value else ""
+        if str(chain_job_name or "").strip().lower() != normalized_job_name:
+            continue
+        if not get_chain_work_dir(chain, work_dir):
+            continue
+        known_active_pids.append(pid)
+        chain_text = " ".join(
+            f"{item.get('Name', '')} {item.get('CommandLine', '')}"
+            for item in chain
+        ).lower()
+        if "explicit" in chain_text:
+            known_solver_kinds.add("explicit")
+        elif "standard" in chain_text:
+            known_solver_kinds.add("standard")
+
+    if known_active_pids:
+        solver_kind = ""
+        if len(known_solver_kinds) == 1:
+            solver_kind = next(iter(known_solver_kinds))
+        result = {
+            "active": True,
+            "confidence": "high",
+            "pids": tuple(sorted(set(known_active_pids))),
+            "solver_kind": solver_kind,
+            "known_pid_active": True,
+            "fallback_match_used": False,
+        }
+        hang_probe_log(
+            "get_runtime_process_evidence",
+            time.monotonic() - probe_start,
+            threshold=0.2,
+            job_name=job_name,
+            active=True,
+            pids=len(result["pids"]),
+            known_solver_pids=len(tuple(known_solver_pids or ())),
+            known_pid_active=True,
+            fallback_match_used=False,
+        )
+        return result
+
+    matched_pids = []
+    solver_kinds = set()
+    for row in rows:
+        process_name = row.get("Name") or ""
+        command_line = row.get("CommandLine") or ""
+        if not is_active_solver_process(process_name, command_line):
+            continue
+
+        chain = get_process_and_parent_chain(row, process_by_pid)
+        chain_job_name = get_first_chain_parameter(chain, "job")
+        if not chain_job_name:
+            input_value = get_first_chain_parameter(chain, "input")
+            chain_job_name = os.path.splitext(os.path.basename(input_value))[0] if input_value else ""
+        if str(chain_job_name or "").strip().lower() != normalized_job_name:
+            continue
+        if not get_chain_work_dir(chain, work_dir):
+            continue
+
+        try:
+            matched_pids.append(int(row.get("ProcessId") or 0))
+        except (TypeError, ValueError):
+            continue
+        chain_text = " ".join(
+            f"{item.get('Name', '')} {item.get('CommandLine', '')}"
+            for item in chain
+        ).lower()
+        if "explicit" in chain_text:
+            solver_kinds.add("explicit")
+        elif "standard" in chain_text:
+            solver_kinds.add("standard")
+
+    solver_kind = ""
+    if len(solver_kinds) == 1:
+        solver_kind = next(iter(solver_kinds))
+    result = {
+        "active": bool(matched_pids),
+        "confidence": "high" if matched_pids else "",
+        "pids": tuple(sorted(set(matched_pids))),
+        "solver_kind": solver_kind,
+        "known_pid_active": False,
+        "fallback_match_used": bool(known_solver_pids),
+    }
+    hang_probe_log(
+        "get_runtime_process_evidence",
+        time.monotonic() - probe_start,
+        threshold=0.2,
+        job_name=job_name,
+        active=result["active"],
+        pids=len(result["pids"]),
+        known_solver_pids=len(tuple(known_solver_pids or ())),
+        known_pid_active=False,
+        fallback_match_used=bool(known_solver_pids),
+    )
+    return result
 
 
 def fetch_psutil_process_rows_for_external_scan(force=True):
@@ -837,6 +1117,7 @@ __all__ = [
     "classify_external_job_runtime",
     "log_performance",
     "get_psutil_process_snapshot",
+    "get_runtime_process_evidence",
     "fetch_psutil_process_rows_for_external_scan",
     "scan_running_abaqus_jobs_by_psutil",
     "fetch_psutil_process_rows",

@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-from .constants import DEFAULT_CPUS, MAX_CPUS
+from .constants import DEFAULT_CPUS, JOB_NAME_PATTERN, MAX_CPUS, STATUS_STARTING
 from .models import QueueItem
 
 
@@ -45,12 +45,24 @@ def derive_oldjob_name(oldjob_path: str) -> str:
     return oldjob_path.strip()
 
 
+def inp_has_restart_keyword(inp_file: str) -> bool:
+    """Return whether the INP header contains a Restart keyword."""
+    if not inp_file:
+        return False
+    try:
+        with open(inp_file, "r", encoding="gbk", errors="ignore") as stream:
+            head = stream.read(32768)
+    except OSError:
+        return False
+    return "*restart" in head.lower()
+
+
 def validate_job_name(job_name: str) -> tuple[bool, str]:
     """Validate an Abaqus job name."""
     if not job_name:
         return False, "作业名称不能为空。"
-    if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_\-]*", job_name):
-        return False, "作业名称只能包含字母、数字、下划线或短横线，且不能以短横线开头。"
+    if not JOB_NAME_PATTERN.fullmatch(job_name):
+        return False, "作业名称只能以英文字母、数字或下划线开头，并且只能包含英文字母、数字、下划线或短横线。"
     return True, ""
 
 
@@ -129,13 +141,13 @@ def validate_options(options: SubmitOptions) -> tuple[bool, str]:
 
     ok, message = validate_job_name(options.job_name)
     if not ok:
-        return False, message
+        return False, f"作业名不合法：{options.job_name or '空'}（{message}）"
 
     oldjob_name = derive_oldjob_name(options.oldjob_path)
     if oldjob_name:
         ok, message = validate_job_name(oldjob_name)
         if not ok:
-            return False, f"重启动作业名称无效：{message}"
+            return False, f"Restart 依赖作业名不合法：{oldjob_name}（{message}）"
         if oldjob_name == options.job_name:
             return False, "当前作业名称不能与 oldjob 名称相同。"
 
@@ -195,7 +207,7 @@ def build_direct_submit_queue_item(
         source_inp_path=options.inp_file,
         job_name=options.job_name,
         source="direct_submit",
-        status="启动中",
+        status=STATUS_STARTING,
         selected=False,
         valid=True,
         message="正在提交",
@@ -209,4 +221,5 @@ def build_direct_submit_queue_item(
         datacheck_only=options.datacheck,
         complete_notify=notify,
         is_external=False,
+        effective_work_dir=str(Path(options.inp_file).parent),
     )

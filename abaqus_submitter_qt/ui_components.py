@@ -3,6 +3,7 @@
 import os
 import time
 import unicodedata
+from collections.abc import Mapping
 
 from .qt_compat import QtWidgets, Signal
 
@@ -67,6 +68,51 @@ def format_abaqus_stage(run: dict) -> str:
     if run.get("pre_started"):
         return "Pre"
     return ""
+
+
+def build_job_display_label(
+    job_name: str,
+    work_dir: str,
+    duplicated: bool,
+) -> str:
+    """Build a UI-only job label without changing the real Abaqus job name."""
+    job_name = str(job_name or "").strip()
+    if not duplicated:
+        return job_name
+
+    work_dir = str(work_dir or "").strip()
+    context = work_dir or "外部作业"
+    return f"{job_name}  [{context}]"
+
+
+def duplicated_runtime_job_names(runs: Mapping[str, Mapping[str, object]]) -> set[str]:
+    counts: dict[str, int] = {}
+    for run in runs.values():
+        job_name = str(run.get("job_name", "") or "").strip().lower()
+        if not job_name:
+            continue
+        counts[job_name] = counts.get(job_name, 0) + 1
+    return {job_name for job_name, count in counts.items() if count > 1}
+
+
+def runtime_job_display_label(
+    runs: Mapping[str, Mapping[str, object]],
+    job_key: str,
+    *,
+    duplicate_job_names: set[str] | None = None,
+) -> str:
+    run = runs.get(job_key)
+    if run is None:
+        return job_key
+    job_name = str(run.get("job_name", "") or job_key)
+    work_dir = str(run.get("work_dir", "") or "")
+    if duplicate_job_names is None:
+        duplicate_job_names = duplicated_runtime_job_names(runs)
+    return build_job_display_label(
+        job_name,
+        work_dir,
+        job_name.lower() in duplicate_job_names,
+    )
 
 
 def safe_int(value, default: int = 0) -> int:

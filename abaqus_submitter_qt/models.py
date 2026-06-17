@@ -1,4 +1,3 @@
-import ctypes
 from dataclasses import dataclass, field
 from uuid import uuid4
 
@@ -26,7 +25,8 @@ class QueueItem:
     datacheck_only: bool = False
     complete_notify: bool = False
     source_inp_path: str = ""
-    calculation_work_dir: str = ""
+    calculation_root_dir: str = ""
+    effective_work_dir: str = ""
     archive_dir: str = ""
     archive_after_complete: bool = False
     cleanup_after_archive: bool = False
@@ -42,20 +42,4 @@ class QueueItem:
     rss_bytes: int = 0
 
 
-class MemoryStatusEx(ctypes.Structure):
-    """Windows GlobalMemoryStatusEx structure reused across queue checks."""
-
-    _fields_ = [
-        ("dwLength", ctypes.c_ulong),
-        ("dwMemoryLoad", ctypes.c_ulong),
-        ("ullTotalPhys", ctypes.c_ulonglong),
-        ("ullAvailPhys", ctypes.c_ulonglong),
-        ("ullTotalPageFile", ctypes.c_ulonglong),
-        ("ullAvailPageFile", ctypes.c_ulonglong),
-        ("ullTotalVirtual", ctypes.c_ulonglong),
-        ("ullAvailVirtual", ctypes.c_ulonglong),
-        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-    ]
-
-
-__all__ = ["QueueItem", "MemoryStatusEx"]
+__all__ = ["QueueItem"]

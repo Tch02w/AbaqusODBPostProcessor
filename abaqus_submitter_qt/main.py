@@ -71,7 +71,7 @@ from .external_jobs import (
 )
 from .job_controller import JobController
 from .job_runtime import JobRuntimeController
-from .qt_compat import QtCore, QtGui, QtWidgets, hang_probe_function
+from .qt_compat import QtCore, QtGui, QtWidgets, Signal, hang_probe_function
 from .queue_manager import QueueManagerDialog
 from .queue_scheduler import (
     find_queue_item_by_key as scheduler_find_queue_item_by_key,
@@ -111,6 +111,35 @@ ENABLE_EXTERNAL_SCAN_DEBUG_LOG = False
 QUEUE_DISPATCH_DEBOUNCE_MS = 50
 
 
+class AbaqusPathCheckWorker(QtCore.QObject):
+    finished = Signal(str)
+
+    def run(self) -> None:
+        self.finished.emit(shutil.which("abaqus") or "")
+
+
+class ArrowComboBox(QtWidgets.QComboBox):
+    """Combo box with a painted arrow that does not depend on theme assets."""
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        super().paintEvent(event)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(QtGui.QColor("#475569"))
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        center_x = self.width() - 13
+        center_y = self.height() // 2 + 1
+        painter.drawPolygon(
+            QtGui.QPolygon(
+                [
+                    QtCore.QPoint(center_x - 4, center_y - 2),
+                    QtCore.QPoint(center_x + 4, center_y - 2),
+                    QtCore.QPoint(center_x, center_y + 3),
+                ]
+            )
+        )
+
+
 class MainWindow(QtWidgets.QMainWindow):
     """Qt version of the main submitter layout."""
 
@@ -143,6 +172,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.external_scan_worker: ExternalJobScanWorker | None = None
         self.external_scan_dialog: QueueManagerDialog | None = None
         self.external_scan_message_box: QtWidgets.QMessageBox | None = None
+        self.abaqus_status_thread: QtCore.QThread | None = None
+        self.abaqus_status_worker: AbaqusPathCheckWorker | None = None
         self.job_notification_boxes: list[QtWidgets.QMessageBox] = []
         self.deferred_archive_runs: dict[str, dict] = {}
         self.latest_memory_usage_by_job: dict = {}
@@ -201,12 +232,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.build_ui()
         self.apply_styles()
 
-        QtCore.QTimer.singleShot(
-            0,
-            self.apply_runtime_panel_width_baseline,
-        )
-
-        self.update_abaqus_status()
+        QtCore.QTimer.singleShot(250, self.start_abaqus_status_check)
         self.update_command_preview()
         self.append_history("等待提交作业...")
 
@@ -214,10 +240,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def on_ui_heartbeat(self) -> None:
         now = time.monotonic()
-        elapsed = now - self._ui_heartbeat_last
         self._ui_heartbeat_last = now
-        if elapsed > 3.0:
-            print(f"[UI-BLOCK] Qt event loop blocked for {elapsed:.2f}s", flush=True)
 
     def build_ui(self) -> None:
         central = QtWidgets.QWidget()
@@ -279,7 +302,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cpus_spin.setValue(DEFAULT_CPUS)
         self.cpus_spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.cpus_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.cpus_spin.setFixedSize(52, 28)
+        self.cpus_spin.setFixedSize(52, 30)
         settings.addWidget(self.cpus_spin)
         max_label = QtWidgets.QLabel(f"最大 {MAX_CPUS}")
         max_label.setObjectName("hint")
@@ -287,12 +310,15 @@ class MainWindow(QtWidgets.QMainWindow):
         settings.addStretch(1)
         settings.addWidget(QtWidgets.QLabel("Mem"))
         self.memory_value = QtWidgets.QLineEdit()
+        self.memory_value.setObjectName("submitParamEdit")
         self.memory_value.setText("90")
         self.memory_value.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.memory_value.setFixedSize(52, 28)
-        self.memory_unit = QtWidgets.QComboBox()
+        self.memory_value.setFixedSize(52, 30)
+        self.memory_unit = ArrowComboBox()
+        self.memory_unit.setObjectName("submitParamCombo")
         self.memory_unit.addItems(MEMORY_OPTIONS)
-        self.memory_unit.setFixedSize(56, 28)
+        self.memory_unit.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.memory_unit.setFixedSize(72, 30)
         settings.addWidget(self.memory_value)
         settings.addWidget(self.memory_unit)
         card_layout.addLayout(settings)
@@ -348,16 +374,18 @@ class MainWindow(QtWidgets.QMainWindow):
             queue_row.setColumnStretch(column, 1)
         queue_controls = QtWidgets.QHBoxLayout()
         queue_controls.setSpacing(8)
-        queue_controls.addWidget(QtWidgets.QLabel("队列最大并行"))
+        queue_parallel_label = QtWidgets.QLabel("并行上限")
+        queue_parallel_label.setObjectName("hint")
+        queue_controls.addWidget(queue_parallel_label)
         self.max_parallel_spin = QtWidgets.QSpinBox()
+        self.max_parallel_spin.setObjectName("queueMaxParallelSpin")
         self.max_parallel_spin.setRange(1, 999)
         self.max_parallel_spin.setValue(calculate_default_joblist_parallel(DEFAULT_CPUS))
         self.max_parallel_spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.max_parallel_spin.setFixedSize(52, 28)
+        self.max_parallel_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.max_parallel_spin.setFixedSize(64, 30)
+        self.max_parallel_spin.setToolTip("队列中允许同时运行的最大作业数")
         queue_controls.addWidget(self.max_parallel_spin)
-        hint = QtWidgets.QLabel("达到上限后暂停补位")
-        hint.setObjectName("hint")
-        queue_controls.addWidget(hint)
         queue_controls.addStretch(1)
         queue_row.addLayout(queue_controls, 0, 0, 1, 3)
         self.stop_queue_btn = QtWidgets.QPushButton("终止队列")
@@ -424,7 +452,7 @@ class MainWindow(QtWidgets.QMainWindow):
         selector_row.setContentsMargins(
             0,
             0,
-            0,
+            8,
             0,
         )
 
@@ -432,15 +460,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         selector_row.addWidget(QtWidgets.QLabel("Job"))
 
-        self.job_selector = QtWidgets.QComboBox()
+        self.job_selector = ArrowComboBox()
 
         self.job_selector.setObjectName("runtimeSelector")
 
-        self.job_selector.setMinimumWidth(220)
+        self.job_selector.setMinimumWidth(180)
 
-        self.job_selector.setMaximumWidth(340)
+        self.job_selector.setMaximumWidth(280)
 
         self.job_selector.setFixedHeight(30)
+        self.job_selector.setToolTip("点击展开切换作业；颜色表示作业状态")
 
         self.job_selector.currentIndexChanged.connect(self.on_job_selector_changed)
 
@@ -838,7 +867,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         dialog = QueueManagerDialog(
-            self,
+            None,
             self.queue_items,
             self.current_queue_settings(),
             self.inp_row.text(),
@@ -1119,19 +1148,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.external_scan_dialog = None
 
     def start_queue(self) -> None:
-        pending_before = sum(1 for item in self.queue_items if item.status == STATUS_PENDING_RUN)
-        self.append_history(
-            "[QUEUE-START] clicked "
-            f"active={self.queue_active} "
-            f"stop={self.queue_stop_requested} "
-            f"pending={pending_before}"
-        )
         if self.queue_active:
-            self.append_history(
-                "[QUEUE-START] active-already dispatch-only "
-                f"stop={self.queue_stop_requested} "
-                f"pending={pending_before}"
-            )
             self.dispatch_queue()
             return
 
@@ -1879,13 +1896,28 @@ class MainWindow(QtWidgets.QMainWindow):
             self.job_selector.clear()
 
             for job_key, run in self.run_records.items():
-                self.job_selector.addItem(
-                    ui_runtime_job_display_label(
-                        self.run_records,
-                        job_key,
-                        duplicate_job_names=duplicate_job_names,
-                    ),
+                label = ui_runtime_job_display_label(
+                    self.run_records,
                     job_key,
+                    duplicate_job_names=duplicate_job_names,
+                )
+                self.job_selector.addItem(label, job_key)
+                index = self.job_selector.count() - 1
+                background_color = self.runtime_selector_color(job_key, run)
+                self.job_selector.setItemData(
+                    index,
+                    background_color,
+                    QtCore.Qt.ItemDataRole.BackgroundRole,
+                )
+                self.job_selector.setItemData(
+                    index,
+                    QtGui.QColor("#0f172a"),
+                    QtCore.Qt.ItemDataRole.ForegroundRole,
+                )
+                self.job_selector.setItemData(
+                    index,
+                    f"{label} | {self.runtime_selector_status_text(job_key, run)}",
+                    QtCore.Qt.ItemDataRole.ToolTipRole,
                 )
 
             if current_key:
@@ -1897,7 +1929,55 @@ class MainWindow(QtWidgets.QMainWindow):
         finally:
             self.job_selector.blockSignals(False)
 
+        self.apply_runtime_selector_current_color()
         self.refresh_job_stats()
+
+    def runtime_selector_status_text(self, job_key: str, run: dict) -> str:
+        if job_key in self.active_runs:
+            return STATUS_RUNNING
+        queue_item = run.get("queue_item")
+        return str(getattr(queue_item, "status", "") or "未运行")
+
+    def runtime_selector_color(self, job_key: str, run: dict) -> QtGui.QColor:
+        status = self.runtime_selector_status_text(job_key, run)
+        if status in {STATUS_RUNNING, STATUS_STARTING}:
+            return QtGui.QColor("#dcfce7")
+        if status in {STATUS_COMPLETED, STATUS_DATACHECK_COMPLETED}:
+            return QtGui.QColor("#dbeafe")
+        if status in {STATUS_FAILED, STATUS_DATACHECK_FAILED}:
+            return QtGui.QColor("#fee2e2")
+        if status in {STATUS_TERMINATED, STATUS_TERMINATING, STATUS_CANCELED}:
+            return QtGui.QColor("#ede9fe")
+        if status == STATUS_WAITING_DEPENDENCY:
+            return QtGui.QColor("#fef3c7")
+        return QtGui.QColor("#e2e8f0")
+
+    def apply_runtime_selector_current_color(self) -> None:
+        index = self.job_selector.currentIndex()
+        background_color = (
+            self.job_selector.itemData(index, QtCore.Qt.ItemDataRole.BackgroundRole) if index >= 0 else None
+        )
+        if not isinstance(background_color, QtGui.QColor):
+            background_color = QtGui.QColor("#e2e8f0")
+        background = background_color.name()
+        self.job_selector.setStyleSheet(
+            "QComboBox#runtimeSelector {"
+            f"background: {background};"
+            "color: #0f172a;"
+            "border: 1px solid #cbd5e1;"
+            "border-radius: 4px;"
+            "min-height: 30px;"
+            "max-height: 30px;"
+            "padding: 0 24px 0 8px;"
+            "}"
+            "QComboBox#runtimeSelector::drop-down {"
+            "subcontrol-origin: border;"
+            "subcontrol-position: top right;"
+            "width: 22px;"
+            "border: 0;"
+            "margin: 1px 1px 1px 0;"
+            "}"
+        )
 
     def on_job_selector_changed(
         self,
@@ -1910,6 +1990,7 @@ class MainWindow(QtWidgets.QMainWindow):
         job_key = self.job_selector.itemData(index)
 
         if job_key:
+            self.apply_runtime_selector_current_color()
             self.select_run(str(job_key))
 
     def refresh_job_stats(
@@ -2106,6 +2187,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.job_selector.setCurrentIndex(index)
 
             self.job_selector.blockSignals(False)
+            self.apply_runtime_selector_current_color()
 
         self.refresh_selected_run_status(job_key)
 
@@ -2144,6 +2226,40 @@ class MainWindow(QtWidgets.QMainWindow):
             self.abaqus_status_label.setText("Abaqus 状态：已检测到 Abaqus")
         else:
             self.abaqus_status_label.setText("Abaqus 状态：未在 PATH 中找到")
+
+    def start_abaqus_status_check(self) -> None:
+        if self._closing or self.abaqus_status_thread is not None:
+            return
+        self.abaqus_status_label.setText("Abaqus 状态：检测中...")
+        thread = QtCore.QThread(self)
+        worker = AbaqusPathCheckWorker()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(
+            self.finish_abaqus_status_check,
+            QtCore.Qt.ConnectionType.QueuedConnection,
+        )
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.clear_abaqus_status_check_worker)
+        self.abaqus_status_thread = thread
+        self.abaqus_status_worker = worker
+        thread.start()
+
+    @QtCore.Slot(str)
+    def finish_abaqus_status_check(self, abaqus_path: str) -> None:
+        if self._closing:
+            return
+        if abaqus_path:
+            self.abaqus_status_label.setText("Abaqus 状态：已检测到 Abaqus")
+        else:
+            self.abaqus_status_label.setText("Abaqus 状态：未在 PATH 中找到")
+
+    @QtCore.Slot()
+    def clear_abaqus_status_check_worker(self) -> None:
+        self.abaqus_status_thread = None
+        self.abaqus_status_worker = None
 
     def append_history(self, text: str) -> None:
         """追加运行记录：时间戳为蓝色，正文使用默认深灰色。"""
@@ -2305,6 +2421,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._closing = True
         self._dispatch_timer.stop()
         self._ui_heartbeat_timer.stop()
+        abaqus_status_thread = self.abaqus_status_thread
+        if abaqus_status_thread is not None:
+            abaqus_status_thread.quit()
+            if abaqus_status_thread.isRunning():
+                abaqus_status_thread.wait(1500)
         self.runtime_controller.shutdown()
         self.workspace_prepare_service.shutdown()
         self._workspace_prepare_contexts.clear()

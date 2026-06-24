@@ -182,7 +182,7 @@ def queue_item_to_options(
     return SubmitOptions(
         inp_file=item.inp_path,
         job_name=item.job_name or derive_job_name(item.inp_path),
-        cpus=item.cores or default_cpus,
+        cpus=int(item.cores or 0),
         oldjob_path=item.oldjob_path,
         for_file=item.fortran_path,
         interactive=item.interactive,

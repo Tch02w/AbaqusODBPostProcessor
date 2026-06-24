@@ -60,6 +60,7 @@ ABAQUS_COMMAND_LINE_MARKERS = (
     "interactive",
     "simulia",
 )
+EXTERNAL_SCAN_MAX_CHILD_DEPTH = 2
 
 
 def normalize_joblist_path(path):
@@ -299,12 +300,39 @@ def get_first_chain_parameter(process_chain, parameter):
     return ""
 
 
-def get_chain_work_dir(process_chain, target_work_dir):
+def scan_root_child_depth(work_dir, scan_root_dir):
+    """Return depth under scan_root_dir, or None when work_dir is outside it."""
+    normalized_root = normalize_work_dir(scan_root_dir)
+    normalized_work_dir = normalize_work_dir(work_dir)
+    if not normalized_root or not normalized_work_dir:
+        return None
+    if normalized_work_dir == normalized_root:
+        return 0
+    try:
+        common = os.path.commonpath([normalized_root, normalized_work_dir])
+    except ValueError:
+        return None
+    if common != normalized_root:
+        return None
+    relative = os.path.relpath(normalized_work_dir, normalized_root)
+    if relative in {"", "."}:
+        return 0
+    if relative.startswith(".."):
+        return None
+    return len([part for part in relative.split(os.sep) if part and part != "."])
+
+
+def work_dir_matches_scan_root(work_dir, scan_root_dir, max_child_depth=0):
+    """Return True when work_dir is scan_root_dir or an allowed child directory."""
+    depth = scan_root_child_depth(work_dir, scan_root_dir)
+    return depth is not None and depth <= max(0, int(max_child_depth or 0))
+
+
+def get_chain_work_dir(process_chain, target_work_dir, max_child_depth=0):
     """Return the matching process work directory from a process chain."""
-    normalized_target = normalize_work_dir(target_work_dir)
     for row in process_chain:
         cwd = row.get("Cwd") or ""
-        if cwd and normalize_work_dir(cwd) == normalized_target:
+        if cwd and work_dir_matches_scan_root(cwd, target_work_dir, max_child_depth):
             return os.path.abspath(os.path.normpath(cwd))
 
         command_line = row.get("CommandLine") or ""
@@ -317,7 +345,7 @@ def get_chain_work_dir(process_chain, target_work_dir):
             if not os.path.isabs(command_dir) and cwd:
                 command_dir = os.path.join(cwd, command_dir)
 
-            if normalize_work_dir(command_dir) == normalized_target:
+            if work_dir_matches_scan_root(command_dir, target_work_dir, max_child_depth):
                 return os.path.abspath(os.path.normpath(command_dir))
 
     return ""
@@ -795,7 +823,7 @@ def fetch_psutil_process_rows_for_external_scan(force=True):
 
 
 def scan_running_abaqus_jobs_by_psutil(work_dir, force=True, known_external_jobs=None):
-    """Scan running Abaqus jobs in one work directory using psutil."""
+    """Scan running Abaqus jobs under one scan root using psutil process data."""
     normalized_work_dir = normalize_work_dir(work_dir)
     known_external_jobs = known_external_jobs or []
     rows = get_psutil_process_snapshot(force=force, include_details=True)
@@ -824,7 +852,11 @@ def scan_running_abaqus_jobs_by_psutil(work_dir, force=True, known_external_jobs
         if not chain or not is_possible_abaqus_process(chain):
             continue
 
-        matching_work_dir = get_chain_work_dir(chain, normalized_work_dir)
+        matching_work_dir = get_chain_work_dir(
+            chain,
+            normalized_work_dir,
+            max_child_depth=EXTERNAL_SCAN_MAX_CHILD_DEPTH,
+        )
         if not matching_work_dir:
             continue
 
@@ -852,7 +884,7 @@ def scan_running_abaqus_jobs_by_psutil(work_dir, force=True, known_external_jobs
         oldjob_path = resolve_external_job_path(oldjob_name, matching_work_dir, extension=".odb") if oldjob_name else ""
         cores = get_first_chain_parameter(chain, "cpus")
         memory_setting = get_first_chain_parameter(chain, "memory")
-        job_key = (normalized_work_dir, job_name.lower())
+        job_key = (normalize_work_dir(matching_work_dir), job_name.lower())
 
         job_info = scanned_jobs.setdefault(
             job_key,
@@ -936,9 +968,13 @@ def scan_running_abaqus_jobs_by_psutil(work_dir, force=True, known_external_jobs
     for known in known_external_jobs:
         known_job_name = known.get("job_name", "")
         known_work_dir = known.get("work_dir") or os.path.dirname(known.get("inp_path", ""))
-        if not known_job_name or normalize_work_dir(known_work_dir) != normalized_work_dir:
+        if not known_job_name or not work_dir_matches_scan_root(
+            known_work_dir,
+            normalized_work_dir,
+            EXTERNAL_SCAN_MAX_CHILD_DEPTH,
+        ):
             continue
-        known_key = (normalized_work_dir, known_job_name.lower())
+        known_key = (normalize_work_dir(known_work_dir), known_job_name.lower())
         if known_key in scanned_keys:
             continue
         diagnostics_status, diagnostics_detail = inspect_job_files(known_work_dir, known_job_name)

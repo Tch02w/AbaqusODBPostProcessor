@@ -204,8 +204,8 @@ class FilePickerRow(QtWidgets.QWidget):
         self.label = QtWidgets.QLabel(label)
         self.button = QtWidgets.QPushButton(placeholder)
         self.button.setObjectName("filePicker")
-        self.button.setFixedHeight(28)
-        self.setFixedHeight(32)
+        self.button.setFixedHeight(30)
+        self.setFixedHeight(34)
 
         layout = QtWidgets.QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)

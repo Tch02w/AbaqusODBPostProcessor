@@ -19,7 +19,7 @@ class QueueItem:
     oldjob_dir: str = ""
     oldjob_path: str = ""
     fortran_path: str = ""
-    cores: int = 1
+    cores: int = 0
     memory: str = ""
     interactive: bool = False
     datacheck_only: bool = False

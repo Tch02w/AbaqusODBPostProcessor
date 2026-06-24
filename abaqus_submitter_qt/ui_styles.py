@@ -112,15 +112,19 @@ def build_main_stylesheet() -> str:
                 background: #15803d;
             }}
             QPushButton#filePicker {{
-                background: #ffffff;
+                background: #f8fafc;
                 color: {HINT};
-                border: 1px solid #9ca3af;
-                border-radius: 0;
-                min-height: 28px;
-                max-height: 28px;
+                border: 1px solid #cbd5e1;
+                border-radius: 4px;
+                min-height: 30px;
+                max-height: 30px;
                 padding: 0 8px;
                 text-align: center;
                 font-weight: 400;
+            }}
+            QPushButton#filePicker:hover {{
+                background: #ffffff;
+                border-color: #94a3b8;
             }}
             QLineEdit {{
                 background: #ffffff;
@@ -150,6 +154,26 @@ def build_main_stylesheet() -> str:
             }}
             QSpinBox::down-button {{
                 subcontrol-position: bottom right;
+            }}
+            QSpinBox#plainSpin,
+            QLineEdit#submitParamEdit,
+            QComboBox#submitParamCombo,
+            QSpinBox#queueMaxParallelSpin {{
+                background: #f8fafc;
+                color: {TEXT};
+                border: 1px solid #cbd5e1;
+                border-radius: 4px;
+                min-height: 30px;
+                max-height: 30px;
+                padding: 0 8px;
+                font-weight: 500;
+            }}
+            QComboBox#submitParamCombo {{
+                padding: 0 22px 0 8px;
+            }}
+            QComboBox#submitParamCombo::drop-down {{
+                width: 18px;
+                border: 0;
             }}
             QComboBox {{
                 background: #ffffff;

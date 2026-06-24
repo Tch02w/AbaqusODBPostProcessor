@@ -29,6 +29,9 @@ except ImportError as pyside_error:  # pragma: no cover - depends on environment
         ) from pyqt_error
 
 
+ENABLE_HANG_PROBE_LOGS = False
+
+
 def current_thread_name() -> str:
     qt_thread = QtCore.QThread.currentThread()
     qt_name = qt_thread.objectName() if qt_thread is not None else ""
@@ -42,6 +45,8 @@ def is_gui_thread() -> bool:
 
 
 def hang_probe_log(label: str, elapsed: float | None = None, threshold: float = 0.2, **fields) -> None:
+    if not ENABLE_HANG_PROBE_LOGS:
+        return
     if elapsed is not None and elapsed < threshold:
         return
     parts = [f"[HANG-PROBE] {label}"]

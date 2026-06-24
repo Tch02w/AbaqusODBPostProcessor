@@ -66,6 +66,12 @@ FORMAL_COLUMNS = (
 )
 
 
+FORMAL_RESTART_COLUMN = 4
+FORMAL_FORTRAN_COLUMN = 5
+FORMAL_CORE_COLUMN = 6
+FORMAL_MEMORY_COLUMN = 7
+
+
 def atomic_write_json(path, payload):
     """Atomically write JSON so joblist.json is never half-written."""
     temp_path = path + ".tmp"
@@ -123,6 +129,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
     def __init__(self, parent, queue_items: list[QueueItem], current_settings, current_inp=""):
         super().__init__(parent)
+        self.setWindowFlag(QtCore.Qt.WindowType.Window, True)
         self.setWindowTitle("作业队列管理")
         self.resize(1280, 752)
         self.queue_items = queue_items
@@ -130,6 +137,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.current_inp = current_inp
         self.candidates: list[QueueItem] = []
         self.saved_paths = self.load_saved_paths()
+        self.last_oldjob_odb_dir = str(self.saved_paths.get("qt_oldjob_odb_dir", "") or "")
         self.external_scan_busy = False
         self.folder_scan_thread: QtCore.QThread | None = None
         self.folder_scan_worker: FolderScanWorker | None = None
@@ -242,7 +250,8 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
         self.queue_table = QtWidgets.QTableWidget(0, len(FORMAL_COLUMNS))
         self.setup_table(self.queue_table, FORMAL_COLUMNS)
-        self.queue_table.itemDoubleClicked.connect(lambda _item: self.edit_selected_pending())
+        self.queue_table.itemDoubleClicked.connect(self.on_queue_item_double_clicked)
+        self.queue_table.itemChanged.connect(self.on_queue_table_item_changed)
         queue_layout.addWidget(self.queue_table, 1)
         root.addWidget(queue_group, 1)
 
@@ -326,9 +335,11 @@ class QueueManagerDialog(QtWidgets.QDialog):
                 background: #b91c1c;
             }
             QLineEdit {
-                background: #ffffff;
+                background: #f8fafc;
+                color: #111827;
                 border: 1px solid #cbd5e1;
-                min-height: 28px;
+                border-radius: 4px;
+                min-height: 30px;
                 padding: 0 8px;
             }
             QTableWidget {
@@ -450,6 +461,12 @@ class QueueManagerDialog(QtWidgets.QDialog):
             table.setItem(row, column, table_item)
 
         table_item.setData(TABLE_ROW_KEY_ROLE, row_key)
+        flags = table_item.flags()
+        if table is self.queue_table and column in (FORMAL_CORE_COLUMN, FORMAL_MEMORY_COLUMN):
+            flags |= QtCore.Qt.ItemFlag.ItemIsEditable
+        else:
+            flags &= ~QtCore.Qt.ItemFlag.ItemIsEditable
+        table_item.setFlags(flags)
 
         if check_state is not None:
             flags = table_item.flags()
@@ -562,6 +579,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
         data = self.load_saved_paths()
         data["qt_ssd_work_dir"] = self.ssd_dir_edit.text().strip()
         data["qt_archive_dir"] = self.archive_dir_edit.text().strip()
+        data["qt_oldjob_odb_dir"] = self.last_oldjob_odb_dir
         try:
             atomic_write_json(str(CONFIG_PATH), data)
         except OSError as exc:
@@ -620,7 +638,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             selected=True,
             valid=True,
             message="可加入",
-            cores=self.current_settings["cores"],
+            cores=0,
             memory=self.current_settings["memory"],
             fortran_path=self.current_settings["for_file"],
             oldjob_path=self.current_settings["oldjob_path"],
@@ -944,10 +962,15 @@ class QueueManagerDialog(QtWidgets.QDialog):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "选择 Restart 前置 ODB",
-            start_dir or self.default_work_dir(),
+            start_dir or self.last_oldjob_odb_dir or self.default_work_dir(),
             "Abaqus ODB (*.odb);;所有文件 (*.*)",
         )
-        return os.path.normpath(path) if path else ""
+        if not path:
+            return ""
+        normalized = os.path.normpath(path)
+        self.last_oldjob_odb_dir = os.path.normpath(str(Path(normalized).parent))
+        self.save_saved_paths()
+        return normalized
 
     def apply_oldjob_file_to_item(self, item: QueueItem, oldjob_path: str) -> None:
         if not oldjob_path:
@@ -956,6 +979,15 @@ class QueueManagerDialog(QtWidgets.QDialog):
         item.oldjob_path = os.path.normpath(str(path))
         item.oldjob_name = path.stem
         item.oldjob_dir = os.path.normpath(str(path.parent))
+
+    def select_fortran_file(self, initial_path: str = "") -> str:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择 FOR 文件",
+            initial_path or self.default_work_dir(),
+            "Fortran (*.for *.f *.f90);;所有文件 (*.*)",
+        )
+        return os.path.normpath(path) if path else ""
 
     def choose_candidate_restart_dependency(self, row: int) -> None:
         item = self.candidates[row]
@@ -972,12 +1004,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
     def choose_candidate_fortran_file(self, row: int) -> None:
         item = self.candidates[row]
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "选择 FOR 文件",
-            item.fortran_path or self.default_work_dir(),
-            "Fortran (*.for *.f *.f90);;所有文件 (*.*)",
-        )
+        path = self.select_fortran_file(item.fortran_path or self.default_work_dir())
         if not path:
             return
         item.fortran_path = os.path.normpath(path)
@@ -1331,6 +1358,77 @@ class QueueManagerDialog(QtWidgets.QDialog):
     def selected_queue_rows(self) -> list[int]:
         return sorted({index.row() for index in self.queue_table.selectedIndexes()})
 
+    def queue_item_by_row_key(self, row_key: str) -> QueueItem | None:
+        for item in self.queue_items:
+            if item.item_id == row_key:
+                return item
+        return None
+
+    def queue_item_is_editable(self, item: QueueItem) -> bool:
+        return item.status in (STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY)
+
+    def apply_formal_item_edit_result(self, item: QueueItem) -> None:
+        self.detect_restart(item)
+        self.validate_candidate(item)
+        if item.run_mode == "restart" and not self.restart_dependency_resolved(item):
+            item.status = STATUS_WAITING_DEPENDENCY
+            item.message = "未选择有效的 Restart 前置作业"
+        else:
+            item.status = STATUS_PENDING_RUN if item.valid else STATUS_FAILED
+            item.message = "待提交" if item.valid else item.message
+
+    def on_queue_item_double_clicked(self, table_item: QtWidgets.QTableWidgetItem) -> None:
+        row_key = self.table_row_key(self.queue_table, table_item.row())
+        item = self.queue_item_by_row_key(row_key)
+        if item is None:
+            return
+        if not self.queue_item_is_editable(item):
+            QtWidgets.QMessageBox.information(self, "编辑队列作业", "只能编辑待运行或等待前置的作业。")
+            return
+
+        column = table_item.column()
+        if column == FORMAL_RESTART_COLUMN:
+            oldjob_path = self.select_oldjob_odb_file(item.oldjob_path or item.oldjob_dir)
+            if oldjob_path:
+                self.apply_oldjob_file_to_item(item, oldjob_path)
+                self.apply_formal_item_edit_result(item)
+                self.refresh_queue_table()
+            return
+        if column == FORMAL_FORTRAN_COLUMN:
+            path = self.select_fortran_file(item.fortran_path or self.default_work_dir())
+            if path:
+                item.fortran_path = path
+                self.apply_formal_item_edit_result(item)
+                self.refresh_queue_table()
+            return
+        if column in (FORMAL_CORE_COLUMN, FORMAL_MEMORY_COLUMN):
+            self.queue_table.editItem(table_item)
+            return
+
+        self.edit_selected_pending()
+
+    def on_queue_table_item_changed(self, table_item: QtWidgets.QTableWidgetItem) -> None:
+        column = table_item.column()
+        if column not in (FORMAL_CORE_COLUMN, FORMAL_MEMORY_COLUMN):
+            return
+        row_key = self.table_row_key(self.queue_table, table_item.row())
+        item = self.queue_item_by_row_key(row_key)
+        if item is None or not self.queue_item_is_editable(item):
+            self.refresh_queue_table()
+            return
+
+        value = table_item.text().strip()
+        if column == FORMAL_CORE_COLUMN:
+            try:
+                item.cores = max(0, min(999, int(value)))
+            except ValueError:
+                self.refresh_queue_table()
+                return
+        else:
+            item.memory = value
+        self.apply_formal_item_edit_result(item)
+        self.refresh_queue_table()
+
     def cancel_selected_pending(self) -> None:
         blocked = False
         for row in self.selected_queue_rows():
@@ -1361,6 +1459,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
         layout = QtWidgets.QFormLayout(dialog)
         core_spin = QtWidgets.QSpinBox()
         core_spin.setRange(0, 999)
+        core_spin.setSpecialValueText("未设置")
         core_spin.setValue(item.cores)
         memory_edit = QtWidgets.QLineEdit(item.memory)
         oldjob_edit = QtWidgets.QLineEdit(item.oldjob_path)
@@ -1629,7 +1728,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             item.job_type or ("重启动" if item.run_mode == "restart" else "普通"),
             dependency,
             os.path.basename(item.fortran_path) if item.fortran_path else "",
-            str(item.cores),
+            "" if int(item.cores or 0) <= 0 else str(item.cores),
             self.format_runtime_memory(item.rss_bytes),
             item.status,
             item.message,

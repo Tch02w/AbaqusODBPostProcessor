@@ -447,69 +447,23 @@ class JobController:
     def dispatch_queue_now(self) -> None:
         self._refresh_queue_dependencies()
         queue_items = self._queue_items()
-        active_runs = self._active_runs()
         archive_reserved_keys = self._archive_reserved_keys()
-        pending_items = [item for item in queue_items if item.status == STATUS_PENDING_RUN]
-        active_items = [
-            item
-            for item in queue_items
-            if item.status in scheduler_managed_active_statuses()
-        ]
-        self._append_history(
-            "[QUEUE-DISPATCH] enter "
-            f"active={self._is_queue_active()} "
-            f"stop={self._is_queue_stop_requested()} "
-            f"pending={len(pending_items)} "
-            f"active_runs={len(active_runs)} {self._active_runs_brief(active_runs)} "
-            f"active_items={self._queue_items_brief(active_items)} "
-            f"reserved={len(archive_reserved_keys)} "
-            f"max={self._max_parallel_jobs()}"
-        )
         if not self._is_queue_active() or self._is_queue_stop_requested():
-            self._append_history(
-                "[QUEUE-DISPATCH] early-return reason=inactive-or-stop "
-                f"active={self._is_queue_active()} "
-                f"stop={self._is_queue_stop_requested()} "
-                f"pending={len(pending_items)}"
-            )
             self._update_queue_status_label()
             self._process_deferred_archives()
             return
 
         slot_info = self._estimate_effective_available_slots()
         available_slots = int(slot_info["effective_available_slots"])
-        slot_estimate = slot_info.get("slot_estimate")
-        self._append_history(
-            "[QUEUE-DISPATCH] slots "
-            f"manual_limit={slot_info.get('manual_limit')} "
-            f"managed_active={slot_info.get('managed_active_count')} "
-            f"manual_available={slot_info.get('manual_available_slots')} "
-            f"memory_available={slot_info.get('memory_available_slots')} "
-            f"effective={available_slots} "
-            f"available_memory={getattr(slot_estimate, 'available_memory', '')} "
-            f"current_abaqus_memory={getattr(slot_estimate, 'current_abaqus_memory', '')} "
-            f"per_job_memory={getattr(slot_estimate, 'per_job_memory', '')}"
-        )
-        if available_slots <= 0:
-            self._append_history(
-                "[QUEUE-DISPATCH] no-slot "
-                f"pending_jobs={self._queue_items_brief(pending_items)} "
-                f"active_runs={self._active_runs_brief(active_runs)} "
-                f"active_items={self._queue_items_brief(active_items)}"
-            )
+        if (
+            available_slots <= 0
+            and any(item.status == STATUS_PENDING_RUN for item in queue_items)
+            and int(slot_info.get("managed_active_count") or 0) == 0
+            and int(slot_info.get("manual_available_slots") or 0) > 0
+            and int(slot_info.get("memory_available_slots") or 0) == 0
+        ):
+            available_slots = 1
         while available_slots > 0:
-            pending_now = [entry for entry in queue_items if entry.status == STATUS_PENDING_RUN]
-            reserved_pending = [
-                entry
-                for entry in pending_now
-                if scheduler_queue_item_conflict_key(entry) in archive_reserved_keys
-            ]
-            for entry in reserved_pending[:8]:
-                self._append_history(
-                    "[QUEUE-DISPATCH] skip-reserved "
-                    f"job={entry.job_name} "
-                    f"work_dir={scheduler_effective_queue_item_work_dir(entry)}"
-                )
             for entry in queue_items:
                 if (
                     entry.status == STATUS_PENDING_RUN
@@ -526,31 +480,13 @@ class JobController:
                 None,
             )
             if item is None:
-                if pending_now:
-                    self._append_history(
-                        "[QUEUE-DISPATCH] no-selectable-pending "
-                        f"pending={self._queue_items_brief(pending_now)} "
-                        f"reserved={len(archive_reserved_keys)}"
-                    )
                 break
 
-            self._append_history(
-                "[QUEUE-DISPATCH] selected "
-                f"job={item.job_name} "
-                f"type={item.job_type or ('重启动' if item.run_mode == 'restart' else '普通')} "
-                f"work_dir={scheduler_effective_queue_item_work_dir(item)} "
-                f"status={item.status}"
-            )
             conflict_item = scheduler_find_formal_queue_conflict(
                 item,
                 queue_items,
             )
             if conflict_item is not None:
-                self._append_history(
-                    "[QUEUE-DISPATCH] start-blocked "
-                    f"job={item.job_name} "
-                    f"reason=formal-conflict conflict={conflict_item.job_name}|{conflict_item.status}"
-                )
                 item.status = STATUS_FAILED
                 item.message = (
                     f"作业冲突：同一计算目录中已存在同名作业 {item.job_name}，"
@@ -559,17 +495,25 @@ class JobController:
                 self._append_history(f"队列作业冲突，已跳过：{item.job_name} | {item.message}")
                 continue
 
+            if int(item.cores or 0) <= 0:
+                item.message = "请先设置 Core 后再提交。"
+                self._set_queue_active(False)
+                self._refresh_queue_views()
+                QtWidgets.QMessageBox.warning(
+                    self.window,
+                    "队列作业 Core 未设置",
+                    f"作业 {item.job_name} 尚未设置 Core。\n\n"
+                    "请在作业队列管理窗口中编辑该作业的 Core 后，再开始队列。",
+                )
+                self._process_deferred_archives()
+                return
+
             options = queue_item_to_options(
                 item,
                 default_cpus=self._default_cpus(),
             )
             ok, message = validate_options(options)
             if not ok:
-                self._append_history(
-                    "[QUEUE-DISPATCH] start-blocked "
-                    f"job={item.job_name} "
-                    f"reason=validate message={message}"
-                )
                 item.status = STATUS_FAILED
                 item.message = message
                 self._append_history(f"队列作业校验失败：{item.job_name} | {message}")
@@ -580,20 +524,8 @@ class JobController:
                 queue_item=item,
                 queue_mode=True,
             )
-            self._append_history(
-                "[QUEUE-DISPATCH] start-job "
-                f"result={started} "
-                f"job={item.job_name} "
-                f"status={item.status} "
-                f"message={item.message}"
-            )
             if started:
                 available_slots -= 1
-                self._append_history(
-                    "[QUEUE-DISPATCH] pause-after-one-start "
-                    f"job={item.job_name} "
-                    "reason=wait-memory-sample"
-                )
             else:
                 if item.status == STATUS_PENDING_RUN:
                     item.status = STATUS_FAILED

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -12,14 +12,24 @@ from .abaqus_diagnostics import build_diagnostic_file_baseline, classify_job_tex
 from .archive import (
     ArchiveCoordinator,
     apply_workspace_prepare_result,
+    backup_existing_result_files,
     build_archive_move_plan,
     build_workspace_info,
     build_workspace_prepare_plan,
+    delete_existing_result_files,
+    get_existing_lck_file,
+    get_existing_odb_file,
     is_ssd_independent_work_dir,
     prepare_calculation_workspace,
 )
 from .background_tasks import ArchiveMoveTask, WorkspacePrepareTask
-from .command import SubmitOptions, build_abaqus_command, derive_oldjob_name
+from .command import (
+    SubmitOptions,
+    build_abaqus_command,
+    derive_oldjob_name,
+    queue_item_to_options,
+    validate_options,
+)
 from .constants import (
     STATUS_CANCELED,
     STATUS_COMPLETED,
@@ -39,9 +49,11 @@ from .qt_compat import QtCore, QtWidgets, hang_probe_function
 from .queue_scheduler import (
     active_submit_conflict_message as scheduler_active_submit_conflict_message,
     effective_queue_item_work_dir as scheduler_effective_queue_item_work_dir,
+    find_formal_queue_conflict as scheduler_find_formal_queue_conflict,
     managed_active_statuses as scheduler_managed_active_statuses,
     managed_job_key as scheduler_managed_job_key,
     oldjob_name_from_item as scheduler_oldjob_name_from_item,
+    queue_item_conflict_key as scheduler_queue_item_conflict_key,
 )
 from .ui_components import runtime_job_display_label as ui_runtime_job_display_label
 
@@ -183,6 +195,153 @@ class JobController:
             return
         setattr(self.window, name, value)
 
+    def _queue_items(self) -> list[QueueItem]:
+        return self.window.queue_items
+
+    def _active_runs(self) -> dict[str, dict]:
+        return self.window.active_runs
+
+    def _is_queue_active(self) -> bool:
+        return bool(self.window.queue_active)
+
+    def _is_queue_stop_requested(self) -> bool:
+        return bool(self.window.queue_stop_requested)
+
+    def _set_queue_active(self, value: bool) -> None:
+        self.window.queue_active = value
+
+    def _archive_reserved_keys(self) -> set[tuple[str, str]]:
+        return self.window._archive_move_reserved_keys
+
+    def _append_history(self, message: str) -> None:
+        self.window.append_history(message)
+
+    def _update_queue_status_label(self) -> None:
+        self.window.update_queue_status_label()
+
+    def _refresh_queue_views(self) -> None:
+        self.window.refresh_visible_queue_manager()
+        self.window.update_queue_status_label()
+
+    def _default_cpus(self) -> int:
+        return int(self.window.cpus_spin.value())
+
+    def _estimate_effective_available_slots(self) -> dict:
+        return self.window.estimate_effective_available_slots()
+
+    def _refresh_queue_dependencies(self) -> None:
+        self.window.refresh_queue_dependencies()
+
+    def _process_deferred_archives(self) -> None:
+        self.window.process_deferred_archives()
+
+    def _request_dispatch_queue(self) -> None:
+        self.window.request_dispatch_queue()
+
+    def _max_parallel_jobs(self) -> int:
+        return int(self.window.max_parallel_spin.value())
+
+    def _queue_item_brief(self, item: QueueItem) -> str:
+        work_dir = scheduler_effective_queue_item_work_dir(item)
+        return f"{item.job_name}|{item.status}|{work_dir}"
+
+    def _queue_items_brief(self, items: list[QueueItem], limit: int = 8) -> str:
+        values = [self._queue_item_brief(item) for item in items[:limit]]
+        if len(items) > limit:
+            values.append(f"...+{len(items) - limit}")
+        return "[" + "; ".join(values) + "]"
+
+    def _active_runs_brief(self, active_runs: dict[str, dict], limit: int = 8) -> str:
+        values = []
+        for key, run in list(active_runs.items())[:limit]:
+            values.append(f"{key}|{run.get('job_name', '')}")
+        if len(active_runs) > limit:
+            values.append(f"...+{len(active_runs) - limit}")
+        return "[" + "; ".join(values) + "]"
+
+    def _ask_existing_odb_action(self, job_name: str, odb_path: Path, queue_mode: bool) -> str:
+        return self.window.ask_existing_odb_action(job_name, odb_path, queue_mode)
+
+    def _show_existing_lck_warning(self, existing_lck: Path) -> None:
+        QtWidgets.QMessageBox.warning(
+            self.window,
+            "作业可能仍在运行",
+            f"检测到同名 LCK 文件，暂不提交：\n\n{existing_lck}\n\n"
+            "请确认旧作业已经结束，或手动清理残留 LCK 文件后再提交。",
+        )
+
+    def _show_existing_result_error(self, exc: OSError) -> None:
+        QtWidgets.QMessageBox.critical(
+            self.window,
+            "已有结果处理失败",
+            f"无法处理旧结果文件：\n\n{exc}\n\n请确认 ODB/STA 没有被 Abaqus 或其他程序占用。",
+        )
+
+    def _set_queue_stop_requested(self, value: bool) -> None:
+        self.window.queue_stop_requested = value
+
+    @hang_probe_function("JobController.handle_existing_job_results")
+    def handle_existing_job_results(
+        self,
+        options: SubmitOptions,
+        work_dir: str,
+        queue_item: QueueItem | None,
+        *,
+        queue_mode: bool = False,
+    ) -> tuple[bool, SubmitOptions, dict]:
+        """Apply overwrite/backup handling for existing Abaqus result files."""
+        job_name = options.job_name
+        existing_lck = get_existing_lck_file(work_dir, job_name)
+        if existing_lck is not None:
+            self._show_existing_lck_warning(existing_lck)
+            if queue_item is not None:
+                queue_item.status = STATUS_FAILED
+                queue_item.message = "检测到同名 LCK 文件"
+            return False, options, {"action": "lck", "odb": "", "sta": ""}
+
+        existing_odb = get_existing_odb_file(work_dir, job_name)
+        if existing_odb is None:
+            return True, options, {"action": "", "odb": "", "sta": ""}
+
+        action = self._ask_existing_odb_action(
+            job_name,
+            existing_odb,
+            queue_mode,
+        )
+        if action == "cancel":
+            self._append_history(f"取消提交：{job_name} 检测到同名 ODB。")
+            if queue_item is not None:
+                queue_item.status = STATUS_CANCELED
+                queue_item.message = "用户取消同名 ODB 处理"
+
+            if queue_mode:
+                self._set_queue_stop_requested(True)
+                self._set_queue_active(False)
+
+        try:
+            if action == "backup":
+                result = backup_existing_result_files(work_dir, job_name)
+                if result.get("odb"):
+                    self._append_history(f"已有结果处理：同名 ODB 已备份为：{result['odb']}")
+                if result.get("sta"):
+                    self._append_history(f"旧 STA 已备份为：{result['sta']}")
+                return True, replace(options, ask_delete_off=True), {"action": action, **result}
+
+            if action == "overwrite":
+                result = delete_existing_result_files(work_dir, job_name)
+                if result.get("odb"):
+                    self._append_history(f"已有结果处理：同名 ODB 已删除：{result['odb']}")
+                if result.get("sta"):
+                    self._append_history(f"旧 STA 已删除：{result['sta']}")
+                return True, replace(options, ask_delete_off=True), {"action": action, **result}
+        except OSError as exc:
+            self._show_existing_result_error(exc)
+            if queue_item is not None:
+                queue_item.status = STATUS_FAILED
+                queue_item.message = f"旧结果处理失败：{exc}"
+            return False, options, {"action": action, "odb": str(existing_odb), "sta": ""}
+
+        return False, options, {"action": action, "odb": str(existing_odb), "sta": ""}
     def terminate_queue_items_by_ids(
         self,
         item_ids: list[str],
@@ -284,6 +443,179 @@ class JobController:
         self.refresh_visible_queue_manager()
         self.update_queue_status_label()
         self.process_deferred_archives()
+
+    def dispatch_queue_now(self) -> None:
+        self._refresh_queue_dependencies()
+        queue_items = self._queue_items()
+        active_runs = self._active_runs()
+        archive_reserved_keys = self._archive_reserved_keys()
+        pending_items = [item for item in queue_items if item.status == STATUS_PENDING_RUN]
+        active_items = [
+            item
+            for item in queue_items
+            if item.status in scheduler_managed_active_statuses()
+        ]
+        self._append_history(
+            "[QUEUE-DISPATCH] enter "
+            f"active={self._is_queue_active()} "
+            f"stop={self._is_queue_stop_requested()} "
+            f"pending={len(pending_items)} "
+            f"active_runs={len(active_runs)} {self._active_runs_brief(active_runs)} "
+            f"active_items={self._queue_items_brief(active_items)} "
+            f"reserved={len(archive_reserved_keys)} "
+            f"max={self._max_parallel_jobs()}"
+        )
+        if not self._is_queue_active() or self._is_queue_stop_requested():
+            self._append_history(
+                "[QUEUE-DISPATCH] early-return reason=inactive-or-stop "
+                f"active={self._is_queue_active()} "
+                f"stop={self._is_queue_stop_requested()} "
+                f"pending={len(pending_items)}"
+            )
+            self._update_queue_status_label()
+            self._process_deferred_archives()
+            return
+
+        slot_info = self._estimate_effective_available_slots()
+        available_slots = int(slot_info["effective_available_slots"])
+        slot_estimate = slot_info.get("slot_estimate")
+        self._append_history(
+            "[QUEUE-DISPATCH] slots "
+            f"manual_limit={slot_info.get('manual_limit')} "
+            f"managed_active={slot_info.get('managed_active_count')} "
+            f"manual_available={slot_info.get('manual_available_slots')} "
+            f"memory_available={slot_info.get('memory_available_slots')} "
+            f"effective={available_slots} "
+            f"available_memory={getattr(slot_estimate, 'available_memory', '')} "
+            f"current_abaqus_memory={getattr(slot_estimate, 'current_abaqus_memory', '')} "
+            f"per_job_memory={getattr(slot_estimate, 'per_job_memory', '')}"
+        )
+        if available_slots <= 0:
+            self._append_history(
+                "[QUEUE-DISPATCH] no-slot "
+                f"pending_jobs={self._queue_items_brief(pending_items)} "
+                f"active_runs={self._active_runs_brief(active_runs)} "
+                f"active_items={self._queue_items_brief(active_items)}"
+            )
+        while available_slots > 0:
+            pending_now = [entry for entry in queue_items if entry.status == STATUS_PENDING_RUN]
+            reserved_pending = [
+                entry
+                for entry in pending_now
+                if scheduler_queue_item_conflict_key(entry) in archive_reserved_keys
+            ]
+            for entry in reserved_pending[:8]:
+                self._append_history(
+                    "[QUEUE-DISPATCH] skip-reserved "
+                    f"job={entry.job_name} "
+                    f"work_dir={scheduler_effective_queue_item_work_dir(entry)}"
+                )
+            for entry in queue_items:
+                if (
+                    entry.status == STATUS_PENDING_RUN
+                    and scheduler_queue_item_conflict_key(entry) in archive_reserved_keys
+                ):
+                    entry.message = "同名 SSD 计算目录正在等待归档或归档中，请稍后再提交。"
+            item = next(
+                (
+                    entry
+                    for entry in queue_items
+                    if entry.status == STATUS_PENDING_RUN
+                    and scheduler_queue_item_conflict_key(entry) not in archive_reserved_keys
+                ),
+                None,
+            )
+            if item is None:
+                if pending_now:
+                    self._append_history(
+                        "[QUEUE-DISPATCH] no-selectable-pending "
+                        f"pending={self._queue_items_brief(pending_now)} "
+                        f"reserved={len(archive_reserved_keys)}"
+                    )
+                break
+
+            self._append_history(
+                "[QUEUE-DISPATCH] selected "
+                f"job={item.job_name} "
+                f"type={item.job_type or ('重启动' if item.run_mode == 'restart' else '普通')} "
+                f"work_dir={scheduler_effective_queue_item_work_dir(item)} "
+                f"status={item.status}"
+            )
+            conflict_item = scheduler_find_formal_queue_conflict(
+                item,
+                queue_items,
+            )
+            if conflict_item is not None:
+                self._append_history(
+                    "[QUEUE-DISPATCH] start-blocked "
+                    f"job={item.job_name} "
+                    f"reason=formal-conflict conflict={conflict_item.job_name}|{conflict_item.status}"
+                )
+                item.status = STATUS_FAILED
+                item.message = (
+                    f"作业冲突：同一计算目录中已存在同名作业 {item.job_name}，"
+                    f"冲突来源：{conflict_item.inp_path}"
+                )
+                self._append_history(f"队列作业冲突，已跳过：{item.job_name} | {item.message}")
+                continue
+
+            options = queue_item_to_options(
+                item,
+                default_cpus=self._default_cpus(),
+            )
+            ok, message = validate_options(options)
+            if not ok:
+                self._append_history(
+                    "[QUEUE-DISPATCH] start-blocked "
+                    f"job={item.job_name} "
+                    f"reason=validate message={message}"
+                )
+                item.status = STATUS_FAILED
+                item.message = message
+                self._append_history(f"队列作业校验失败：{item.job_name} | {message}")
+                continue
+
+            started = self.start_job(
+                options,
+                queue_item=item,
+                queue_mode=True,
+            )
+            self._append_history(
+                "[QUEUE-DISPATCH] start-job "
+                f"result={started} "
+                f"job={item.job_name} "
+                f"status={item.status} "
+                f"message={item.message}"
+            )
+            if started:
+                available_slots -= 1
+                self._append_history(
+                    "[QUEUE-DISPATCH] pause-after-one-start "
+                    f"job={item.job_name} "
+                    "reason=wait-memory-sample"
+                )
+            else:
+                if item.status == STATUS_PENDING_RUN:
+                    item.status = STATUS_FAILED
+                    item.message = "启动失败"
+            self._refresh_queue_dependencies()
+            slot_info = self._estimate_effective_available_slots()
+            available_slots = min(available_slots, int(slot_info["effective_available_slots"]))
+            if started:
+                break
+
+        pending = any(
+            item.status in {STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY}
+            for item in queue_items
+        )
+        running = any(run.get("queue_item") is not None for run in self._active_runs().values()) or any(
+            item.status == STATUS_STARTING for item in queue_items
+        )
+        if not pending and not running:
+            self._set_queue_active(False)
+            self._append_history("队列已结束。")
+        self._update_queue_status_label()
+        self._process_deferred_archives()
 
     def block_missing_restart_dependency(
         self,
@@ -773,6 +1105,9 @@ class JobController:
             queue_item.message = decision.message
 
             queue_item.active_job_key = ""
+            self._refresh_queue_dependencies()
+            self._refresh_queue_views()
+            self._append_history(f"作业完成状态写回后已刷新队列依赖：{queue_item.job_name}")
         self.archive_or_defer_finished_job(run)
         final_text = queue_item.status if queue_item is not None else (status or "finished")
         self.append_history(f"{run['job_name']} final status: {final_text}")

@@ -6,7 +6,6 @@ import os
 import shutil
 import sys
 import time
-from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -17,10 +16,6 @@ from .abaqus_diagnostics import (
 )
 from .archive import (
     ArchiveCoordinator,
-    backup_existing_result_files,
-    delete_existing_result_files,
-    get_existing_lck_file,
-    get_existing_odb_file,
 )
 from .background_tasks import (
     ArchiveMoveService,
@@ -66,7 +61,6 @@ from .command import (
     derive_job_name,
     derive_oldjob_name,
     inp_has_restart_keyword,
-    queue_item_to_options,
     validate_options,
 )
 from .external_jobs import (
@@ -80,7 +74,6 @@ from .job_runtime import JobRuntimeController
 from .qt_compat import QtCore, QtGui, QtWidgets, hang_probe_function
 from .queue_manager import QueueManagerDialog
 from .queue_scheduler import (
-    find_formal_queue_conflict as scheduler_find_formal_queue_conflict,
     find_queue_item_by_key as scheduler_find_queue_item_by_key,
     find_queue_oldjob_item as scheduler_find_queue_oldjob_item,
     get_managed_active_job_keys as scheduler_get_managed_active_job_keys,
@@ -88,7 +81,6 @@ from .queue_scheduler import (
     managed_active_statuses as scheduler_managed_active_statuses,
     oldjob_name_from_item as scheduler_oldjob_name_from_item,
     queue_item_is_finished as scheduler_queue_item_is_finished,
-    queue_item_conflict_key as scheduler_queue_item_conflict_key,
     queue_status_counts as scheduler_queue_status_counts,
     refresh_queue_dependencies as scheduler_refresh_queue_dependencies,
     submit_conflict_key as scheduler_submit_conflict_key,
@@ -1127,10 +1119,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.external_scan_dialog = None
 
     def start_queue(self) -> None:
+        pending_before = sum(1 for item in self.queue_items if item.status == STATUS_PENDING_RUN)
+        self.append_history(
+            "[QUEUE-START] clicked "
+            f"active={self.queue_active} "
+            f"stop={self.queue_stop_requested} "
+            f"pending={pending_before}"
+        )
         if self.queue_active:
+            self.append_history(
+                "[QUEUE-START] active-already dispatch-only "
+                f"stop={self.queue_stop_requested} "
+                f"pending={pending_before}"
+            )
             self.dispatch_queue()
             return
 
+        self.refresh_queue_dependencies()
         pending = [item for item in self.queue_items if item.status == STATUS_PENDING_RUN]
         if not pending:
             QtWidgets.QMessageBox.information(self, "开始队列", "队列中没有待运行作业。")
@@ -1152,6 +1157,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def estimate_effective_available_slots(self) -> dict:
         manual_limit = self.max_parallel_spin.value()
+        active_job_names = scheduler_get_managed_active_job_names(
+            self.active_runs,
+            self.queue_items,
+        )
         managed_active_count = len(
             scheduler_get_managed_active_job_keys(
                 self.active_runs,
@@ -1160,13 +1169,16 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         manual_available_slots = max(0, manual_limit - managed_active_count)
         available_memory = int(self.latest_system_memory.get("available") or 0)
+        active_job_names_lower = {name.lower() for name in active_job_names}
+        active_memory_usage_by_job = {
+            job_name: usage
+            for job_name, usage in self.latest_memory_usage_by_job.items()
+            if str(job_name).lower() in active_job_names_lower
+        }
         slot_estimate = self.memory_monitor_service.estimate_available_slots(
             available_memory=available_memory,
-            usage_by_job=self.latest_memory_usage_by_job,
-            active_job_names=scheduler_get_managed_active_job_names(
-                self.active_runs,
-                self.queue_items,
-            ),
+            usage_by_job=active_memory_usage_by_job,
+            active_job_names=active_job_names,
         )
         memory_available_slots = int(slot_estimate.slots) if available_memory > 0 else UNLIMITED_JOB_SLOTS
         effective_slots = min(manual_available_slots, memory_available_slots)
@@ -1219,83 +1231,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._dispatch_running = False
 
     def _dispatch_queue_now(self) -> None:
-        self.refresh_queue_dependencies()
-        if not self.queue_active or self.queue_stop_requested:
-            self.update_queue_status_label()
-            self.process_deferred_archives()
-            return
-
-        slot_info = self.estimate_effective_available_slots()
-        available_slots = int(slot_info["effective_available_slots"])
-        while available_slots > 0:
-            for entry in self.queue_items:
-                if (
-                    entry.status == STATUS_PENDING_RUN
-                    and scheduler_queue_item_conflict_key(entry) in self._archive_move_reserved_keys
-                ):
-                    entry.message = "同名 SSD 计算目录正在等待归档或归档中，请稍后再提交。"
-            item = next(
-                (
-                    entry
-                    for entry in self.queue_items
-                    if entry.status == STATUS_PENDING_RUN
-                    and scheduler_queue_item_conflict_key(entry) not in self._archive_move_reserved_keys
-                ),
-                None,
-            )
-            if item is None:
-                break
-
-            conflict_item = scheduler_find_formal_queue_conflict(
-                item,
-                self.queue_items,
-            )
-            if conflict_item is not None:
-                item.status = STATUS_FAILED
-                item.message = (
-                    f"作业冲突：同一计算目录中已存在同名作业 {item.job_name}，"
-                    f"冲突来源：{conflict_item.inp_path}"
-                )
-                self.append_history(f"队列作业冲突，已跳过：{item.job_name} | {item.message}")
-                continue
-
-            options = queue_item_to_options(
-                item,
-                default_cpus=self.cpus_spin.value(),
-            )
-            ok, message = validate_options(options)
-            if not ok:
-                item.status = STATUS_FAILED
-                item.message = message
-                self.append_history(f"队列作业校验失败：{item.job_name} | {message}")
-                continue
-
-            if self.start_job(
-                options,
-                queue_item=item,
-                queue_mode=True,
-            ):
-                available_slots -= 1
-            else:
-                if item.status == STATUS_PENDING_RUN:
-                    item.status = STATUS_FAILED
-                    item.message = "启动失败"
-            self.refresh_queue_dependencies()
-            slot_info = self.estimate_effective_available_slots()
-            available_slots = min(available_slots, int(slot_info["effective_available_slots"]))
-
-        pending = any(
-            item.status in {STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY}
-            for item in self.queue_items
-        )
-        running = any(run.get("queue_item") is not None for run in self.active_runs.values()) or any(
-            item.status == STATUS_STARTING for item in self.queue_items
-        )
-        if not pending and not running:
-            self.queue_active = False
-            self.append_history("队列已结束。")
-        self.update_queue_status_label()
-        self.process_deferred_archives()
+        return self.job_controller.dispatch_queue_now()
 
     def ask_existing_odb_action(self, job_name: str, odb_path: Path, queue_mode: bool) -> str:
         """Ask how to handle an existing ODB before submitting."""
@@ -1335,68 +1271,12 @@ class MainWindow(QtWidgets.QMainWindow):
         *,
         queue_mode: bool = False,
     ) -> tuple[bool, SubmitOptions, dict]:
-        """Apply overwrite/backup handling for existing Abaqus result files."""
-        job_name = options.job_name
-        existing_lck = get_existing_lck_file(work_dir, job_name)
-        if existing_lck is not None:
-            QtWidgets.QMessageBox.warning(
-                self,
-                "作业可能仍在运行",
-                f"检测到同名 LCK 文件，暂不提交：\n\n{existing_lck}\n\n"
-                "请确认旧作业已经结束，或手动清理残留 LCK 文件后再提交。",
-            )
-            if queue_item is not None:
-                queue_item.status = STATUS_FAILED
-                queue_item.message = "检测到同名 LCK 文件"
-            return False, options, {"action": "lck", "odb": "", "sta": ""}
-
-        existing_odb = get_existing_odb_file(work_dir, job_name)
-        if existing_odb is None:
-            return True, options, {"action": "", "odb": "", "sta": ""}
-
-        action = self.ask_existing_odb_action(
-            job_name,
-            existing_odb,
-            queue_mode,
+        return self.job_controller.handle_existing_job_results(
+            options,
+            work_dir,
+            queue_item,
+            queue_mode=queue_mode,
         )
-        if action == "cancel":
-            self.append_history(f"取消提交：{job_name} 检测到同名 ODB。")
-            if queue_item is not None:
-                queue_item.status = STATUS_CANCELED
-                queue_item.message = "用户取消同名 ODB 处理"
-
-            if queue_mode:
-                self.queue_stop_requested = True
-                self.queue_active = False
-
-        try:
-            if action == "backup":
-                result = backup_existing_result_files(work_dir, job_name)
-                if result.get("odb"):
-                    self.append_history(f"已有结果处理：同名 ODB 已备份为：{result['odb']}")
-                if result.get("sta"):
-                    self.append_history(f"旧 STA 已备份为：{result['sta']}")
-                return True, replace(options, ask_delete_off=True), {"action": action, **result}
-
-            if action == "overwrite":
-                result = delete_existing_result_files(work_dir, job_name)
-                if result.get("odb"):
-                    self.append_history(f"已有结果处理：同名 ODB 已删除：{result['odb']}")
-                if result.get("sta"):
-                    self.append_history(f"旧 STA 已删除：{result['sta']}")
-                return True, replace(options, ask_delete_off=True), {"action": action, **result}
-        except OSError as exc:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "已有结果处理失败",
-                f"无法处理旧结果文件：\n\n{exc}\n\n请确认 ODB/STA 没有被 Abaqus 或其他程序占用。",
-            )
-            if queue_item is not None:
-                queue_item.status = STATUS_FAILED
-                queue_item.message = f"旧结果处理失败：{exc}"
-            return False, options, {"action": action, "odb": str(existing_odb), "sta": ""}
-
-        return False, options, {"action": action, "odb": str(existing_odb), "sta": ""}
 
     def archive_move_conflict_message(self, options: SubmitOptions, queue_item: QueueItem | None) -> str:
         conflict_key = scheduler_submit_conflict_key(

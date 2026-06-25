@@ -17,7 +17,7 @@ RUNTIME_LOG_WIDTH_SAMPLE = "****************************************************
 # Horizontal padding inside runtimeBodyCard: 8 + 8.
 RUNTIME_BODY_HORIZONTAL_MARGIN = 16
 
-APP_BG = "#f3f6fa"
+APP_BG = "#eef3f8"
 CARD_BG = "#ffffff"
 LOG_BG = "#f8fafc"
 TEXT = "#111827"
@@ -27,6 +27,8 @@ PRIMARY_HOVER = "#1d4ed8"
 LIGHT = "#dbe3ee"
 LIGHT_HOVER = "#cbd5e1"
 DANGER = "#7f1d1d"
+BORDER = "#cbd5e1"
+FOCUS = "#60a5fa"
 
 
 def build_main_stylesheet() -> str:
@@ -42,12 +44,13 @@ def build_main_stylesheet() -> str:
             }}
             QFrame#card {{
                 background: {CARD_BG};
-                border: 0;
+                border: 1px solid #d8e1ee;
+                border-radius: 8px;
             }}
             QFrame#runtimeBodyCard {{
                 background-color: #ffffff;
-                border: 1px solid #9ca3af;
-                border-radius: 0;
+                border: 1px solid #d8e1ee;
+                border-radius: 8px;
             }}
             QFrame#runtimeBodyCard QLabel {{
                 border: 0;
@@ -60,7 +63,7 @@ def build_main_stylesheet() -> str:
             QLabel#hint {{
                 color: {HINT};
             }}
-                        QLabel#runtimeTitle {{
+            QLabel#runtimeTitle {{
                 color: {TEXT};
                 font-size: 13px;
                 font-weight: 600;
@@ -76,22 +79,24 @@ def build_main_stylesheet() -> str:
             QLabel#runtimeStatus {{
                 color: #64748b;
                 font-size: 12px;
+                padding-right: 4px;
             }}
 
             QComboBox#runtimeSelector {{
                 background: #dbe3ee;
                 color: {TEXT};
-                border: 0;
-                border-radius: 0;
+                border: 1px solid {BORDER};
+                border-radius: 6px;
                 min-height: 30px;
                 max-height: 30px;
-                padding: 0 8px;
+                padding: 0 24px 0 9px;
             }}
 
             QPlainTextEdit#runtimeMeta {{
                 background: #f8fafc;
                 color: {TEXT};
-                border: 0;
+                border: 1px solid #e5e7eb;
+                border-radius: 6px;
                 font-family: Consolas, "Microsoft YaHei", monospace;
                 font-size: 12px;
             }}
@@ -114,8 +119,8 @@ def build_main_stylesheet() -> str:
             QPushButton#filePicker {{
                 background: #f8fafc;
                 color: {HINT};
-                border: 1px solid #cbd5e1;
-                border-radius: 4px;
+                border: 1px solid {BORDER};
+                border-radius: 6px;
                 min-height: 30px;
                 max-height: 30px;
                 padding: 0 8px;
@@ -129,20 +134,29 @@ def build_main_stylesheet() -> str:
             QLineEdit {{
                 background: #ffffff;
                 color: {TEXT};
-                border: 1px solid #9ca3af;
-                border-radius: 0;
-                min-height: 28px;
-                max-height: 28px;
-                padding: 0 6px;
+                border: 1px solid {BORDER};
+                border-radius: 6px;
+                min-height: 30px;
+                max-height: 30px;
+                padding: 0 8px;
+                selection-background-color: #bfdbfe;
+            }}
+            QLineEdit:focus {{
+                border-color: {FOCUS};
+                background: #ffffff;
             }}
             QSpinBox {{
                 background: #ffffff;
                 color: {TEXT};
-                border: 1px solid #9ca3af;
-                border-radius: 0;
-                min-height: 28px;
-                max-height: 28px;
-                padding: 0 20px 0 6px;
+                border: 1px solid {BORDER};
+                border-radius: 6px;
+                min-height: 30px;
+                max-height: 30px;
+                padding: 0 20px 0 8px;
+                selection-background-color: #bfdbfe;
+            }}
+            QSpinBox:focus {{
+                border-color: {FOCUS};
             }}
             QSpinBox::up-button,
             QSpinBox::down-button {{
@@ -161,8 +175,8 @@ def build_main_stylesheet() -> str:
             QSpinBox#queueMaxParallelSpin {{
                 background: #f8fafc;
                 color: {TEXT};
-                border: 1px solid #cbd5e1;
-                border-radius: 4px;
+                border: 1px solid {BORDER};
+                border-radius: 6px;
                 min-height: 30px;
                 max-height: 30px;
                 padding: 0 8px;
@@ -178,34 +192,47 @@ def build_main_stylesheet() -> str:
             QComboBox {{
                 background: #ffffff;
                 color: {TEXT};
-                border: 1px solid #9ca3af;
-                border-radius: 0;
-                min-height: 28px;
-                max-height: 28px;
-                padding: 0 22px 0 6px;
+                border: 1px solid {BORDER};
+                border-radius: 6px;
+                min-height: 30px;
+                max-height: 30px;
+                padding: 0 24px 0 8px;
+                selection-background-color: #bfdbfe;
+            }}
+            QComboBox:focus {{
+                border-color: {FOCUS};
             }}
             QComboBox::drop-down {{
-                width: 12px;
+                width: 20px;
                 border: 0;
+            }}
+            QComboBox QAbstractItemView {{
+                background: #ffffff;
+                border: 1px solid {BORDER};
+                border-radius: 6px;
+                padding: 4px;
+                outline: 0;
+                selection-background-color: #dbeafe;
+                selection-color: #0f172a;
             }}
             QPlainTextEdit#log {{
                 background: #f8fafc;
                 color: #111827;
-                border: 1px solid #9ca3af;
-                border-radius: 0;
+                border: 1px solid #d8e1ee;
+                border-radius: 8px;
                 font-family: Consolas, "Microsoft YaHei", monospace;
                 font-size: 12px;
             }}
             QFrame#runtimeLogFrame {{
                 background: #f8fafc;
-                border: 1px solid #9ca3af;
-                border-radius: 0;
+                border: 1px solid #d8e1ee;
+                border-radius: 8px;
             }}
             QLabel#staStickyHeader {{
                 background: #f8fafc;
                 color: #111827;
                 border: 0;
-                border-bottom: 1px solid #9ca3af;
+                border-bottom: 1px solid #d8e1ee;
                 padding: 2px 3px;
                 font-family: Consolas, "Microsoft YaHei", monospace;
                 font-size: 12px;
@@ -222,8 +249,9 @@ def build_main_stylesheet() -> str:
                 background: {LIGHT};
                 color: {TEXT};
                 border: 0;
-                border-radius: 7px;
-                padding: 6px 10px;
+                border-radius: 8px;
+                min-height: 30px;
+                padding: 6px 12px;
                 font-weight: 600;
             }}
             QPushButton:hover {{

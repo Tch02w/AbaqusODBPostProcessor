@@ -25,6 +25,7 @@ from .background_tasks import (
 )
 from .constants import (
     DEFAULT_CPUS,
+    FORMAL_QUEUE_SAVE_DEBOUNCE_MS,
     JOB_MEMORY_BASE_SAFETY_FACTOR,
     JOB_MEMORY_LEARNING_INTERVAL_MS,
     JOB_MEMORY_MAX_SAMPLES,
@@ -72,7 +73,7 @@ from .external_jobs import (
 from .job_controller import JobController
 from .job_runtime import JobRuntimeController
 from .qt_compat import QtCore, QtGui, QtWidgets, Signal, hang_probe_function
-from .queue_manager import QueueManagerDialog
+from .queue_manager import QueueManagerDialog, load_joblist_state, save_joblist_state
 from .queue_scheduler import (
     find_queue_item_by_key as scheduler_find_queue_item_by_key,
     find_queue_oldjob_item as scheduler_find_queue_oldjob_item,
@@ -161,6 +162,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.current_log_suffix = ".sta"
         self.command_preview = ""
         self.queue_items: list[QueueItem] = []
+        self.candidate_queue_items: list[QueueItem] = []
+        self.joblist_load_error = ""
         self.run_records: dict[str, dict] = {}
         self.active_runs: dict[str, dict] = {}
         self.queue_manager_dialog: QueueManagerDialog | None = None
@@ -211,6 +214,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._dispatch_timer = QtCore.QTimer(self)
         self._dispatch_timer.setSingleShot(True)
         self._dispatch_timer.timeout.connect(self._run_scheduled_dispatch_queue)
+        self._joblist_save_timer = QtCore.QTimer(self)
+        self._joblist_save_timer.setSingleShot(True)
+        self._joblist_save_timer.setInterval(FORMAL_QUEUE_SAVE_DEBOUNCE_MS)
+        self._joblist_save_timer.timeout.connect(self.save_joblist_state_now)
         self._ui_heartbeat_last = time.monotonic()
         self._ui_heartbeat_timer = QtCore.QTimer(self)
         self._ui_heartbeat_timer.setInterval(1000)
@@ -229,12 +236,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self.archive_move_service.blocked.connect(self.on_archive_move_blocked)
         self.archive_move_service.failed.connect(self.on_archive_move_failed)
 
+        self.restore_joblist_state()
+
         self.build_ui()
         self.apply_styles()
 
         QtCore.QTimer.singleShot(250, self.start_abaqus_status_check)
         self.update_command_preview()
         self.append_history("等待提交作业...")
+        if self.joblist_load_error:
+            self.append_history(f"读取 joblist.json 失败：{self.joblist_load_error}")
+        elif self.candidate_queue_items or self.queue_items:
+            self.append_history(
+                f"已恢复队列记录：候选 {len(self.candidate_queue_items)}，正式 {len(self.queue_items)}"
+            )
+            self.update_queue_status_label()
 
     # ---------- UI ----------
 
@@ -270,8 +286,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.submit_card = QtWidgets.QFrame()
         self.submit_card.setObjectName("card")
         card_layout = QtWidgets.QVBoxLayout(self.submit_card)
-        card_layout.setContentsMargins(18, 14, 18, 14)
-        card_layout.setSpacing(10)
+        card_layout.setContentsMargins(18, 16, 18, 16)
+        card_layout.setSpacing(11)
 
         self.abaqus_status_label = QtWidgets.QLabel("Abaqus 状态：待检测")
         self.abaqus_status_label.setObjectName("hint")
@@ -464,9 +480,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.job_selector.setObjectName("runtimeSelector")
 
-        self.job_selector.setMinimumWidth(180)
+        self.job_selector.setMinimumWidth(148)
 
-        self.job_selector.setMaximumWidth(280)
+        self.job_selector.setMaximumWidth(220)
 
         self.job_selector.setFixedHeight(30)
         self.job_selector.setToolTip("点击展开切换作业；颜色表示作业状态")
@@ -480,6 +496,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.job_stats_label = QtWidgets.QLabel("运行中 0 | 完成 0 | 异常 0")
 
         self.job_stats_label.setObjectName("hint")
+        self.job_stats_label.setContentsMargins(0, 0, 8, 0)
 
         selector_row.addWidget(self.job_stats_label)
 
@@ -746,6 +763,26 @@ class MainWindow(QtWidgets.QMainWindow):
             "notify": self.notify_check.isChecked(),
         }
 
+    def restore_joblist_state(self) -> None:
+        candidates, queue_items, error = load_joblist_state()
+        self.candidate_queue_items = candidates
+        self.queue_items = queue_items
+        self.joblist_load_error = error
+
+    def request_joblist_save(self) -> None:
+        if self._closing:
+            return
+        if not hasattr(self, "_joblist_save_timer"):
+            return
+        self._joblist_save_timer.start(FORMAL_QUEUE_SAVE_DEBOUNCE_MS)
+
+    def save_joblist_state_now(self) -> None:
+        try:
+            save_joblist_state(self.candidate_queue_items, self.queue_items)
+        except OSError as exc:
+            if hasattr(self, "history"):
+                self.append_history(f"保存 joblist.json 失败：{exc}")
+
     def find_queue_item_by_job(
         self,
         *,
@@ -871,6 +908,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.queue_items,
             self.current_queue_settings(),
             self.inp_row.text(),
+            initial_candidates=self.candidate_queue_items,
+            joblist_save_callback=self.request_joblist_save,
         )
         dialog.setModal(False)
         dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -1096,6 +1135,7 @@ class MainWindow(QtWidgets.QMainWindow):
         added = int(merge_result["added"])
         updated = int(merge_result["updated"])
         status_only_updates = int(merge_result["status_only_updates"])
+        terminal_external_records = merge_result.get("terminal_external_records") or []
 
         for record in merge_result["memory_records"]:
             target_item = record["item"]
@@ -1116,6 +1156,20 @@ class MainWindow(QtWidgets.QMainWindow):
                     work_dir=target_item.effective_work_dir or job_work_dir,
                 )
                 self.memory_adapter.activate_job(ext_key)
+
+        for record in terminal_external_records:
+            target_item = record.get("item")
+            key = record.get("key")
+            if target_item is None or not key:
+                continue
+            ext_key = f"{key[0]}::{target_item.job_name.lower()}"
+            self.memory_adapter.finalize_job(ext_key)
+            if not target_item.message:
+                target_item.message = f"外部作业状态：{target_item.status}"
+
+        if terminal_external_records:
+            self.refresh_queue_dependencies()
+            self.request_dispatch_queue()
 
         for record in merge_result["debug_records"]:
             self.append_external_scan_debug_log(
@@ -1965,10 +2019,10 @@ class MainWindow(QtWidgets.QMainWindow):
             f"background: {background};"
             "color: #0f172a;"
             "border: 1px solid #cbd5e1;"
-            "border-radius: 4px;"
+            "border-radius: 6px;"
             "min-height: 30px;"
             "max-height: 30px;"
-            "padding: 0 24px 0 8px;"
+            "padding: 0 24px 0 9px;"
             "}"
             "QComboBox#runtimeSelector::drop-down {"
             "subcontrol-origin: border;"
@@ -1976,6 +2030,15 @@ class MainWindow(QtWidgets.QMainWindow):
             "width: 22px;"
             "border: 0;"
             "margin: 1px 1px 1px 0;"
+            "}"
+            "QComboBox#runtimeSelector QAbstractItemView {"
+            "background: #ffffff;"
+            "border: 1px solid #cbd5e1;"
+            "border-radius: 6px;"
+            "padding: 4px;"
+            "outline: 0;"
+            "selection-background-color: #dbeafe;"
+            "selection-color: #0f172a;"
             "}"
         )
 
@@ -2215,10 +2278,12 @@ class MainWindow(QtWidgets.QMainWindow):
         cancelled = counts.get(STATUS_CANCELED, 0) + counts.get(STATUS_TERMINATED, 0)
         if not self.queue_items:
             self.queue_status_label.setText("队列：未生成")
+            self.request_joblist_save()
             return
         self.queue_status_label.setText(
             f"队列：{len(self.queue_items)} 个 | 运行 {running} | 等待 {pending} | 完成 {completed} | 失败 {failed} | 取消 {cancelled}"
         )
+        self.request_joblist_save()
 
     def update_abaqus_status(self) -> None:
         abaqus_path = shutil.which("abaqus")
@@ -2420,6 +2485,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """关闭窗口前停止后台内存监测。"""
         self._closing = True
         self._dispatch_timer.stop()
+        self._joblist_save_timer.stop()
+        self.save_joblist_state_now()
         self._ui_heartbeat_timer.stop()
         abaqus_status_thread = self.abaqus_status_thread
         if abaqus_status_thread is not None:

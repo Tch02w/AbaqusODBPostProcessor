@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import os
 
-from .constants import ACTIVE_STATUSES, STATUS_UNKNOWN
+from .constants import ACTIVE_STATUSES, STATUS_UNKNOWN, TERMINAL_STATUSES
 from .models import QueueItem
-from .process_scanner import scan_running_abaqus_jobs_by_psutil
+from .process_scanner import (
+    EXTERNAL_SCAN_MAX_CHILD_DEPTH,
+    scan_running_abaqus_jobs_by_psutil,
+    work_dir_matches_scan_root,
+)
 from .qt_compat import QtCore, Signal
 from .queue_scheduler import (
     effective_queue_item_work_dir,
     managed_job_key,
-    normalize_work_dir,
     queue_item_conflict_key,
 )
 
@@ -44,7 +47,6 @@ def collect_known_external_jobs(
     queue_items: list[QueueItem],
     work_dir: str,
 ) -> list[dict]:
-    normalized_work_dir = normalize_work_dir(work_dir)
     jobs = []
     for item in queue_items:
         if not item.is_external:
@@ -52,7 +54,11 @@ def collect_known_external_jobs(
         item_work_dir = effective_queue_item_work_dir(item)
         if not item_work_dir:
             continue
-        if normalize_work_dir(item_work_dir) != normalized_work_dir:
+        if not work_dir_matches_scan_root(
+            item_work_dir,
+            work_dir,
+            EXTERNAL_SCAN_MAX_CHILD_DEPTH,
+        ):
             continue
         jobs.append(
             {
@@ -89,6 +95,7 @@ def merge_external_scan_results(
     status_only_updates = 0
     updated_items: list[QueueItem] = []
     active_external_items: list[QueueItem] = []
+    terminal_external_records: list[dict] = []
     debug_records: list[dict] = []
     memory_records: list[dict] = []
 
@@ -105,6 +112,7 @@ def merge_external_scan_results(
         matched = queue_item_by_key.get(key)
         runtime_status = job.get("runtime_status") or STATUS_UNKNOWN
         runtime_message = job.get("runtime_message") or "外部作业状态待确认"
+        previous_status = matched.status if matched is not None else ""
 
         if job.get("status_only_update"):
             if matched is not None:
@@ -125,6 +133,17 @@ def merge_external_scan_results(
                 )
                 if matched.status in ACTIVE_STATUSES:
                     active_external_items.append(matched)
+                if previous_status in ACTIVE_STATUSES and matched.status in TERMINAL_STATUSES:
+                    terminal_external_records.append(
+                        {
+                            "item": matched,
+                            "job": job,
+                            "key": key,
+                            "work_dir": job_work_dir,
+                            "previous_status": previous_status,
+                            "status": matched.status,
+                        }
+                    )
                 debug_records.append(
                     {
                         "job_name": job_name,
@@ -186,6 +205,17 @@ def merge_external_scan_results(
             )
             if target_item.status in ACTIVE_STATUSES:
                 active_external_items.append(target_item)
+            if previous_status in ACTIVE_STATUSES and target_item.status in TERMINAL_STATUSES:
+                terminal_external_records.append(
+                    {
+                        "item": target_item,
+                        "job": job,
+                        "key": key,
+                        "work_dir": job_work_dir,
+                        "previous_status": previous_status,
+                        "status": target_item.status,
+                    }
+                )
 
         debug_records.append(
             {
@@ -203,6 +233,7 @@ def merge_external_scan_results(
         "status_only_updates": status_only_updates,
         "updated_items": updated_items,
         "active_external_items": active_external_items,
+        "terminal_external_records": terminal_external_records,
         "debug_records": debug_records,
         "memory_records": memory_records,
     }

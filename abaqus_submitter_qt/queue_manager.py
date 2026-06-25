@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import os
 import json
+from dataclasses import asdict, fields
 from pathlib import Path
 
 from .constants import (
+    ACTIVE_STATUSES,
+    JOBLIST_FILENAME,
     STATUS_CANCELED,
     STATUS_COMPLETED,
     STATUS_CONFIRMING,
@@ -36,6 +39,7 @@ from .queue_scheduler import (
 
 RESULT_EXTENSIONS = (".odb", ".sta", ".msg", ".dat", ".log")
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
+JOBLIST_PATH = Path(__file__).resolve().parents[1] / JOBLIST_FILENAME
 ADD_STATS_DETAIL_LIMIT = 10
 TABLE_ROW_KEY_ROLE = QtCore.Qt.ItemDataRole.UserRole
 CANDIDATE_COLUMNS = (
@@ -80,6 +84,66 @@ def atomic_write_json(path, payload):
         file.flush()
         os.fsync(file.fileno())
     os.replace(temp_path, path)
+
+
+QUEUE_ITEM_FIELD_NAMES = {field.name for field in fields(QueueItem)}
+_last_saved_joblist_payload: dict | None = None
+
+
+def queue_item_to_json(item: QueueItem) -> dict:
+    return asdict(item)
+
+
+def queue_item_from_json(payload: object, *, restore_active_state: bool = True) -> QueueItem | None:
+    if not isinstance(payload, dict):
+        return None
+    values = {key: value for key, value in payload.items() if key in QUEUE_ITEM_FIELD_NAMES}
+    try:
+        item = QueueItem(**values)
+    except TypeError:
+        return None
+    if restore_active_state and item.status in ACTIVE_STATUSES:
+        item.status = STATUS_UNKNOWN
+        item.message = "程序重启后状态待确认"
+        item.active_job_key = ""
+        item.pids = []
+        item.pid_create_times = {}
+        item.rss_bytes = 0
+    return item
+
+
+def load_joblist_state() -> tuple[list[QueueItem], list[QueueItem], str]:
+    try:
+        with JOBLIST_PATH.open("r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except FileNotFoundError:
+        return [], [], ""
+    except (OSError, json.JSONDecodeError) as exc:
+        return [], [], str(exc)
+    if not isinstance(payload, dict):
+        return [], [], "joblist.json 格式不是对象"
+
+    def read_items(key: str) -> list[QueueItem]:
+        items = []
+        for raw_item in payload.get(key, []) or []:
+            item = queue_item_from_json(raw_item, restore_active_state=key == "queue_items")
+            if item is not None:
+                items.append(item)
+        return items
+
+    return read_items("candidates"), read_items("queue_items"), ""
+
+
+def save_joblist_state(candidates: list[QueueItem], queue_items: list[QueueItem]) -> None:
+    global _last_saved_joblist_payload
+    payload = {
+        "candidates": [queue_item_to_json(item) for item in candidates],
+        "queue_items": [queue_item_to_json(item) for item in queue_items],
+    }
+    if payload == _last_saved_joblist_payload:
+        return
+    atomic_write_json(str(JOBLIST_PATH), payload)
+    _last_saved_joblist_payload = payload
 
 
 class FolderScanWorker(QtCore.QObject):
@@ -127,7 +191,16 @@ class QueueManagerDialog(QtWidgets.QDialog):
     terminateRequested = Signal(list)
     scanExternalRequested = Signal(str)
 
-    def __init__(self, parent, queue_items: list[QueueItem], current_settings, current_inp=""):
+    def __init__(
+        self,
+        parent,
+        queue_items: list[QueueItem],
+        current_settings,
+        current_inp="",
+        *,
+        initial_candidates: list[QueueItem] | None = None,
+        joblist_save_callback=None,
+    ):
         super().__init__(parent)
         self.setWindowFlag(QtCore.Qt.WindowType.Window, True)
         self.setWindowTitle("作业队列管理")
@@ -135,7 +208,8 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.queue_items = queue_items
         self.current_settings = current_settings
         self.current_inp = current_inp
-        self.candidates: list[QueueItem] = []
+        self.candidates = initial_candidates if initial_candidates is not None else []
+        self.joblist_save_callback = joblist_save_callback
         self.saved_paths = self.load_saved_paths()
         self.last_oldjob_odb_dir = str(self.saved_paths.get("qt_oldjob_odb_dir", "") or "")
         self.external_scan_busy = False
@@ -147,6 +221,10 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
         self.build_ui()
         self.refresh_tables()
+
+    def request_joblist_save(self) -> None:
+        if self.joblist_save_callback is not None:
+            self.joblist_save_callback()
 
     # ---------- UI ----------
 
@@ -275,16 +353,16 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.setStyleSheet(
             """
             QDialog {
-                background: #f3f6fa;
+                background: #eef3f8;
                 font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
                 font-size: 12px;
             }
             QGroupBox {
                 background: #ffffff;
-                border: 1px solid #d1d5db;
-                border-radius: 4px;
+                border: 1px solid #d8e1ee;
+                border-radius: 8px;
                 margin-top: 10px;
-                padding-top: 10px;
+                padding-top: 12px;
                 font-weight: 600;
             }
             QGroupBox::title {
@@ -298,16 +376,16 @@ class QueueManagerDialog(QtWidgets.QDialog):
                 background: #ffffff;
             }
             QLabel#hint {
-                color: #3f5f87;
+                color: #64748b;
                 font-weight: 400;
             }
             QPushButton {
                 background: #dbe3ee;
                 color: #111827;
                 border: 0;
-                border-radius: 6px;
-                min-height: 28px;
-                padding: 3px 10px;
+                border-radius: 8px;
+                min-height: 30px;
+                padding: 4px 12px;
                 font-weight: 600;
             }
             QPushButton:hover {
@@ -338,22 +416,28 @@ class QueueManagerDialog(QtWidgets.QDialog):
                 background: #f8fafc;
                 color: #111827;
                 border: 1px solid #cbd5e1;
-                border-radius: 4px;
+                border-radius: 6px;
                 min-height: 30px;
                 padding: 0 8px;
+                selection-background-color: #bfdbfe;
+            }
+            QLineEdit:focus {
+                border-color: #60a5fa;
+                background: #ffffff;
             }
             QTableWidget {
                 background: #ffffff;
-                border: 1px solid #cbd5e1;
+                border: 1px solid #d8e1ee;
+                border-radius: 6px;
                 gridline-color: #e5e7eb;
                 selection-background-color: #dbeafe;
                 selection-color: #111827;
             }
             QHeaderView::section {
-                background: #eef4fb;
+                background: #f1f5f9;
                 border: 0;
                 border-right: 1px solid #e5e7eb;
-                padding: 6px;
+                padding: 7px 6px;
                 font-weight: 500;
             }
             QScrollBar:vertical, QScrollBar:horizontal {
@@ -596,6 +680,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             self.save_saved_paths()
             self.revalidate_candidates()
             self.refresh_candidate_table()
+            self.request_joblist_save()
 
     def choose_archive_dir(self) -> None:
         folder = QtWidgets.QFileDialog.getExistingDirectory(
@@ -723,6 +808,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
         if changed:
             self.revalidate_candidates()
             self.refresh_candidate_table()
+            self.request_joblist_save()
         else:
             self.refresh_summaries()
 
@@ -939,6 +1025,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             return
         self.candidates[row].selected = table_item.checkState() == QtCore.Qt.CheckState.Checked
         self.refresh_summaries()
+        self.request_joblist_save()
 
     def on_candidate_item_double_clicked(self, item: QtWidgets.QTableWidgetItem) -> None:
         row = item.row()
@@ -949,6 +1036,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
         if column == CANDIDATE_CHECK_COLUMN:
             self.candidates[row].selected = not self.candidates[row].selected
             self.refresh_candidate_table()
+            self.request_joblist_save()
         elif column == CANDIDATE_RESTART_COLUMN:
             self.choose_candidate_restart_dependency(row)
         elif column == CANDIDATE_FORTRAN_COLUMN:
@@ -1001,6 +1089,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.detect_restart(item)
         self.validate_candidate(item)
         self.refresh_candidate_table()
+        self.request_joblist_save()
 
     def choose_candidate_fortran_file(self, row: int) -> None:
         item = self.candidates[row]
@@ -1010,18 +1099,21 @@ class QueueManagerDialog(QtWidgets.QDialog):
         item.fortran_path = os.path.normpath(path)
         self.validate_candidate(item)
         self.refresh_candidate_table()
+        self.request_joblist_save()
 
     def set_candidate_selection(self, selected: bool) -> None:
         for item in self.candidates:
             if item.valid:
                 item.selected = selected
         self.refresh_candidate_table()
+        self.request_joblist_save()
 
     def invert_candidate_selection(self) -> None:
         for item in self.candidates:
             if item.valid:
                 item.selected = not item.selected
         self.refresh_candidate_table()
+        self.request_joblist_save()
 
     def remove_selected_candidates(self) -> None:
         selected_rows = {index.row() for index in self.candidate_table.selectedIndexes()}
@@ -1030,6 +1122,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
         else:
             self.candidates[:] = [item for item in self.candidates if not item.selected]
         self.refresh_candidate_table()
+        self.request_joblist_save()
 
     @staticmethod
     def format_count_distribution(values: list[str], empty_text: str = "默认") -> str:
@@ -1352,6 +1445,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             added_ids.add(item.item_id)
         self.candidates[:] = [item for item in self.candidates if item.item_id not in added_ids]
         self.refresh_tables()
+        self.request_joblist_save()
 
     # ---------- Formal queue actions ----------
 
@@ -1393,6 +1487,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
                 self.apply_oldjob_file_to_item(item, oldjob_path)
                 self.apply_formal_item_edit_result(item)
                 self.refresh_queue_table()
+                self.request_joblist_save()
             return
         if column == FORMAL_FORTRAN_COLUMN:
             path = self.select_fortran_file(item.fortran_path or self.default_work_dir())
@@ -1400,6 +1495,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
                 item.fortran_path = path
                 self.apply_formal_item_edit_result(item)
                 self.refresh_queue_table()
+                self.request_joblist_save()
             return
         if column in (FORMAL_CORE_COLUMN, FORMAL_MEMORY_COLUMN):
             self.queue_table.editItem(table_item)
@@ -1428,6 +1524,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             item.memory = value
         self.apply_formal_item_edit_result(item)
         self.refresh_queue_table()
+        self.request_joblist_save()
 
     def cancel_selected_pending(self) -> None:
         blocked = False
@@ -1441,6 +1538,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             elif item.status in (STATUS_RUNNING, STATUS_STARTING, STATUS_TERMINATING):
                 blocked = True
         self.refresh_queue_table()
+        self.request_joblist_save()
         if blocked:
             QtWidgets.QMessageBox.information(self, "不能取消运行中作业", "运行中作业请使用“终止选中的运行中作业”。")
 
@@ -1489,6 +1587,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             item.status = STATUS_PENDING_RUN if item.valid else STATUS_FAILED
             item.message = "待提交" if item.valid else item.message
         self.refresh_queue_table()
+        self.request_joblist_save()
 
     def terminate_selected_running(self) -> None:
         item_ids = []
@@ -1503,10 +1602,12 @@ class QueueManagerDialog(QtWidgets.QDialog):
         if item_ids:
             self.terminateRequested.emit(item_ids)
         self.refresh_queue_table()
+        self.request_joblist_save()
 
     def clear_finished(self) -> None:
         self.queue_items[:] = [item for item in self.queue_items if item.status not in TERMINAL_STATUSES]
         self.refresh_tables()
+        self.request_joblist_save()
 
     def choose_work_dir(self) -> None:
         folder = QtWidgets.QFileDialog.getExistingDirectory(self, "选择外部作业工作目录", self.default_work_dir())

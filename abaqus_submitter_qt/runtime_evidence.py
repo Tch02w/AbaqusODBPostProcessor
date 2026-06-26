@@ -12,7 +12,7 @@ from .abaqus_diagnostics import (
 )
 from .constants import SOLVER_START_GRACE_SECONDS, STA_POLL_INTERVAL_MS
 from .process_scanner import get_runtime_process_evidence
-from .qt_compat import hang_probe, hang_probe_log
+from .diagnostics import hang_probe, hang_probe_log
 
 
 STA_STABLE_POLLS_REQUIRED = 3
@@ -21,6 +21,8 @@ TERMINATION_STABLE_POLLS_REQUIRED = 3
 TERMINATION_STABLE_SECONDS = (
     (TERMINATION_STABLE_POLLS_REQUIRED - 1) * STA_POLL_INTERVAL_MS / 1000.0
 )
+ORPHANED_RUNTIME_STABLE_POLLS_REQUIRED = 6
+ORPHANED_RUNTIME_STABLE_SECONDS = 30.0
 SLOW_DIAGNOSTIC_INTERVAL_SECONDS = 10.0
 
 
@@ -505,12 +507,57 @@ def runtime_termination_ready(
     )
 
 
+def runtime_orphaned_after_external_stop_ready(
+    run: dict,
+    evidence: dict,
+    now: float | None = None,
+) -> bool:
+    """Return True when an already-started job lost every runtime signal.
+
+    This covers jobs terminated outside the app, or directories manually cleaned
+    after termination. It is deliberately separate from normal completion:
+    missing STA evidence can only become an interrupted/terminated outcome, not
+    a successful completion.
+    """
+    if run.get("terminating"):
+        return False
+    if not run.get("launcher_finished"):
+        return False
+    if not (run.get("solver_started") or run.get("seen_sta")):
+        return False
+    if not run.get("process_snapshot_available"):
+        run["orphaned_runtime_stable_polls"] = 0
+        run["orphaned_runtime_candidate_since"] = None
+        return False
+    if evidence.get("lck_exists") or evidence.get("solver_pid_active") or evidence.get("sta_valid"):
+        run["orphaned_runtime_stable_polls"] = 0
+        run["orphaned_runtime_candidate_since"] = None
+        return False
+    if evidence.get("log_delta") or evidence.get("sta_delta"):
+        run["orphaned_runtime_stable_polls"] = 0
+        run["orphaned_runtime_candidate_since"] = None
+        return False
+
+    current_time = time.monotonic() if now is None else now
+    candidate_since = run.get("orphaned_runtime_candidate_since")
+    if candidate_since is None:
+        candidate_since = current_time
+        run["orphaned_runtime_candidate_since"] = current_time
+
+    run["orphaned_runtime_stable_polls"] = int(run.get("orphaned_runtime_stable_polls", 0)) + 1
+    return (
+        int(run["orphaned_runtime_stable_polls"]) >= ORPHANED_RUNTIME_STABLE_POLLS_REQUIRED
+        and current_time - float(candidate_since) >= ORPHANED_RUNTIME_STABLE_SECONDS
+    )
+
+
 __all__ = [
     "build_sta_signature",
     "collect_runtime_evidence",
     "read_log_delta",
     "read_sta_delta",
     "runtime_completion_ready",
+    "runtime_orphaned_after_external_stop_ready",
     "runtime_termination_ready",
     "update_file_stability",
     "update_runtime_phase",

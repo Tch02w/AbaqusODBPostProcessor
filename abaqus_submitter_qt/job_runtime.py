@@ -14,10 +14,12 @@ from .abaqus_diagnostics import (
 )
 from .constants import SOLVER_START_GRACE_SECONDS, STA_POLL_INTERVAL_MS
 from .process_scanner import get_psutil_process_snapshot
-from .qt_compat import QtCore, Signal, hang_probe, hang_probe_function, hang_probe_log
+from .diagnostics import hang_probe, hang_probe_function, hang_probe_log
+from .qt_compat import QtCore, Signal
 from .runtime_evidence import (
     collect_runtime_evidence,
     runtime_completion_ready,
+    runtime_orphaned_after_external_stop_ready,
     runtime_termination_ready,
     update_file_stability,
     update_runtime_phase,
@@ -431,6 +433,78 @@ class JobRuntimeController(QtCore.QObject):
         )
         return True
 
+    def start_external_monitor(
+        self,
+        *,
+        job_key: str,
+        run: dict,
+    ) -> bool:
+        if job_key in self.runs:
+            return True
+
+        now = time.monotonic()
+        timer = QtCore.QTimer(self)
+        timer.setInterval(STA_POLL_INTERVAL_MS)
+
+        run["process"] = None
+        run["timer"] = timer
+        run.setdefault("is_external", True)
+        run.setdefault("activity_seen", True)
+        run.setdefault("solver_started", True)
+        run.setdefault("solver_kind", "")
+        run.setdefault("known_solver_pids", ())
+        if run.get("known_solver_pids"):
+            run.setdefault("solver_pid_seen_at", now)
+            run.setdefault("solver_pid_last_seen_at", now)
+            run.setdefault("solver_pid_confidence", "high")
+        else:
+            run.setdefault("solver_pid_seen_at", None)
+            run.setdefault("solver_pid_last_seen_at", None)
+            run.setdefault("solver_pid_confidence", "")
+        run.setdefault("runtime_phase", "SOLVING")
+        run.setdefault("runtime_started_monotonic", now)
+        run.setdefault("last_runtime_activity_at", now)
+        run.setdefault("runtime_phase_text_pending", "")
+        run.setdefault("runtime_diagnostic_status", "")
+        run.setdefault("runtime_diagnostic_detail", "")
+        run.setdefault("log_position", 0)
+        run.setdefault("msg_position", 0)
+        run.setdefault("dat_position", 0)
+        run.setdefault("launcher_finished", True)
+        run.setdefault("launcher_exit_code", 0)
+        run.setdefault("launcher_exit_status", None)
+        run.setdefault("launcher_finished_at", time.time())
+        run.setdefault("launcher_finished_monotonic", now)
+        run.setdefault("launcher_started", True)
+        run.setdefault("launcher_started_monotonic", now)
+        run.setdefault("solver_start_timeout", False)
+        run.setdefault("solver_start_timeout_detail", "")
+        run.setdefault("seen_sta", False)
+        run.setdefault("sta_valid", False)
+        run.setdefault("datacheck_stable_polls", 0)
+        run.setdefault("sta_signature", None)
+        run.setdefault("sta_stable_polls", 0)
+        run.setdefault("finish_candidate_since", None)
+        run.setdefault("termination_stable_polls", 0)
+        run.setdefault("termination_candidate_since", None)
+        run.setdefault("runtime_completion_confirmed", False)
+        run.setdefault("runtime_completion_reason", "")
+        run.setdefault("finish_emitted", False)
+        run.setdefault("_process_connections", ())
+
+        self.register_run(
+            job_key,
+            run,
+        )
+
+        timer_callback = lambda key=job_key: self.poll_sta_file(key)
+        timer.timeout.connect(timer_callback)
+        run["_timer_callback"] = timer_callback
+        timer.start()
+        QtCore.QTimer.singleShot(0, timer_callback)
+        self.jobUpdated.emit(job_key)
+        return True
+
     def on_process_started(self, job_key: str) -> None:
         with hang_probe("JobRuntimeController.on_process_started", job_key=job_key):
             run = self.runs.get(job_key)
@@ -603,6 +677,19 @@ class JobRuntimeController(QtCore.QObject):
             queue_item.message = "等待 STA 文件生成"
         self.jobUpdated.emit(job_key)
 
+    def update_runtime_queue_message(self, job_key: str, run: dict) -> None:
+        queue_item = run.get("queue_item")
+        if queue_item is None:
+            return
+
+        if run.get("runtime_phase") == "FINISH_CANDIDATE":
+            message = "状态确认中，等待 STA/LCK 稳定"
+        else:
+            message = "正式求解中"
+        if queue_item.message != message:
+            queue_item.message = message
+            self.jobUpdated.emit(job_key)
+
     @hang_probe_function("JobRuntimeController.poll_sta_file")
     def poll_sta_file(
         self,
@@ -662,9 +749,17 @@ class JobRuntimeController(QtCore.QObject):
             self.emit_job_finished_once(job_key, run)
             return
 
+        if runtime_orphaned_after_external_stop_ready(run, evidence):
+            run["runtime_diagnostic_status"] = "终止"
+            run["runtime_diagnostic_detail"] = "未发现 LCK、求解器进程或有效 STA，判断作业已在外部停止"
+            self.emit_job_finished_once(job_key, run)
+            return
+
         if not evidence.get("sta_valid"):
             self.handle_runtime_not_ready(job_key, run)
             return
+
+        self.update_runtime_queue_message(job_key, run)
 
         if not run.get("memory_monitor_activated"):
             run["memory_monitor_activated"] = True

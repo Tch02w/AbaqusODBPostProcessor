@@ -30,12 +30,14 @@ from .constants import (
 from .models import QueueItem
 
 from .command import derive_job_name, derive_oldjob_name, inp_has_restart_keyword, validate_job_name
-from .qt_compat import QtCore, QtWidgets, Signal, Slot, hang_probe_function
+from .diagnostics import StartupTimeline, hang_probe_function
+from .qt_compat import QtCore, QtGui, QtWidgets, Signal, Slot
 from .queue_scheduler import (
     effective_queue_item_work_dir,
     queue_item_conflict_key,
     queue_status_counts,
 )
+from .ui_styles import build_queue_manager_stylesheet
 
 RESULT_EXTENSIONS = (".odb", ".sta", ".msg", ".dat", ".log")
 CONFIG_PATH = Path(__file__).resolve().parents[1] / "config.json"
@@ -202,6 +204,11 @@ class QueueManagerDialog(QtWidgets.QDialog):
         joblist_save_callback=None,
     ):
         super().__init__(parent)
+        self._startup_timeline = StartupTimeline("QueueManagerDialog")
+        self._startup_timeline_active = self._startup_timeline.enabled
+        self._startup_candidate_refresh_done = False
+        self._startup_queue_refresh_done = False
+        self._startup_timeline.mark("queue-dialog-init-start")
         self.setWindowFlag(QtCore.Qt.WindowType.Window, True)
         self.setWindowTitle("作业队列管理")
         self.resize(1280, 752)
@@ -211,6 +218,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.candidates = initial_candidates if initial_candidates is not None else []
         self.joblist_save_callback = joblist_save_callback
         self.saved_paths = self.load_saved_paths()
+        self._startup_timeline.mark("load-saved-paths")
         self.last_oldjob_odb_dir = str(self.saved_paths.get("qt_oldjob_odb_dir", "") or "")
         self.external_scan_busy = False
         self.folder_scan_thread: QtCore.QThread | None = None
@@ -218,9 +226,13 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.folder_scan_closing = False
         self.candidate_columns_initialized = False
         self.formal_columns_initialized = False
+        self._table_refresh_tokens: dict[int, int] = {}
+        self._table_refresh_batch_size = 80
 
         self.build_ui()
-        self.refresh_tables()
+        self._startup_timeline.mark("build-ui")
+        QtCore.QTimer.singleShot(0, self.refresh_tables)
+        self._startup_timeline.mark("schedule-initial-refresh")
 
     def request_joblist_save(self) -> None:
         if self.joblist_save_callback is not None:
@@ -350,114 +362,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.choose_work_dir_btn.clicked.connect(self.choose_work_dir)
         self.scan_external_btn.clicked.connect(self.request_external_scan)
 
-        self.setStyleSheet(
-            """
-            QDialog {
-                background: #eef3f8;
-                font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
-                font-size: 12px;
-            }
-            QGroupBox {
-                background: #ffffff;
-                border: 1px solid #d8e1ee;
-                border-radius: 8px;
-                margin-top: 10px;
-                padding-top: 12px;
-                font-weight: 600;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 8px;
-                padding: 0 4px;
-                background: #ffffff;
-            }
-            QGroupBox QLabel,
-            QGroupBox QCheckBox {
-                background: #ffffff;
-            }
-            QLabel#hint {
-                color: #64748b;
-                font-weight: 400;
-            }
-            QPushButton {
-                background: #dbe3ee;
-                color: #111827;
-                border: 0;
-                border-radius: 8px;
-                min-height: 30px;
-                padding: 4px 12px;
-                font-weight: 600;
-            }
-            QPushButton:hover {
-                background: #cbd5e1;
-            }
-            QPushButton#light {
-                background: #dbe3ee;
-                color: #111827;
-            }
-            QPushButton#light:hover {
-                background: #cbd5e1;
-            }
-            QPushButton#primary {
-                background: #2563eb;
-                color: #ffffff;
-            }
-            QPushButton#primary:hover {
-                background: #1d4ed8;
-            }
-            QPushButton#danger {
-                background: #dc2626;
-                color: #ffffff;
-            }
-            QPushButton#danger:hover {
-                background: #b91c1c;
-            }
-            QLineEdit {
-                background: #f8fafc;
-                color: #111827;
-                border: 1px solid #cbd5e1;
-                border-radius: 6px;
-                min-height: 30px;
-                padding: 0 8px;
-                selection-background-color: #bfdbfe;
-            }
-            QLineEdit:focus {
-                border-color: #60a5fa;
-                background: #ffffff;
-            }
-            QTableWidget {
-                background: #ffffff;
-                border: 1px solid #d8e1ee;
-                border-radius: 6px;
-                gridline-color: #e5e7eb;
-                selection-background-color: #dbeafe;
-                selection-color: #111827;
-            }
-            QHeaderView::section {
-                background: #f1f5f9;
-                border: 0;
-                border-right: 1px solid #e5e7eb;
-                padding: 7px 6px;
-                font-weight: 500;
-            }
-            QScrollBar:vertical, QScrollBar:horizontal {
-                background: #eef2f7;
-                border: 0;
-                width: 12px;
-                height: 12px;
-            }
-            QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
-                background: #9fb1c8;
-                border-radius: 6px;
-                min-height: 24px;
-                min-width: 24px;
-            }
-            QScrollBar::add-line, QScrollBar::sub-line {
-                width: 0;
-                height: 0;
-            }
-            """
-        )
+        self.setStyleSheet(build_queue_manager_stylesheet())
 
     def make_button(self, text: str, variant: str = "light") -> QtWidgets.QPushButton:
         button = QtWidgets.QPushButton(text)
@@ -528,6 +433,19 @@ class QueueManagerDialog(QtWidgets.QDialog):
         while table.rowCount() < target_count:
             table.insertRow(table.rowCount())
 
+    def next_table_refresh_token(self, table: QtWidgets.QTableWidget) -> int:
+        table_key = id(table)
+        token = self._table_refresh_tokens.get(table_key, 0) + 1
+        self._table_refresh_tokens[table_key] = token
+        return token
+
+    def table_refresh_is_current(self, table: QtWidgets.QTableWidget, token: int) -> bool:
+        return self._table_refresh_tokens.get(id(table)) == token
+
+    def cancel_table_refreshes(self) -> None:
+        for table_key, token in list(self._table_refresh_tokens.items()):
+            self._table_refresh_tokens[table_key] = token + 1
+
     def update_table_cell(
         self,
         table: QtWidgets.QTableWidget,
@@ -564,6 +482,169 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
         if table_item.text() != value:
             table_item.setText(value)
+        self.apply_queue_status_cell_style(table_item, table, column, value)
+
+    @staticmethod
+    def queue_status_cell_colors(status: str) -> tuple[str, str]:
+        if status in {STATUS_RUNNING, STATUS_STARTING}:
+            return "#dcfce7", "#166534"
+        if status in {STATUS_COMPLETED, STATUS_DATACHECK_COMPLETED}:
+            return "#dbeafe", "#1e3a8a"
+        if status in {STATUS_FAILED, STATUS_DATACHECK_FAILED}:
+            return "#fee2e2", "#991b1b"
+        if status in {STATUS_TERMINATED, STATUS_TERMINATING, STATUS_CANCELED}:
+            return "#ede9fe", "#5b21b6"
+        if status == STATUS_WAITING_DEPENDENCY:
+            return "#fef3c7", "#92400e"
+        if status in {STATUS_CONFIRMING, STATUS_INTERRUPTED, STATUS_UNKNOWN}:
+            return "#e2e8f0", "#334155"
+        if status == STATUS_PENDING_RUN:
+            return "#f8fafc", "#0f172a"
+        return "#ffffff", "#111827"
+
+    def apply_queue_status_cell_style(
+        self,
+        table_item: QtWidgets.QTableWidgetItem,
+        table: QtWidgets.QTableWidget,
+        column: int,
+        value: str,
+    ) -> None:
+        if table is not self.queue_table or column != 8:
+            return
+        background, foreground = self.queue_status_cell_colors(value)
+        table_item.setBackground(QtGui.QColor(background))
+        table_item.setForeground(QtGui.QColor(foreground))
+
+    def populate_table_rows(
+        self,
+        table: QtWidgets.QTableWidget,
+        items: list[QueueItem],
+        columns: tuple[str, ...],
+        row_value_builder,
+        start_row: int,
+        end_row: int,
+        *,
+        checkable_first_column: bool = False,
+    ) -> None:
+        for row in range(start_row, end_row):
+            item = items[row]
+            row_key = self.item_row_key(item)
+            values = row_value_builder(item, row + 1)
+            for column, value in enumerate(values):
+                check_state = None
+                if checkable_first_column and column == 0:
+                    check_state = (
+                        QtCore.Qt.CheckState.Checked
+                        if item.selected
+                        else QtCore.Qt.CheckState.Unchecked
+                    )
+                self.update_table_cell(
+                    table,
+                    row,
+                    column,
+                    value,
+                    columns[column],
+                    row_key,
+                    check_state,
+                )
+
+    def finish_table_refresh(
+        self,
+        table: QtWidgets.QTableWidget,
+        selected_keys: set[str],
+        current_key: str,
+        scroll_value: int,
+        sorting_enabled: bool,
+    ) -> None:
+        table.setSortingEnabled(sorting_enabled)
+        self.restore_table_view_state(table, selected_keys, current_key, scroll_value)
+        table.viewport().update()
+        self.mark_initial_table_refresh_finished(table)
+
+    def mark_initial_table_refresh_finished(self, table: QtWidgets.QTableWidget) -> None:
+        if not self._startup_timeline_active:
+            return
+        if table is self.candidate_table and not self._startup_candidate_refresh_done:
+            self._startup_candidate_refresh_done = True
+            self._startup_timeline.mark(
+                "candidate-table-filled",
+                rows=self.candidate_table.rowCount(),
+            )
+        elif table is self.queue_table and not self._startup_queue_refresh_done:
+            self._startup_queue_refresh_done = True
+            self._startup_timeline.mark(
+                "queue-table-filled",
+                rows=self.queue_table.rowCount(),
+            )
+
+        if self._startup_candidate_refresh_done and self._startup_queue_refresh_done:
+            self._startup_timeline_active = False
+            self._startup_timeline.mark("initial-refresh-done")
+
+    def populate_table_rows_batched(
+        self,
+        table: QtWidgets.QTableWidget,
+        token: int,
+        items: list[QueueItem],
+        columns: tuple[str, ...],
+        row_value_builder,
+        selected_keys: set[str],
+        current_key: str,
+        scroll_value: int,
+        sorting_enabled: bool,
+        start_row: int,
+        *,
+        checkable_first_column: bool = False,
+    ) -> None:
+        if self.folder_scan_closing:
+            return
+        if not self.table_refresh_is_current(table, token):
+            return
+
+        end_row = min(start_row + self._table_refresh_batch_size, len(items))
+        table.blockSignals(True)
+        table.setUpdatesEnabled(False)
+        try:
+            self.populate_table_rows(
+                table,
+                items,
+                columns,
+                row_value_builder,
+                start_row,
+                end_row,
+                checkable_first_column=checkable_first_column,
+            )
+        finally:
+            table.setUpdatesEnabled(True)
+            table.blockSignals(False)
+
+        if end_row >= len(items):
+            if self.table_refresh_is_current(table, token):
+                self.finish_table_refresh(
+                    table,
+                    selected_keys,
+                    current_key,
+                    scroll_value,
+                    sorting_enabled,
+                )
+            return
+
+        QtCore.QTimer.singleShot(
+            0,
+            lambda: self.populate_table_rows_batched(
+                table,
+                token,
+                items,
+                columns,
+                row_value_builder,
+                selected_keys,
+                current_key,
+                scroll_value,
+                sorting_enabled,
+                end_row,
+                checkable_first_column=checkable_first_column,
+            ),
+        )
 
     def restore_table_view_state(
         self,
@@ -612,44 +693,57 @@ class QueueManagerDialog(QtWidgets.QDialog):
         row_value_builder,
         *,
         checkable_first_column: bool = False,
+        batch: bool = False,
     ) -> None:
         selected_keys = self.selected_table_row_keys(table)
         current_key = self.current_table_row_key(table)
         scroll_value = table.verticalScrollBar().value()
         sorting_enabled = table.isSortingEnabled()
+        items_snapshot = list(items)
+        token = self.next_table_refresh_token(table)
 
         table.blockSignals(True)
         table.setUpdatesEnabled(False)
         table.setSortingEnabled(False)
         try:
-            self.resize_table_to_count(table, len(items))
-            for row, item in enumerate(items):
-                row_key = self.item_row_key(item)
-                values = row_value_builder(item, row + 1)
-                for column, value in enumerate(values):
-                    check_state = None
-                    if checkable_first_column and column == 0:
-                        check_state = (
-                            QtCore.Qt.CheckState.Checked
-                            if item.selected
-                            else QtCore.Qt.CheckState.Unchecked
-                        )
-                    self.update_table_cell(
-                        table,
-                        row,
-                        column,
-                        value,
-                        columns[column],
-                        row_key,
-                        check_state,
-                    )
+            self.resize_table_to_count(table, len(items_snapshot))
+            if not batch or len(items_snapshot) <= self._table_refresh_batch_size:
+                self.populate_table_rows(
+                    table,
+                    items_snapshot,
+                    columns,
+                    row_value_builder,
+                    0,
+                    len(items_snapshot),
+                    checkable_first_column=checkable_first_column,
+                )
         finally:
-            table.setSortingEnabled(sorting_enabled)
             table.setUpdatesEnabled(True)
             table.blockSignals(False)
 
-        self.restore_table_view_state(table, selected_keys, current_key, scroll_value)
-        table.viewport().update()
+        if not batch or len(items_snapshot) <= self._table_refresh_batch_size:
+            self.finish_table_refresh(
+                table,
+                selected_keys,
+                current_key,
+                scroll_value,
+                sorting_enabled,
+            )
+            return
+
+        self.populate_table_rows_batched(
+            table,
+            token,
+            items_snapshot,
+            columns,
+            row_value_builder,
+            selected_keys,
+            current_key,
+            scroll_value,
+            sorting_enabled,
+            0,
+            checkable_first_column=checkable_first_column,
+        )
 
     def load_saved_paths(self) -> dict:
         try:
@@ -935,6 +1029,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
     def closeEvent(self, event) -> None:
         self.folder_scan_closing = True
+        self.cancel_table_refreshes()
         super().closeEvent(event)
 
     def has_result_files(self, inp_path: str) -> bool:
@@ -1228,10 +1323,15 @@ class QueueManagerDialog(QtWidgets.QDialog):
         layout.addWidget(QtWidgets.QLabel(f"当前 Restart 作业：\n{item.job_name}"))
 
         form = QtWidgets.QFormLayout()
-        dependency_combo = QtWidgets.QComboBox()
-        dependency_combo.addItem("手动选择 oldjob ODB 文件", None)
-        for option in self.build_restart_dependency_options(item, preceding_candidates):
-            dependency_combo.addItem(option["label"], option)
+        dependency_options = self.build_restart_dependency_options(item, preceding_candidates)
+        dependency_combo = QtWidgets.QComboBox() if dependency_options else None
+        if dependency_combo is not None:
+            for option in dependency_options:
+                dependency_combo.addItem(option["label"], option)
+
+        dependency_hint = QtWidgets.QLabel("未找到可直接选择的前置队列作业，请手动指定 oldjob 名称和 ODB 文件。")
+        dependency_hint.setObjectName("hint")
+        dependency_hint.setWordWrap(True)
 
         oldjob_name_edit = QtWidgets.QLineEdit(item.oldjob_name or derive_oldjob_name(item.oldjob_path))
         oldjob_path_edit = QtWidgets.QLineEdit(item.oldjob_path)
@@ -1241,7 +1341,10 @@ class QueueManagerDialog(QtWidgets.QDialog):
         file_row.addWidget(oldjob_path_edit, 1)
         file_row.addWidget(choose_odb_btn)
 
-        form.addRow("请选择前置作业", dependency_combo)
+        if dependency_combo is not None:
+            form.addRow("请选择前置作业", dependency_combo)
+        else:
+            form.addRow("前置作业", dependency_hint)
         form.addRow("oldjob 名称", oldjob_name_edit)
         form.addRow("前置 ODB 文件", file_row)
         layout.addLayout(form)
@@ -1252,20 +1355,24 @@ class QueueManagerDialog(QtWidgets.QDialog):
         layout.addWidget(buttons)
 
         selected_result: dict[str, str] = {}
+        manual_selection = {"value": dependency_combo is None}
 
         def apply_combo_selection(index: int) -> None:
+            if dependency_combo is None:
+                return
             data = dependency_combo.itemData(index)
             if not data:
                 return
+            manual_selection["value"] = False
             oldjob_name_edit.setText(str(data.get("oldjob_name", "")))
             oldjob_path_edit.setText(str(data.get("oldjob_path", "")))
 
         def choose_oldjob_file() -> None:
             oldjob_path = self.select_oldjob_odb_file(oldjob_path_edit.text() or item.oldjob_dir)
             if oldjob_path:
+                manual_selection["value"] = True
                 oldjob_path_edit.setText(oldjob_path)
                 oldjob_name_edit.setText(Path(oldjob_path).stem)
-                dependency_combo.setCurrentIndex(0)
 
         def accept_dialog() -> None:
             oldjob_path = oldjob_path_edit.text().strip()
@@ -1284,8 +1391,12 @@ class QueueManagerDialog(QtWidgets.QDialog):
                 QtWidgets.QMessageBox.warning(dialog, "Restart 依赖无效", "请选择前置 ODB 文件。")
                 return
 
-            data = dependency_combo.itemData(dependency_combo.currentIndex())
-            allow_missing = bool(data and str(data.get("allow_missing", "")) == "1")
+            data = dependency_combo.itemData(dependency_combo.currentIndex()) if dependency_combo is not None else None
+            allow_missing = bool(
+                not manual_selection["value"]
+                and data
+                and str(data.get("allow_missing", "")) == "1"
+            )
             if Path(oldjob_path).stem.lower() != oldjob_name.lower():
                 oldjob_path = str(Path(oldjob_path).with_name(f"{oldjob_name}.odb"))
 
@@ -1306,14 +1417,15 @@ class QueueManagerDialog(QtWidgets.QDialog):
             )
             dialog.accept()
 
-        dependency_combo.currentIndexChanged.connect(apply_combo_selection)
+        if dependency_combo is not None:
+            dependency_combo.currentIndexChanged.connect(apply_combo_selection)
         choose_odb_btn.clicked.connect(choose_oldjob_file)
         buttons.accepted.connect(accept_dialog)
         buttons.rejected.connect(dialog.reject)
 
-        if dependency_combo.count() > 1 and not oldjob_name_edit.text().strip():
-            dependency_combo.setCurrentIndex(1)
-            apply_combo_selection(1)
+        if dependency_combo is not None and dependency_combo.count() > 0 and not oldjob_name_edit.text().strip():
+            dependency_combo.setCurrentIndex(0)
+            apply_combo_selection(0)
 
         if dialog.exec() != QtWidgets.QDialog.DialogCode.Accepted:
             return False
@@ -1666,28 +1778,42 @@ class QueueManagerDialog(QtWidgets.QDialog):
     # ---------- Refresh ----------
 
     def refresh_tables(self) -> None:
+        if self.folder_scan_closing:
+            return
+        if self._startup_timeline_active:
+            self._startup_timeline.mark(
+                "refresh-tables-start",
+                candidates=len(self.candidates),
+                queue=len(self.queue_items),
+            )
         self.refresh_candidate_table()
-        self.refresh_queue_table()
+        QtCore.QTimer.singleShot(0, self.refresh_queue_table)
 
     @hang_probe_function("QueueManagerDialog.refresh_candidate_table")
     def refresh_candidate_table(self) -> None:
+        if self.folder_scan_closing:
+            return
         self.sync_table_rows(
             self.candidate_table,
             self.candidates,
             CANDIDATE_COLUMNS,
             self.candidate_row_values,
             checkable_first_column=True,
+            batch=True,
         )
         self.ensure_candidate_columns_initialized()
         self.refresh_summaries()
 
     @hang_probe_function("QueueManagerDialog.refresh_queue_table")
     def refresh_queue_table(self) -> None:
+        if self.folder_scan_closing:
+            return
         self.sync_table_rows(
             self.queue_table,
             self.queue_items,
             FORMAL_COLUMNS,
             self.formal_row_values,
+            batch=True,
         )
         self.ensure_formal_columns_initialized()
         self.refresh_summaries()

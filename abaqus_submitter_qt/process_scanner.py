@@ -11,7 +11,7 @@ except ImportError:
 
 from .abaqus_diagnostics import inspect_job_files
 from .constants import *
-from .qt_compat import hang_probe_log
+from .diagnostics import hang_probe_log, performance_log as log_performance
 from .queue_scheduler import normalize_work_dir
 
 
@@ -459,12 +459,6 @@ def classify_external_job_runtime(
         "has_solver_process": has_solver_process,
         "has_related_process": has_related_process,
     }
-
-
-def log_performance(message):
-    """Print performance diagnostics only when explicitly enabled."""
-    if ENABLE_PERFORMANCE_LOG:
-        print(f"[perf] {message}")
 
 
 def get_psutil_process_snapshot(force=False, include_details=False):
@@ -992,7 +986,7 @@ def scan_running_abaqus_jobs_by_psutil(work_dir, force=True, known_external_jobs
             "work_dir": normalize_joblist_path(known_work_dir),
             "inp_path": known.get("inp_path", ""),
             "source": "external_psutil",
-            "is_external": True,
+            "is_external": bool(known.get("is_external", True)),
             "status_only_update": True,
             "pids": [],
             "pid_create_times": {},

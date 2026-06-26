@@ -20,7 +20,7 @@
    - �
    - ????
 8. 发现疑似乱码时不要擅自修改。 继续完成当前任务，并在最终总结中报告文件路径、行号和对应文本片段。
-9. 不执行 git add、git commit、git reset、git restore、git checkout、git stash 或 git clean。
+9. 在执行 git add、git commit、git reset、git restore、git checkout、git stash 或 git clean之前需要询问。
 
 ## Agent skills
 

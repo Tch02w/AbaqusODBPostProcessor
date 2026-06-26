@@ -119,16 +119,27 @@ def active_submit_conflict_message(
         job_name,
         queue_item,
     )
-    active_keys = get_managed_active_job_keys(
-        active_runs,
-        queue_items,
-        exclude_item_id=queue_item.item_id if queue_item is not None else "",
-    )
-    if target_key not in active_keys:
+    blocked_by = ""
+    for run in active_runs.values():
+        if managed_job_key(run.get("work_dir", ""), run.get("job_name", "")) == target_key:
+            blocked_by = "active_runs"
+            break
+    if not blocked_by:
+        exclude_item_id = queue_item.item_id if queue_item is not None else ""
+        for item in queue_items:
+            if exclude_item_id and item.item_id == exclude_item_id:
+                continue
+            if item.status not in ACTIVE_STATUSES:
+                continue
+            if queue_item_conflict_key(item) == target_key:
+                blocked_by = "external_active_item" if item.is_external else "active_queue_item"
+                break
+    if not blocked_by:
         return ""
     return (
         f"无法提交作业 {job_name}：\n"
-        "同一计算目录中已经存在同名运行作业。"
+        "同一计算目录中已经存在同名运行作业。\n"
+        f"冲突来源：{blocked_by}"
     )
 
 
@@ -251,9 +262,12 @@ def get_managed_active_job_keys(
     queue_items: list[QueueItem],
     *,
     exclude_item_id: str = "",
+    include_external: bool = True,
 ) -> set[tuple[str, str]]:
     keys: set[tuple[str, str]] = set()
     for run in active_runs.values():
+        if run.get("is_external") and not include_external:
+            continue
         keys.add(
             managed_job_key(
                 run.get("work_dir", ""),
@@ -262,6 +276,8 @@ def get_managed_active_job_keys(
         )
     for item in queue_items:
         if exclude_item_id and item.item_id == exclude_item_id:
+            continue
+        if item.is_external and not include_external:
             continue
         if item.status not in ACTIVE_STATUSES:
             continue

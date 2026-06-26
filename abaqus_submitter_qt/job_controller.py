@@ -11,6 +11,7 @@ from uuid import uuid4
 from .abaqus_diagnostics import build_diagnostic_file_baseline, classify_job_text
 from .archive import (
     ArchiveCoordinator,
+    ArchiveMoveTask,
     apply_workspace_prepare_result,
     backup_existing_result_files,
     build_archive_move_plan,
@@ -22,7 +23,7 @@ from .archive import (
     is_ssd_independent_work_dir,
     prepare_calculation_workspace,
 )
-from .background_tasks import ArchiveMoveTask, WorkspacePrepareTask
+from .workspace_prepare import WorkspacePrepareTask
 from .command import (
     SubmitOptions,
     build_abaqus_command,
@@ -45,7 +46,8 @@ from .constants import (
     STATUS_WAITING_DEPENDENCY,
 )
 from .models import QueueItem
-from .qt_compat import QtCore, QtWidgets, hang_probe_function
+from .diagnostics import hang_probe_function
+from .qt_compat import QtCore, QtWidgets
 from .queue_scheduler import (
     active_submit_conflict_message as scheduler_active_submit_conflict_message,
     effective_queue_item_work_dir as scheduler_effective_queue_item_work_dir,
@@ -77,6 +79,38 @@ class FinalizationInput:
 class FinalizationDecision:
     status: str
     message: str
+
+
+@dataclass(frozen=True)
+class DispatchSlotInfo:
+    manual_limit: int
+    managed_active_count: int
+    manual_available_slots: int
+    memory_available_slots: int
+    effective_available_slots: int
+    slot_estimate: object | None = None
+
+    @classmethod
+    def from_mapping(cls, slot_info: dict) -> "DispatchSlotInfo":
+        return cls(
+            manual_limit=int(slot_info.get("manual_limit") or 0),
+            managed_active_count=int(slot_info.get("managed_active_count") or 0),
+            manual_available_slots=int(slot_info.get("manual_available_slots") or 0),
+            memory_available_slots=int(slot_info.get("memory_available_slots") or 0),
+            effective_available_slots=int(slot_info["effective_available_slots"]),
+            slot_estimate=slot_info.get("slot_estimate"),
+        )
+
+    def dispatch_slots(self, queue_items: list[QueueItem]) -> int:
+        if (
+            self.effective_available_slots <= 0
+            and any(item.status == STATUS_PENDING_RUN for item in queue_items)
+            and self.managed_active_count == 0
+            and self.manual_available_slots > 0
+            and self.memory_available_slots == 0
+        ):
+            return 1
+        return self.effective_available_slots
 
 
 def run_is_datacheck(
@@ -228,6 +262,12 @@ class JobController:
 
     def _estimate_effective_available_slots(self) -> dict:
         return self.window.estimate_effective_available_slots()
+
+    def _dispatch_slot_info(self) -> DispatchSlotInfo:
+        return DispatchSlotInfo.from_mapping(self._estimate_effective_available_slots())
+
+    def _dispatch_available_slots(self, slot_info: DispatchSlotInfo, queue_items: list[QueueItem]) -> int:
+        return slot_info.dispatch_slots(queue_items)
 
     def _refresh_queue_dependencies(self) -> None:
         self.window.refresh_queue_dependencies()
@@ -453,16 +493,8 @@ class JobController:
             self._process_deferred_archives()
             return
 
-        slot_info = self._estimate_effective_available_slots()
-        available_slots = int(slot_info["effective_available_slots"])
-        if (
-            available_slots <= 0
-            and any(item.status == STATUS_PENDING_RUN for item in queue_items)
-            and int(slot_info.get("managed_active_count") or 0) == 0
-            and int(slot_info.get("manual_available_slots") or 0) > 0
-            and int(slot_info.get("memory_available_slots") or 0) == 0
-        ):
-            available_slots = 1
+        slot_info = self._dispatch_slot_info()
+        available_slots = self._dispatch_available_slots(slot_info, queue_items)
         while available_slots > 0:
             for entry in queue_items:
                 if (
@@ -531,8 +563,8 @@ class JobController:
                     item.status = STATUS_FAILED
                     item.message = "启动失败"
             self._refresh_queue_dependencies()
-            slot_info = self._estimate_effective_available_slots()
-            available_slots = min(available_slots, int(slot_info["effective_available_slots"]))
+            slot_info = self._dispatch_slot_info()
+            available_slots = min(available_slots, slot_info.effective_available_slots)
             if started:
                 break
 

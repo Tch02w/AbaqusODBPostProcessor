@@ -16,14 +16,15 @@ from .abaqus_diagnostics import (
 )
 from .archive import (
     ArchiveCoordinator,
-)
-from .background_tasks import (
     ArchiveMoveService,
     ArchiveMoveTask,
+)
+from .workspace_prepare import (
     WorkspacePrepareService,
     WorkspacePrepareTask,
 )
 from .constants import (
+    ACTIVE_STATUSES,
     DEFAULT_CPUS,
     FORMAL_QUEUE_SAVE_DEBOUNCE_MS,
     JOB_MEMORY_BASE_SAFETY_FACTOR,
@@ -42,11 +43,14 @@ from .constants import (
     STATUS_DATACHECK_COMPLETED,
     STATUS_DATACHECK_FAILED,
     STATUS_FAILED,
+    STATUS_INTERRUPTED,
+    STATUS_PENDING_CONFIRM,
     STATUS_PENDING_RUN,
     STATUS_RUNNING,
     STATUS_STARTING,
     STATUS_TERMINATED,
     STATUS_TERMINATING,
+    STATUS_UNKNOWN,
     STATUS_WAITING_DEPENDENCY,
     UNLIMITED_JOB_SLOTS,
     calculate_default_joblist_parallel,
@@ -64,7 +68,9 @@ from .command import (
     inp_has_restart_keyword,
     validate_options,
 )
+from .diagnostics import StartupTimeline, external_scan_debug_enabled, hang_probe_function
 from .external_jobs import (
+    ExternalJobCoordinator,
     ExternalJobScanWorker,
     build_queue_item_index as external_build_queue_item_index,
     collect_known_external_jobs as external_collect_known_external_jobs,
@@ -72,7 +78,7 @@ from .external_jobs import (
 )
 from .job_controller import JobController
 from .job_runtime import JobRuntimeController
-from .qt_compat import QtCore, QtGui, QtWidgets, Signal, hang_probe_function
+from .qt_compat import QtCore, QtGui, QtWidgets, Signal
 from .queue_manager import QueueManagerDialog, load_joblist_state, save_joblist_state
 from .queue_scheduler import (
     find_queue_item_by_key as scheduler_find_queue_item_by_key,
@@ -87,7 +93,6 @@ from .queue_scheduler import (
     submit_conflict_key as scheduler_submit_conflict_key,
 )
 from .ui_components import (
-    build_memory_summary_table,
     duplicated_runtime_job_names as ui_duplicated_runtime_job_names,
     FilePickerRow,
     format_elapsed_seconds,
@@ -106,9 +111,9 @@ from .ui_styles import (
     TEXT,
     WINDOW_OUTER_HORIZONTAL_MARGIN,
     build_main_stylesheet,
+    build_runtime_selector_stylesheet,
 )
 
-ENABLE_EXTERNAL_SCAN_DEBUG_LOG = False
 QUEUE_DISPATCH_DEBOUNCE_MS = 50
 
 
@@ -119,8 +124,97 @@ class AbaqusPathCheckWorker(QtCore.QObject):
         self.finished.emit(shutil.which("abaqus") or "")
 
 
+class RuntimeSelectorDelegate(QtWidgets.QStyledItemDelegate):
+    """Paint runtime selector popup rows without hiding status background colors."""
+
+    def paint(
+        self,
+        painter: QtGui.QPainter,
+        option: QtWidgets.QStyleOptionViewItem,
+        index: QtCore.QModelIndex,
+    ) -> None:
+        background = index.data(QtCore.Qt.ItemDataRole.BackgroundRole)
+        if isinstance(background, QtGui.QBrush):
+            background_color = background.color()
+        elif isinstance(background, QtGui.QColor):
+            background_color = background
+        else:
+            background_color = QtGui.QColor("#e2e8f0")
+
+        foreground = index.data(QtCore.Qt.ItemDataRole.ForegroundRole)
+        if isinstance(foreground, QtGui.QBrush):
+            foreground_color = foreground.color()
+        elif isinstance(foreground, QtGui.QColor):
+            foreground_color = foreground
+        else:
+            foreground_color = QtGui.QColor("#0f172a")
+
+        selected = bool(option.state & QtWidgets.QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QtWidgets.QStyle.StateFlag.State_MouseOver)
+        row_rect = option.rect
+        text_rect = row_rect.adjusted(10, 0, -10, 0)
+
+        painter.save()
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.fillRect(row_rect, background_color)
+
+        if hovered or selected:
+            overlay = QtGui.QColor(255, 255, 255, 48 if hovered else 28)
+            painter.fillRect(row_rect, overlay)
+            painter.setPen(QtGui.QPen(background_color.darker(118 if hovered else 132), 1))
+            painter.drawLine(row_rect.bottomLeft(), row_rect.bottomRight())
+
+        text = str(index.data(QtCore.Qt.ItemDataRole.DisplayRole) or "")
+        painter.setPen(foreground_color)
+        painter.drawText(text_rect, QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft, text)
+        painter.restore()
+
+    def sizeHint(
+        self,
+        option: QtWidgets.QStyleOptionViewItem,
+        index: QtCore.QModelIndex,
+    ) -> QtCore.QSize:
+        size = super().sizeHint(option, index)
+        size.setHeight(max(size.height(), 26))
+        return size
+
+
 class ArrowComboBox(QtWidgets.QComboBox):
     """Combo box with a painted arrow that does not depend on theme assets."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.view().setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.view().setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.view().setWindowFlag(QtCore.Qt.WindowType.NoDropShadowWindowHint, True)
+
+    def showPopup(self) -> None:
+        view = self.view()
+        view.setWindowFlag(QtCore.Qt.WindowType.NoDropShadowWindowHint, True)
+        view.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        super().showPopup()
+        QtCore.QTimer.singleShot(0, self.position_popup_below)
+
+    def position_popup_below(self) -> None:
+        view = self.view()
+        popup = view.window()
+        if popup is None:
+            return
+
+        popup.setWindowFlag(QtCore.Qt.WindowType.NoDropShadowWindowHint, True)
+        popup.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, False)
+
+        top_left = self.mapToGlobal(QtCore.QPoint(0, self.height()))
+        screen = QtGui.QGuiApplication.screenAt(top_left) or self.screen()
+        available = screen.availableGeometry() if screen is not None else QtCore.QRect()
+        row_count = max(1, self.count())
+        row_height = max(view.sizeHintForRow(0), 26)
+        content_height = row_count * row_height + 2
+        if available.isValid():
+            available_below = max(row_height + 2, available.bottom() - top_left.y() + 1)
+            content_height = min(content_height, available_below)
+        popup_width = max(self.width(), view.sizeHintForColumn(0) + 24)
+        popup.setGeometry(top_left.x(), top_left.y(), popup_width, content_height)
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         super().paintEvent(event)
@@ -146,6 +240,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self._startup_timeline = StartupTimeline("MainWindow")
+        self._startup_timeline.mark("main-init-start")
         self.setWindowTitle(APP_TITLE)
         self.setMinimumSize(
             COMPACT_WINDOW_MIN_WIDTH,
@@ -175,6 +271,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.external_scan_worker: ExternalJobScanWorker | None = None
         self.external_scan_dialog: QueueManagerDialog | None = None
         self.external_scan_message_box: QtWidgets.QMessageBox | None = None
+        self.external_scan_show_summary = True
+        self.external_scan_reason = "manual"
+        self.external_job_coordinator = ExternalJobCoordinator(self)
+        self._start_queue_after_restore_scan = False
+        self._restored_status_scan_after_queue_open_scheduled = False
         self.abaqus_status_thread: QtCore.QThread | None = None
         self.abaqus_status_worker: AbaqusPathCheckWorker | None = None
         self.job_notification_boxes: list[QtWidgets.QMessageBox] = []
@@ -235,14 +336,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.archive_move_service.succeeded.connect(self.on_archive_move_succeeded)
         self.archive_move_service.blocked.connect(self.on_archive_move_blocked)
         self.archive_move_service.failed.connect(self.on_archive_move_failed)
+        self._startup_timeline.mark("services-ready")
 
         self.restore_joblist_state()
+        self._startup_timeline.mark(
+            "restore-joblist-state",
+            candidates=len(self.candidate_queue_items),
+            queue=len(self.queue_items),
+        )
 
         self.build_ui()
+        self._startup_timeline.mark("build-ui")
         self.apply_styles()
+        self._startup_timeline.mark("apply-styles")
 
         QtCore.QTimer.singleShot(250, self.start_abaqus_status_check)
         self.update_command_preview()
+        self._startup_timeline.mark("command-preview")
         self.append_history("等待提交作业...")
         if self.joblist_load_error:
             self.append_history(f"读取 joblist.json 失败：{self.joblist_load_error}")
@@ -251,6 +361,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 f"已恢复队列记录：候选 {len(self.candidate_queue_items)}，正式 {len(self.queue_items)}"
             )
             self.update_queue_status_label()
+        self._startup_timeline.mark("main-init-done")
 
     # ---------- UI ----------
 
@@ -310,7 +421,7 @@ class MainWindow(QtWidgets.QMainWindow):
         settings = QtWidgets.QHBoxLayout()
         settings.setSpacing(8)
         core_label = QtWidgets.QLabel("Core")
-        core_label.setFixedWidth(34)
+        core_label.setFixedWidth(38)
         settings.addWidget(core_label)
         self.cpus_spin = QtWidgets.QSpinBox()
         self.cpus_spin.setObjectName("plainSpin")
@@ -320,9 +431,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cpus_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.cpus_spin.setFixedSize(52, 30)
         settings.addWidget(self.cpus_spin)
-        max_label = QtWidgets.QLabel(f"最大 {MAX_CPUS}")
-        max_label.setObjectName("hint")
-        settings.addWidget(max_label)
         settings.addStretch(1)
         settings.addWidget(QtWidgets.QLabel("Mem"))
         self.memory_value = QtWidgets.QLineEdit()
@@ -333,10 +441,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.memory_unit = ArrowComboBox()
         self.memory_unit.setObjectName("submitParamCombo")
         self.memory_unit.addItems(MEMORY_OPTIONS)
+        self.memory_unit.setCurrentText("%")
         self.memory_unit.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
-        self.memory_unit.setFixedSize(72, 30)
+        self.memory_unit.setVisible(False)
+        memory_percent_label = QtWidgets.QLabel("%")
+        memory_percent_label.setObjectName("unitBadge")
+        memory_percent_label.setFixedSize(34, 30)
+        memory_percent_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         settings.addWidget(self.memory_value)
-        settings.addWidget(self.memory_unit)
+        settings.addWidget(memory_percent_label)
+        settings.addStretch(1)
+        queue_parallel_label = QtWidgets.QLabel("并行上限")
+        queue_parallel_label.setObjectName("hint")
+        settings.addWidget(queue_parallel_label)
+        self.max_parallel_spin = QtWidgets.QSpinBox()
+        self.max_parallel_spin.setObjectName("queueMaxParallelSpin")
+        self.max_parallel_spin.setRange(1, 999)
+        self.max_parallel_spin.setValue(calculate_default_joblist_parallel(DEFAULT_CPUS))
+        self.max_parallel_spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.max_parallel_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.max_parallel_spin.setFixedSize(64, 30)
+        self.max_parallel_spin.setToolTip("队列中允许同时运行的最大作业数")
+        settings.addWidget(self.max_parallel_spin)
         card_layout.addLayout(settings)
 
         self.cpus_spin.valueChanged.connect(self.update_command_preview)
@@ -356,59 +482,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self.interactive_check.toggled.connect(self.update_command_preview)
         self.datacheck_check.toggled.connect(self.update_command_preview)
 
-        action_grid = QtWidgets.QGridLayout()
-        action_grid.setHorizontalSpacing(8)
-        action_grid.setVerticalSpacing(8)
-        for column in range(4):
-            action_grid.setColumnStretch(column, 1)
+        action_rows = QtWidgets.QVBoxLayout()
+        action_rows.setSpacing(8)
+        single_file_actions = QtWidgets.QHBoxLayout()
+        single_file_actions.setSpacing(8)
+        queue_actions = QtWidgets.QHBoxLayout()
+        queue_actions.setSpacing(8)
         self.preview_btn = QtWidgets.QPushButton("预览命令")
         self.submit_btn = QtWidgets.QPushButton("提交作业")
         self.queue_btn = QtWidgets.QPushButton("管理队列")
         self.start_queue_btn = QtWidgets.QPushButton("开始队列")
-        action_button_width = 89
-        for button in (self.preview_btn, self.submit_btn, self.queue_btn, self.start_queue_btn):
+        self.stop_queue_btn = QtWidgets.QPushButton("终止队列")
+        action_button_width = 120
+        action_spacing = 8
+        single_file_button_width = int((action_button_width * 3 + action_spacing * 2 - action_spacing) / 2)
+        for button in (self.queue_btn, self.start_queue_btn, self.stop_queue_btn):
             button.setFixedSize(action_button_width, 32)
+        for button in (self.preview_btn, self.submit_btn):
+            button.setFixedSize(single_file_button_width, 32)
         self.preview_btn.setObjectName("light")
         self.submit_btn.setObjectName("primary")
         self.queue_btn.setObjectName("light")
         self.start_queue_btn.setObjectName("primary")
-        action_grid.addWidget(self.preview_btn, 0, 0)
-        action_grid.addWidget(self.submit_btn, 0, 1)
-        action_grid.addWidget(self.queue_btn, 0, 2)
-        action_grid.addWidget(self.start_queue_btn, 0, 3)
-        card_layout.addLayout(action_grid)
+        self.stop_queue_btn.setObjectName("danger")
+        single_file_actions.addWidget(self.preview_btn)
+        single_file_actions.addWidget(self.submit_btn)
+        queue_actions.addWidget(self.queue_btn)
+        queue_actions.addWidget(self.start_queue_btn)
+        queue_actions.addWidget(self.stop_queue_btn)
+        action_rows.addLayout(single_file_actions)
+        action_rows.addLayout(queue_actions)
+        card_layout.addLayout(action_rows)
 
         self.preview_btn.clicked.connect(self.preview_command)
         self.submit_btn.clicked.connect(self.submit_job)
         self.queue_btn.clicked.connect(self.open_queue_manager)
         self.start_queue_btn.clicked.connect(self.start_queue)
-
-        queue_row = QtWidgets.QGridLayout()
-        queue_row.setHorizontalSpacing(8)
-        queue_row.setVerticalSpacing(0)
-        for column in range(4):
-            queue_row.setColumnStretch(column, 1)
-        queue_controls = QtWidgets.QHBoxLayout()
-        queue_controls.setSpacing(8)
-        queue_parallel_label = QtWidgets.QLabel("并行上限")
-        queue_parallel_label.setObjectName("hint")
-        queue_controls.addWidget(queue_parallel_label)
-        self.max_parallel_spin = QtWidgets.QSpinBox()
-        self.max_parallel_spin.setObjectName("queueMaxParallelSpin")
-        self.max_parallel_spin.setRange(1, 999)
-        self.max_parallel_spin.setValue(calculate_default_joblist_parallel(DEFAULT_CPUS))
-        self.max_parallel_spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.max_parallel_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.max_parallel_spin.setFixedSize(64, 30)
-        self.max_parallel_spin.setToolTip("队列中允许同时运行的最大作业数")
-        queue_controls.addWidget(self.max_parallel_spin)
-        queue_controls.addStretch(1)
-        queue_row.addLayout(queue_controls, 0, 0, 1, 3)
-        self.stop_queue_btn = QtWidgets.QPushButton("终止队列")
-        self.stop_queue_btn.setObjectName("danger")
-        self.stop_queue_btn.setFixedSize(action_button_width, 32)
-        queue_row.addWidget(self.stop_queue_btn, 0, 3)
-        card_layout.addLayout(queue_row)
         self.stop_queue_btn.clicked.connect(self.stop_queue)
 
         self.queue_status_label = QtWidgets.QLabel("队列：未生成")
@@ -446,13 +555,13 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
         right_layout.setContentsMargins(
-            0,
-            0,
-            0,
-            0,
+            8,
+            8,
+            8,
+            8,
         )
 
-        right_layout.setSpacing(6)
+        right_layout.setSpacing(8)
 
         # 标题
         runtime_title = QtWidgets.QLabel("作业运行情况")
@@ -486,6 +595,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.job_selector.setFixedHeight(30)
         self.job_selector.setToolTip("点击展开切换作业；颜色表示作业状态")
+        self.job_selector.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.job_selector.setItemDelegate(RuntimeSelectorDelegate(self.job_selector))
+        self.job_selector.view().setMouseTracking(True)
 
         self.job_selector.currentIndexChanged.connect(self.on_job_selector_changed)
 
@@ -589,19 +701,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # ---------- 第四块：当前作业概要 ----------
 
-        self.job_meta = QtWidgets.QPlainTextEdit()
-        self.job_meta.setReadOnly(True)
+        self.job_meta = QtWidgets.QScrollArea()
         self.job_meta.setObjectName("runtimeMeta")
-
-        meta_font = QtGui.QFont("Consolas")
-        meta_font.setStyleHint(QtGui.QFont.StyleHint.Monospace)
-        meta_font.setFixedPitch(True)
-        self.job_meta.setFont(meta_font)
-
-        self.job_meta.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.WidgetWidth)
-
+        self.job_meta.setWidgetResizable(True)
+        self.job_meta.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         self.job_meta.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-
         self.job_meta.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         self.job_meta.setSizePolicy(
@@ -609,11 +713,17 @@ class MainWindow(QtWidgets.QMainWindow):
             QtWidgets.QSizePolicy.Policy.Preferred,
         )
 
-        self.job_meta.setMinimumHeight(128)
+        self.job_meta.setMinimumHeight(172)
 
-        self.job_meta.setMaximumHeight(148)
+        self.job_meta.setMaximumHeight(236)
 
-        self.job_meta.setPlainText("尚未提交作业。")
+        self.job_meta_content = QtWidgets.QWidget()
+        self.job_meta_content.setObjectName("runtimeMetaContent")
+        self.job_meta_layout = QtWidgets.QVBoxLayout(self.job_meta_content)
+        self.job_meta_layout.setContentsMargins(8, 8, 8, 8)
+        self.job_meta_layout.setSpacing(8)
+        self.job_meta.setWidget(self.job_meta_content)
+        self.set_job_meta_empty()
 
         # ---------- 第五块：STA / MSG / DAT 运行日志 ----------
 
@@ -897,20 +1007,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_queue_status_label()
 
     def open_queue_manager(self) -> None:
+        self._startup_timeline.mark("open-queue-manager-start")
         if self.queue_manager_dialog is not None and self.queue_manager_dialog.isVisible():
             self.queue_manager_dialog.refresh_tables()
             self.queue_manager_dialog.raise_()
             self.queue_manager_dialog.activateWindow()
+            self.request_restored_status_scan_after_queue_manager_render()
+            self._startup_timeline.mark("open-queue-manager-existing")
             return
 
         dialog = QueueManagerDialog(
-            None,
+            self,
             self.queue_items,
             self.current_queue_settings(),
             self.inp_row.text(),
             initial_candidates=self.candidate_queue_items,
             joblist_save_callback=self.request_joblist_save,
         )
+        dialog.setWindowFlag(QtCore.Qt.WindowType.Window, True)
         dialog.setModal(False)
         dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dialog.terminateRequested.connect(self.terminate_queue_items_by_ids)
@@ -923,6 +1037,29 @@ class MainWindow(QtWidgets.QMainWindow):
         self.position_queue_manager(dialog)
         dialog.show()
         self.update_queue_status_label()
+        self.request_restored_status_scan_after_queue_manager_render()
+        self._startup_timeline.mark(
+            "open-queue-manager-shown",
+            candidates=len(self.candidate_queue_items),
+            queue=len(self.queue_items),
+        )
+
+    def request_restored_status_scan_after_queue_manager_render(self) -> None:
+        if self._restored_status_scan_after_queue_open_scheduled:
+            return
+        if not self.restored_unknown_queue_items():
+            return
+
+        self._restored_status_scan_after_queue_open_scheduled = True
+
+        def run_restore_scan() -> None:
+            self._restored_status_scan_after_queue_open_scheduled = False
+            dialog = self.queue_manager_dialog
+            if dialog is None or not dialog.isVisible():
+                return
+            self.request_restored_queue_status_scan()
+
+        QtCore.QTimer.singleShot(350, run_restore_scan)
 
     def refresh_visible_queue_manager(
         self,
@@ -966,6 +1103,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self,
         work_dir: str,
         queue_dialog: QueueManagerDialog | None = None,
+        *,
+        show_summary: bool = True,
+        reason: str = "manual",
     ) -> None:
         if self.external_scan_thread is not None:
             self.show_non_modal_message(
@@ -977,9 +1117,15 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.queue_dialog_is_visible(queue_dialog):
             queue_dialog.set_external_scan_busy(True)
 
-        self.append_history(f"开始后台扫描外部 Abaqus 作业：{work_dir}")
+        scan_operation = f"external-scan:{work_dir}"
+        self.append_history(
+            f"开始后台扫描外部 Abaqus 作业：{work_dir}",
+            operation=scan_operation,
+        )
 
         self.external_scan_dialog = queue_dialog
+        self.external_scan_show_summary = show_summary
+        self.external_scan_reason = reason
 
         thread = QtCore.QThread(self)
 
@@ -1022,6 +1168,52 @@ class MainWindow(QtWidgets.QMainWindow):
     def clear_external_scan_worker(self) -> None:
         self.external_scan_thread = None
         self.external_scan_worker = None
+
+    @staticmethod
+    def queue_item_runtime_work_dir(item: QueueItem) -> str:
+        return (
+            item.effective_work_dir
+            or item.external_work_dir
+            or item.calculation_root_dir
+            or os.path.dirname(item.source_inp_path or item.inp_path)
+        )
+
+    def restored_unknown_queue_items(self) -> list[QueueItem]:
+        return [item for item in self.queue_items if item.status == STATUS_UNKNOWN]
+
+    def request_restored_queue_status_scan(self, *, start_queue_after: bool = False) -> bool:
+        unknown_items = self.restored_unknown_queue_items()
+        if not unknown_items:
+            return False
+
+        if start_queue_after:
+            self._start_queue_after_restore_scan = True
+
+        if self.external_scan_thread is not None:
+            self.append_history("恢复队列状态复核：外部作业扫描正在进行，等待当前扫描完成。")
+            return True
+
+        scan_root = ""
+        for item in unknown_items:
+            scan_root = self.queue_item_runtime_work_dir(item)
+            if scan_root:
+                break
+        if not scan_root:
+            for item in unknown_items:
+                item.status = STATUS_PENDING_CONFIRM
+                item.message = "程序重启后缺少运行目录，请人工确认"
+            self.update_queue_status_label()
+            self.refresh_visible_queue_manager()
+            self.request_joblist_save()
+            return False
+
+        self.append_history(f"开始恢复队列状态复核：{len(unknown_items)} 个待确认作业")
+        self.scan_external_jobs(
+            scan_root,
+            show_summary=False,
+            reason="restore",
+        )
+        return True
 
     @staticmethod
     def queue_dialog_is_visible(queue_dialog: QueueManagerDialog | None) -> bool:
@@ -1073,21 +1265,29 @@ class MainWindow(QtWidgets.QMainWindow):
         error_message: str,
     ) -> None:
         queue_dialog = self.external_scan_dialog
+        show_summary = self.external_scan_show_summary
 
         if self.queue_dialog_is_visible(queue_dialog):
             queue_dialog.set_external_scan_busy(False)
 
             queue_dialog.refresh_queue_table()
 
-        self.append_history(f"外部作业扫描失败：{work_dir}\n{error_message}")
-
-        self.show_non_modal_message(
-            "扫描外部作业",
-            f"扫描失败：\n{error_message}",
-            warning=True,
+        self.append_history(
+            f"外部作业扫描失败：{work_dir}\n{error_message}",
+            operation=f"external-scan:{work_dir}",
         )
 
+        if show_summary:
+            self.show_non_modal_message(
+                "扫描外部作业",
+                f"扫描失败：\n{error_message}",
+                warning=True,
+            )
+
         self.external_scan_dialog = None
+        self.external_scan_show_summary = True
+        self.external_scan_reason = "manual"
+        self._start_queue_after_restore_scan = False
 
     def build_queue_item_index(self) -> dict[tuple[str, str], QueueItem]:
         return external_build_queue_item_index(
@@ -1103,7 +1303,7 @@ class MainWindow(QtWidgets.QMainWindow):
         runtime_status: str,
         runtime_message: str,
     ) -> None:
-        if not ENABLE_EXTERNAL_SCAN_DEBUG_LOG:
+        if not external_scan_debug_enabled():
             return
 
         self.append_history(
@@ -1127,6 +1327,9 @@ class MainWindow(QtWidgets.QMainWindow):
         skipped: list,
     ) -> None:
         queue_dialog = self.external_scan_dialog
+        show_summary = self.external_scan_show_summary
+        start_queue_after_restore_scan = self._start_queue_after_restore_scan
+        self._start_queue_after_restore_scan = False
         merge_result = merge_external_scan_results(
             queue_items=self.queue_items,
             work_dir=work_dir,
@@ -1136,49 +1339,10 @@ class MainWindow(QtWidgets.QMainWindow):
         updated = int(merge_result["updated"])
         status_only_updates = int(merge_result["status_only_updates"])
         terminal_external_records = merge_result.get("terminal_external_records") or []
-
-        for record in merge_result["memory_records"]:
-            target_item = record["item"]
-            job = record["job"]
-            key = record["key"]
-            job_work_dir = record["work_dir"]
-            self.memory_monitor_service.update_external_job_estimate(
-                job_name=target_item.job_name,
-                rss_bytes=int(target_item.rss_bytes or 0),
-                process_count=len(target_item.pids or []),
-                process_names=", ".join(job.get("process_names") or []),
-            )
-            if target_item.status in scheduler_managed_active_statuses():
-                ext_key = f"{key[0]}::{target_item.job_name.lower()}"
-                self.memory_adapter.register_job(
-                    job_key=ext_key,
-                    job_name=target_item.job_name,
-                    work_dir=target_item.effective_work_dir or job_work_dir,
-                )
-                self.memory_adapter.activate_job(ext_key)
-
-        for record in terminal_external_records:
-            target_item = record.get("item")
-            key = record.get("key")
-            if target_item is None or not key:
-                continue
-            ext_key = f"{key[0]}::{target_item.job_name.lower()}"
-            self.memory_adapter.finalize_job(ext_key)
-            if not target_item.message:
-                target_item.message = f"外部作业状态：{target_item.status}"
-
-        if terminal_external_records:
-            self.refresh_queue_dependencies()
-            self.request_dispatch_queue()
-
-        for record in merge_result["debug_records"]:
-            self.append_external_scan_debug_log(
-                job_name=record["job_name"],
-                job_work_dir=record["job_work_dir"],
-                job=record["job"],
-                runtime_status=record["runtime_status"],
-                runtime_message=record["runtime_message"],
-            )
+        self.external_job_coordinator.apply_scan_merge_result(
+            merge_result=merge_result,
+            operation=f"external-scan:{work_dir}",
+        )
 
         self.update_queue_status_label()
         if self.queue_dialog_is_visible(queue_dialog):
@@ -1192,19 +1356,40 @@ class MainWindow(QtWidgets.QMainWindow):
             f"跳过 {len(skipped)} 个。"
         )
 
-        self.append_history(message)
-
-        self.show_non_modal_message(
-            "扫描外部作业",
+        self.append_history(
             message,
+            operation=f"external-scan:{work_dir}",
         )
 
+        if show_summary:
+            self.show_non_modal_message(
+                "扫描外部作业",
+                message,
+            )
+
         self.external_scan_dialog = None
+        self.external_scan_show_summary = True
+        self.external_scan_reason = "manual"
+
+        if added or updated or status_only_updates or terminal_external_records:
+            self.request_joblist_save()
+
+        if start_queue_after_restore_scan:
+            QtCore.QTimer.singleShot(0, self.start_queue)
 
     def start_queue(self) -> None:
         if self.queue_active:
+            if self.queue_stop_requested:
+                self.queue_stop_requested = False
+                self.append_history("开始队列：已清除残留的停止请求。")
             self.dispatch_queue()
             return
+
+        if self.restored_unknown_queue_items():
+            if self.request_restored_queue_status_scan(start_queue_after=True):
+                self.append_history("开始队列：先复核程序重启后的未知状态作业。")
+                self.update_queue_status_label()
+                return
 
         self.refresh_queue_dependencies()
         pending = [item for item in self.queue_items if item.status == STATUS_PENDING_RUN]
@@ -1236,6 +1421,7 @@ class MainWindow(QtWidgets.QMainWindow):
             scheduler_get_managed_active_job_keys(
                 self.active_runs,
                 self.queue_items,
+                include_external=False,
             )
         )
         manual_available_slots = max(0, manual_limit - managed_active_count)
@@ -2014,33 +2200,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not isinstance(background_color, QtGui.QColor):
             background_color = QtGui.QColor("#e2e8f0")
         background = background_color.name()
-        self.job_selector.setStyleSheet(
-            "QComboBox#runtimeSelector {"
-            f"background: {background};"
-            "color: #0f172a;"
-            "border: 1px solid #cbd5e1;"
-            "border-radius: 6px;"
-            "min-height: 30px;"
-            "max-height: 30px;"
-            "padding: 0 24px 0 9px;"
-            "}"
-            "QComboBox#runtimeSelector::drop-down {"
-            "subcontrol-origin: border;"
-            "subcontrol-position: top right;"
-            "width: 22px;"
-            "border: 0;"
-            "margin: 1px 1px 1px 0;"
-            "}"
-            "QComboBox#runtimeSelector QAbstractItemView {"
-            "background: #ffffff;"
-            "border: 1px solid #cbd5e1;"
-            "border-radius: 6px;"
-            "padding: 4px;"
-            "outline: 0;"
-            "selection-background-color: #dbeafe;"
-            "selection-color: #0f172a;"
-            "}"
-        )
+        self.job_selector.setStyleSheet(build_runtime_selector_stylesheet(background))
 
     def on_job_selector_changed(
         self,
@@ -2081,6 +2241,77 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.job_stats_label.setText(f"运行中 {running} | 完成 {completed} | 异常 {failed}")
 
+    @staticmethod
+    def clear_layout(layout: QtWidgets.QLayout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget is not None:
+                widget.deleteLater()
+            elif child_layout is not None:
+                MainWindow.clear_layout(child_layout)
+
+    @staticmethod
+    def make_meta_label(text: str, object_name: str) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(text)
+        label.setObjectName(object_name)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        return label
+
+    def add_meta_section(self, title: str) -> QtWidgets.QGridLayout:
+        section = QtWidgets.QFrame()
+        section.setObjectName("metaSection")
+        layout = QtWidgets.QVBoxLayout(section)
+        layout.setContentsMargins(8, 7, 8, 8)
+        layout.setSpacing(6)
+        title_label = self.make_meta_label(title, "metaSectionTitle")
+        layout.addWidget(title_label)
+        grid = QtWidgets.QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(5)
+        grid.setColumnMinimumWidth(0, 86)
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 1)
+        layout.addLayout(grid)
+        self.job_meta_layout.addWidget(section)
+        return grid
+
+    def add_meta_row(self, grid: QtWidgets.QGridLayout, row: int, key: str, value: object) -> int:
+        value_text = str(value if value not in (None, "") else "-")
+        key_label = self.make_meta_label(key, "metaKey")
+        key_label.setFixedWidth(86)
+        value_label = self.make_meta_label(value_text, "metaValue")
+        grid.addWidget(key_label, row, 0, QtCore.Qt.AlignmentFlag.AlignTop)
+        grid.addWidget(value_label, row, 1)
+        return row + 1
+
+    def add_memory_stat(
+        self,
+        grid: QtWidgets.QGridLayout,
+        column: int,
+        label_text: str,
+        value_text: str,
+    ) -> None:
+        card = QtWidgets.QFrame()
+        card.setObjectName("memoryStat")
+        layout = QtWidgets.QVBoxLayout(card)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(2)
+        label = self.make_meta_label(label_text, "memoryStatLabel")
+        value = self.make_meta_label(value_text, "memoryStatValue")
+        layout.addWidget(label)
+        layout.addWidget(value)
+        grid.addWidget(card, 0, column)
+
+    def set_job_meta_empty(self) -> None:
+        self.clear_layout(self.job_meta_layout)
+        label = self.make_meta_label("尚未提交作业。", "metaEmpty")
+        self.job_meta_layout.addWidget(label)
+        self.job_meta_layout.addStretch(1)
+
     def refresh_selected_run_status(
         self,
         job_key: str | None = None,
@@ -2093,7 +2324,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
             self.status_label.setText("状态：未运行")
 
-            self.job_meta.setPlainText("尚未提交作业。")
+            self.set_job_meta_empty()
 
             self.update_sta_sticky_header_visibility()
             return
@@ -2109,104 +2340,138 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.refresh_selected_run_meta(job_key)
 
+    @staticmethod
+    def restart_dependency_status_text(queue_item: QueueItem) -> str:
+        message = str(queue_item.message or "")
+        status = str(queue_item.status or "")
+        if status == STATUS_WAITING_DEPENDENCY or "等待前置" in message:
+            return "等待前置完成"
+        if "缺少" in message or "不存在" in message:
+            return "依赖缺失"
+        if "已复制" in message or "已准备" in message:
+            return "依赖文件已准备"
+        if status == STATUS_PENDING_RUN or "已完成" in message or "等待提交" in message:
+            return "已满足"
+        if queue_item.oldjob_name or queue_item.oldjob_path:
+            return "已记录"
+        return "-"
+
+    @staticmethod
+    def _same_path(left: str, right: str) -> bool:
+        if not left or not right:
+            return False
+        try:
+            return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+        except (OSError, ValueError):
+            return str(left).strip().lower() == str(right).strip().lower()
+
     def refresh_selected_run_meta(
         self,
-        job_key: str | None = None,
+        selected_key: str | None = None,
+        run: dict | None = None,
     ) -> None:
-        """刷新当前 Job 的概要信息区。"""
-        job_key = job_key or self.selected_job_key()
-
-        run = self.run_records.get(job_key or "")
-
+        if selected_key is None:
+            selected_key = self.selected_job_key()
         if run is None:
-            self.job_meta.setPlainText("尚未提交作业。")
-
+            run = self.run_records.get(selected_key) if selected_key else None
+        if run is None:
+            self.set_job_meta_empty()
             return
 
+        self.clear_layout(self.job_meta_layout)
         queue_item = run.get("queue_item")
-
-        source_inp_path = run.get(
-            "source_inp_path",
-            "",
-        ) or (queue_item.source_inp_path if queue_item is not None else "")
+        source_inp_path = run.get("source_inp_path", "") or (
+            queue_item.source_inp_path if queue_item is not None else ""
+        )
+        runtime_work_dir = str(run.get("work_dir", "") or "")
+        source_work_dir = os.path.dirname(source_inp_path) if source_inp_path else ""
+        display_work_dir = source_work_dir or runtime_work_dir
+        temporary_work_dir = ""
+        if runtime_work_dir and display_work_dir and not self._same_path(runtime_work_dir, display_work_dir):
+            temporary_work_dir = runtime_work_dir
 
         cores = queue_item.cores if queue_item is not None else ""
+        datacheck_enabled = bool(queue_item.datacheck_only) if queue_item is not None else False
+        job_type = queue_item.job_type if queue_item is not None else ""
+        fortran_path = queue_item.fortran_path if queue_item is not None else ""
 
-        memory = queue_item.memory if (queue_item is not None and queue_item.memory) else "默认"
-
-        datacheck = "是" if (queue_item is not None and queue_item.datacheck_only) else "否"
-
-        current_memory = safe_int(
-            run.get(
-                "memory_current",
-                0,
-            )
-            or (queue_item.rss_bytes if queue_item is not None else 0)
-        )
-
-        peak_memory = safe_int(
-            run.get(
-                "memory_peak",
-                0,
-            )
-        )
-
-        estimated_memory = safe_int(
-            run.get(
-                "memory_estimated",
-                0,
-            )
-        )
-
-        monitor_mode = str(
-            run.get(
-                "memory_monitor_mode",
-                "learning",
-            )
-            or "learning"
-        )
-
+        current_memory = safe_int(run.get("memory_current", 0) or (queue_item.rss_bytes if queue_item is not None else 0))
+        peak_memory = safe_int(run.get("memory_peak", 0))
+        estimated_memory = safe_int(run.get("memory_estimated", 0))
+        monitor_mode = str(run.get("memory_monitor_mode", "learning") or "learning")
         monitor_mode_text = {
-            "learning": "高频学习",
-            "patrol": "低频巡检",
-        }.get(
-            monitor_mode,
-            monitor_mode,
-        )
-
-        memory_table_lines = build_memory_summary_table(
-            current_memory_text=(format_memory_size(current_memory) if current_memory > 0 else "未统计"),
-            peak_memory_text=(format_memory_size(peak_memory) if peak_memory > 0 else "未统计"),
-            estimated_memory_text=(format_memory_size(estimated_memory) if estimated_memory > 0 else "未统计"),
-            monitor_mode_text=(monitor_mode_text),
-        )
-
-        lines = [
-            f"工作目录: {run.get('work_dir', '')}",
-            f"INP 文件: {source_inp_path}",
-            f"核心数: {cores}",
-            f"提交内存参数: {memory}",
-            *memory_table_lines,
-            f"Datacheck: {datacheck}",
+            "learning": "学习中",
+            "patrol": "patrol",
+            "external": "external",
+            "stable": "稳定",
+        }.get(monitor_mode, monitor_mode)
+        memory_metrics = [
+            ("当前内存", format_memory_size(current_memory) if current_memory > 0 else "-"),
+            ("内存峰值", format_memory_size(peak_memory) if peak_memory > 0 else "未统计"),
+            ("估算内存", format_memory_size(estimated_memory) if estimated_memory > 0 else "未统计"),
+            ("监测模式", monitor_mode_text),
         ]
+        memory_section = QtWidgets.QFrame()
+        memory_section.setObjectName("memorySection")
+        memory_layout = QtWidgets.QGridLayout(memory_section)
+        memory_layout.setContentsMargins(0, 0, 0, 0)
+        memory_layout.setHorizontalSpacing(6)
+        memory_layout.setVerticalSpacing(6)
+        for idx, (label, value) in enumerate(memory_metrics):
+            self.add_memory_stat(memory_layout, idx, label, value)
+        self.job_meta_layout.addWidget(memory_section)
 
-        backup_odb_path = run.get(
-            "backup_odb_path",
-            "",
-        )
+        basic_grid = self.add_meta_section("作业信息")
+        self.add_meta_row(basic_grid, 0, "工作目录", display_work_dir or "-")
+        if temporary_work_dir:
+            self.add_meta_row(basic_grid, 1, "临时计算目录", temporary_work_dir)
+            next_row = 2
+        else:
+            next_row = 1
+        self.add_meta_row(basic_grid, next_row, "INP 文件", source_inp_path or "-")
+        next_row += 1
+        if fortran_path:
+            self.add_meta_row(basic_grid, next_row, "FOR 文件", fortran_path)
+            next_row += 1
+        if job_type:
+            self.add_meta_row(basic_grid, next_row, "作业类型", job_type)
+            next_row += 1
+        self.add_meta_row(basic_grid, next_row, "核心数", str(cores or "-"))
+        next_row += 1
+        if datacheck_enabled:
+            self.add_meta_row(basic_grid, next_row, "Datacheck", "是")
 
-        if backup_odb_path:
-            lines.append(f"旧 ODB: {backup_odb_path}")
+        if queue_item is not None and (queue_item.oldjob_name or queue_item.oldjob_path):
+            restart_grid = self.add_meta_section("Restart 依赖")
+            restart_row = 0
+            self.add_meta_row(restart_grid, restart_row, "oldjob", queue_item.oldjob_name or "-")
+            restart_row += 1
+            dependency_dir = queue_item.oldjob_dir or (
+                os.path.dirname(queue_item.oldjob_path) if queue_item.oldjob_path else ""
+            )
+            if dependency_dir:
+                self.add_meta_row(restart_grid, restart_row, "依赖目录", dependency_dir)
+                restart_row += 1
+            if queue_item.oldjob_path:
+                self.add_meta_row(restart_grid, restart_row, "ODB", queue_item.oldjob_path)
+                restart_row += 1
+            self.add_meta_row(
+                restart_grid,
+                restart_row,
+                "状态",
+                self.restart_dependency_status_text(queue_item),
+            )
+            restart_row += 1
+            if queue_item.message:
+                self.add_meta_row(restart_grid, restart_row, "备注", queue_item.message)
 
-        backup_sta_path = run.get(
-            "backup_sta_path",
-            "",
-        )
+        backup_messages = run.get("backup_messages") or []
+        if backup_messages:
+            backup_grid = self.add_meta_section("旧结果处理")
+            for idx, message in enumerate(backup_messages[:3]):
+                self.add_meta_row(backup_grid, idx, "备份", str(message))
 
-        if backup_sta_path:
-            lines.append(f"旧 STA: {backup_sta_path}")
-
-        self.job_meta.setPlainText("\n".join(lines))
+        self.job_meta_layout.addStretch(1)
 
     def selected_job_key(self) -> str:
         if self.current_job_key:
@@ -2271,17 +2536,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_queue_status_label(self) -> None:
         counts = scheduler_queue_status_counts(self.queue_items)
-        pending = counts.get(STATUS_PENDING_RUN, 0)
-        running = counts.get(STATUS_RUNNING, 0)
+        pending = counts.get(STATUS_PENDING_RUN, 0) + counts.get(STATUS_WAITING_DEPENDENCY, 0)
+        running = sum(counts.get(status, 0) for status in ACTIVE_STATUSES)
         completed = counts.get(STATUS_COMPLETED, 0) + counts.get(STATUS_DATACHECK_COMPLETED, 0)
-        failed = counts.get(STATUS_FAILED, 0) + counts.get(STATUS_DATACHECK_FAILED, 0)
+        failed = (
+            counts.get(STATUS_FAILED, 0)
+            + counts.get(STATUS_DATACHECK_FAILED, 0)
+            + counts.get(STATUS_INTERRUPTED, 0)
+            + counts.get(STATUS_UNKNOWN, 0)
+        )
         cancelled = counts.get(STATUS_CANCELED, 0) + counts.get(STATUS_TERMINATED, 0)
         if not self.queue_items:
             self.queue_status_label.setText("队列：未生成")
             self.request_joblist_save()
             return
+        covered = running + pending + completed + failed + cancelled
+        other = max(0, len(self.queue_items) - covered)
+        other_text = f" | 其他 {other}" if other else ""
         self.queue_status_label.setText(
-            f"队列：{len(self.queue_items)} 个 | 运行 {running} | 等待 {pending} | 完成 {completed} | 失败 {failed} | 取消 {cancelled}"
+            f"队列：{len(self.queue_items)} 个 | 运行 {running} | 等待 {pending} | 完成 {completed} | 失败 {failed} | 取消 {cancelled}{other_text}"
         )
         self.request_joblist_save()
 
@@ -2326,9 +2599,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.abaqus_status_thread = None
         self.abaqus_status_worker = None
 
-    def append_history(self, text: str) -> None:
+    def append_history(self, text: str, *, operation: str | None = None) -> None:
         """追加运行记录：时间戳为蓝色，正文使用默认深灰色。"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        last_operation = getattr(self, "_history_last_operation", "")
+        same_operation = bool(operation) and operation == last_operation
 
         cursor = self.history.textCursor()
 
@@ -2347,15 +2622,18 @@ class MainWindow(QtWidgets.QMainWindow):
 
         body_format.setForeground(QtGui.QColor(TEXT))
 
-        cursor.insertText(
-            f"[{timestamp}]\n",
-            timestamp_format,
-        )
+        if not same_operation:
+            cursor.insertText(
+                f"[{timestamp}]\n",
+                timestamp_format,
+            )
 
         cursor.insertText(
             text,
             body_format,
         )
+
+        self._history_last_operation = operation or ""
 
         self.history.setTextCursor(cursor)
 
@@ -2484,6 +2762,12 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """关闭窗口前停止后台内存监测。"""
         self._closing = True
+        queue_dialog = self.queue_manager_dialog
+        if queue_dialog is not None:
+            try:
+                queue_dialog.close()
+            except RuntimeError:
+                pass
         self._dispatch_timer.stop()
         self._joblist_save_timer.stop()
         self.save_joblist_state_now()
@@ -2503,14 +2787,34 @@ class MainWindow(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    startup_timeline_start: float | None = None,
+    startup_timeline_last: float | None = None,
+    startup_timeline_enabled: bool = False,
+) -> int:
     """Run the Qt frontend."""
+    startup_timeline = StartupTimeline(
+        "App",
+        enabled=startup_timeline_enabled,
+        start=startup_timeline_start,
+        last=startup_timeline_last,
+    )
+
+    startup_timeline.mark("main-function-start")
     argv = list(sys.argv if argv is None else argv)
+    startup_timeline.mark("argv-ready")
     app = QtWidgets.QApplication(argv)
+    startup_timeline.mark("qapplication-created")
     app.setApplicationName(APP_TITLE)
     QtWidgets.QApplication.setStyle(QtWidgets.QStyleFactory.create("Fusion"))
+    startup_timeline.mark("qt-style-ready")
     window = MainWindow()
+    startup_timeline.mark("mainwindow-created")
     window.show()
+    startup_timeline.mark("mainwindow-shown")
+    QtCore.QTimer.singleShot(0, lambda: startup_timeline.mark("event-loop-first-tick"))
     return app.exec()
 
 

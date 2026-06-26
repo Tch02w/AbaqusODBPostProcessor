@@ -380,7 +380,7 @@ def build_main_stylesheet() -> str:
 
             QScrollArea#runtimeMeta {{
                 background: #f8fafc;
-                border: 0;
+                border: 1px solid {BORDER};
                 border-radius: {RADIUS_CARD}px;
             }}
             QScrollArea#runtimeMeta > QWidget > QWidget {{
@@ -551,25 +551,28 @@ def build_main_stylesheet() -> str:
             }}
             QFrame#runtimeLogFrame {{
                 background: {LOG_BG};
-                border: 0;
+                border: 1px solid {BORDER};
                 border-radius: {RADIUS_CARD}px;
             }}
             QLabel#staStickyHeader {{
                 background: {LOG_BG};
                 color: #111827;
                 border: 0;
-                border-bottom: 1px solid #d8e1ee;
-                padding: 2px 3px;
-                font-family: Consolas, "Microsoft YaHei", monospace;
+                border-bottom: 1px solid {BORDER};
+                padding: 6px 8px 4px 8px;
+                font-family: "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
                 font-size: 12px;
             }}
             QPlainTextEdit#runtimeLog {{
-                background: {LOG_BG};
+                background: transparent;
                 color: #111827;
                 border: 0;
-                border-radius: {RADIUS_CARD}px;
-                font-family: Consolas, "Microsoft YaHei", monospace;
+                border-radius: 0;
+                padding: 6px 0 6px 8px;
+                font-family: "Cascadia Mono", Consolas, "Microsoft YaHei", monospace;
                 font-size: 12px;
+                selection-background-color: #bfdbfe;
+                selection-color: #0f172a;
             }}
             QPlainTextEdit#runtimeLog QWidget {{
                 background: {LOG_BG};

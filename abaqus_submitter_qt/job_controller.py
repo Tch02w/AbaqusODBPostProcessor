@@ -299,6 +299,40 @@ class JobController:
             values.append(f"...+{len(active_runs) - limit}")
         return "[" + "; ".join(values) + "]"
 
+    def _pending_dispatch_items(self, queue_items: list[QueueItem]) -> list[QueueItem]:
+        return [item for item in queue_items if item.status == STATUS_PENDING_RUN]
+
+    def _mark_reserved_dispatch_items(
+        self,
+        queue_items: list[QueueItem],
+        archive_reserved_keys: set[tuple[str, str]],
+    ) -> None:
+        for item in self._pending_dispatch_items(queue_items):
+            if scheduler_queue_item_conflict_key(item) in archive_reserved_keys:
+                item.message = "同名 SSD 计算目录正在等待归档或归档中，请稍后再提交。"
+
+    def _select_dispatch_candidate(
+        self,
+        queue_items: list[QueueItem],
+        archive_reserved_keys: set[tuple[str, str]],
+    ) -> QueueItem | None:
+        for item in self._pending_dispatch_items(queue_items):
+            if scheduler_queue_item_conflict_key(item) not in archive_reserved_keys:
+                return item
+        return None
+
+    @staticmethod
+    def _queue_has_pending_work(queue_items: list[QueueItem]) -> bool:
+        return any(
+            item.status in {STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY}
+            for item in queue_items
+        )
+
+    def _queue_has_running_work(self, queue_items: list[QueueItem]) -> bool:
+        return any(run.get("queue_item") is not None for run in self._active_runs().values()) or any(
+            item.status == STATUS_STARTING for item in queue_items
+        )
+
     def _ask_existing_odb_action(self, job_name: str, odb_path: Path, queue_mode: bool) -> str:
         return self.window.ask_existing_odb_action(job_name, odb_path, queue_mode)
 
@@ -496,21 +530,8 @@ class JobController:
         slot_info = self._dispatch_slot_info()
         available_slots = self._dispatch_available_slots(slot_info, queue_items)
         while available_slots > 0:
-            for entry in queue_items:
-                if (
-                    entry.status == STATUS_PENDING_RUN
-                    and scheduler_queue_item_conflict_key(entry) in archive_reserved_keys
-                ):
-                    entry.message = "同名 SSD 计算目录正在等待归档或归档中，请稍后再提交。"
-            item = next(
-                (
-                    entry
-                    for entry in queue_items
-                    if entry.status == STATUS_PENDING_RUN
-                    and scheduler_queue_item_conflict_key(entry) not in archive_reserved_keys
-                ),
-                None,
-            )
+            self._mark_reserved_dispatch_items(queue_items, archive_reserved_keys)
+            item = self._select_dispatch_candidate(queue_items, archive_reserved_keys)
             if item is None:
                 break
 
@@ -568,13 +589,8 @@ class JobController:
             if started:
                 break
 
-        pending = any(
-            item.status in {STATUS_PENDING_RUN, STATUS_WAITING_DEPENDENCY}
-            for item in queue_items
-        )
-        running = any(run.get("queue_item") is not None for run in self._active_runs().values()) or any(
-            item.status == STATUS_STARTING for item in queue_items
-        )
+        pending = self._queue_has_pending_work(queue_items)
+        running = self._queue_has_running_work(queue_items)
         if not pending and not running:
             self._set_queue_active(False)
             self._append_history("队列已结束。")

@@ -707,6 +707,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.job_meta.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         self.job_meta.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.job_meta.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.job_meta.setViewportMargins(1, 1, 1, 1)
 
         self.job_meta.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding,
@@ -735,9 +736,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.job_log.document().setMaximumBlockCount(MAX_JOB_LOG_LINES)
 
-        self.job_log.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.job_log.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
 
-        self.job_log.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.job_log.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         self.job_log.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
@@ -782,10 +783,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.runtime_log_frame.setObjectName("runtimeLogFrame")
         runtime_log_layout = QtWidgets.QVBoxLayout(self.runtime_log_frame)
         runtime_log_layout.setContentsMargins(
-            0,
-            0,
-            0,
-            0,
+            1,
+            1,
+            1,
+            1,
         )
         runtime_log_layout.setSpacing(0)
 

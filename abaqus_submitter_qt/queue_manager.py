@@ -203,7 +203,8 @@ class QueueManagerDialog(QtWidgets.QDialog):
         initial_candidates: list[QueueItem] | None = None,
         joblist_save_callback=None,
     ):
-        super().__init__(parent)
+        super().__init__(None)
+        self.host_window = parent
         self._startup_timeline = StartupTimeline("QueueManagerDialog")
         self._startup_timeline_active = self._startup_timeline.enabled
         self._startup_candidate_refresh_done = False
@@ -1974,14 +1975,20 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.formal_columns_initialized = True
 
     def resize_candidate_columns(self) -> None:
-        widths = (40, 40, 140, 360, 100, 100, 120, 120, 180)
+        widths = (40, 40, 140, 360, 100, 100, 120, 120)
+        header = self.candidate_table.horizontalHeader()
         for column, width in enumerate(widths):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Fixed)
             self.candidate_table.setColumnWidth(column, width)
+        header.setSectionResizeMode(len(CANDIDATE_COLUMNS) - 1, QtWidgets.QHeaderView.ResizeMode.Stretch)
 
     def resize_formal_columns(self) -> None:
-        widths = (40, 140, 360, 90, 110, 110, 60, 60, 110, 100)
+        widths = (40, 140, 280, 90, 110, 110, 60, 60, 110)
+        header = self.queue_table.horizontalHeader()
         for column, width in enumerate(widths):
+            header.setSectionResizeMode(column, QtWidgets.QHeaderView.ResizeMode.Fixed)
             self.queue_table.setColumnWidth(column, width)
+        header.setSectionResizeMode(len(FORMAL_COLUMNS) - 1, QtWidgets.QHeaderView.ResizeMode.Stretch)
 
     def default_work_dir(self) -> str:
         candidates = [self.work_dir_from_queue(), os.path.dirname(self.current_inp)]

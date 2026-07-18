@@ -18,6 +18,10 @@ class QueueItem:
     oldjob_name: str = ""
     oldjob_dir: str = ""
     oldjob_path: str = ""
+    resolved_oldjob_arg: str = ""
+    resolved_oldjob_source: str = ""
+    resolved_oldjob_dir: str = ""
+    resolved_oldjob_reference_key: str = ""
     fortran_path: str = ""
     cores: int = 0
     memory: str = ""
@@ -30,6 +34,7 @@ class QueueItem:
     archive_dir: str = ""
     archive_after_complete: bool = False
     cleanup_after_archive: bool = False
+    archive_destination: str = ""
     archive_status: str = ""
     archive_error: str = ""
     active_job_key: str = ""

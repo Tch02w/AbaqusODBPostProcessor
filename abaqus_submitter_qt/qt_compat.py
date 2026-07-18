@@ -11,7 +11,7 @@ try:  # pragma: no cover - depends on the user's environment
     Signal = QtCore.Signal
     Slot = QtCore.Slot
     QT_BINDING = "PySide6"
-except ImportError as pyside_error:  # pragma: no cover - depends on environment
+except ImportError:  # pragma: no cover - depends on environment
     try:
         from PyQt6 import QtCore, QtGui, QtWidgets
 

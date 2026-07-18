@@ -10,7 +10,24 @@ except ImportError:
     psutil = None
 
 from .abaqus_diagnostics import inspect_job_files
-from .constants import *
+from .constants import (
+    ABAQUS_MEMORY_POLL_INTERVAL_SECONDS,
+    ABAQUS_PROCESS_EXACT_NAMES,
+    ABAQUS_PROCESS_NAME_MARKERS,
+    ABAQUS_PROCESS_SUBSTRINGS,
+    COMMAND_PARAMETER_PATTERN_CACHE,
+    JOB_NAME_COMMAND_PATTERNS,
+    PROCESS_SNAPSHOT_CACHE_SECONDS,
+    STALE_LOCK_GRACE_SECONDS,
+    STATUS_COMPLETED,
+    STATUS_CONFIRMING,
+    STATUS_FAILED,
+    STATUS_INTERRUPTED,
+    STATUS_RUNNING,
+    STATUS_STARTING,
+    STATUS_TERMINATED,
+    STATUS_UNKNOWN,
+)
 from .diagnostics import hang_probe_log, performance_log as log_performance
 from .queue_scheduler import normalize_work_dir
 
@@ -366,6 +383,14 @@ def resolve_external_job_path(value, work_dir, extension=""):
     return normalize_joblist_path(os.path.join(work_dir, value))
 
 
+def oldjob_name_from_command_value(value):
+    """Return the oldjob stem from a raw Abaqus oldjob= command value."""
+    if not value:
+        return ""
+    value = value.strip().strip('"').strip("'")
+    return os.path.splitext(os.path.basename(value))[0]
+
+
 def detect_external_job_type(process_chain):
     """Infer Standard/Explicit/Abaqus from related process names and command lines."""
     chain_text = " ".join(f"{row.get('Name', '')} {row.get('CommandLine', '')}" for row in process_chain).lower()
@@ -644,6 +669,8 @@ def get_runtime_process_evidence(
     job_name: str,
     *,
     process_rows: list[dict] | None = None,
+    process_by_pid: dict[int, dict] | None = None,
+    solver_rows: list[dict] | None = None,
     snapshot_available: bool = True,
     known_solver_pids: tuple[int, ...] | list[int] | set[int] = (),
 ) -> dict:
@@ -690,12 +717,22 @@ def get_runtime_process_evidence(
         return result
 
     rows = process_rows if process_rows is not None else get_psutil_process_snapshot(force=False, include_details=True)
-    process_by_pid = {}
-    for row in rows:
-        try:
-            process_by_pid[int(row.get("ProcessId") or 0)] = row
-        except (TypeError, ValueError):
-            continue
+    if process_by_pid is None:
+        process_by_pid = {}
+        for row in rows:
+            try:
+                process_by_pid[int(row.get("ProcessId") or 0)] = row
+            except (TypeError, ValueError):
+                continue
+    if solver_rows is None:
+        solver_rows = [
+            row
+            for row in rows
+            if is_active_solver_process(
+                row.get("Name") or "",
+                row.get("CommandLine") or "",
+            )
+        ]
 
     known_active_pids = []
     known_solver_kinds = set()
@@ -757,11 +794,9 @@ def get_runtime_process_evidence(
 
     matched_pids = []
     solver_kinds = set()
-    for row in rows:
+    for row in solver_rows:
         process_name = row.get("Name") or ""
         command_line = row.get("CommandLine") or ""
-        if not is_active_solver_process(process_name, command_line):
-            continue
 
         chain = get_process_and_parent_chain(row, process_by_pid)
         chain_job_name = get_first_chain_parameter(chain, "job")
@@ -816,11 +851,20 @@ def fetch_psutil_process_rows_for_external_scan(force=True):
     return get_psutil_process_snapshot(force=force, include_details=True)
 
 
-def scan_running_abaqus_jobs_by_psutil(work_dir, force=True, known_external_jobs=None):
+def scan_running_abaqus_jobs_by_psutil(
+    work_dir,
+    force=True,
+    known_external_jobs=None,
+    process_rows=None,
+):
     """Scan running Abaqus jobs under one scan root using psutil process data."""
     normalized_work_dir = normalize_work_dir(work_dir)
     known_external_jobs = known_external_jobs or []
-    rows = get_psutil_process_snapshot(force=force, include_details=True)
+    rows = (
+        process_rows
+        if process_rows is not None
+        else get_psutil_process_snapshot(force=force, include_details=True)
+    )
     process_by_pid = {}
     for row in rows:
         try:
@@ -874,8 +918,9 @@ def scan_running_abaqus_jobs_by_psutil(work_dir, force=True, known_external_jobs
                 input_path = normalize_joblist_path(candidate_inp)
 
         for_file = resolve_external_job_path(get_first_chain_parameter(chain, "user"), matching_work_dir)
-        oldjob_name = get_first_chain_parameter(chain, "oldjob")
-        oldjob_path = resolve_external_job_path(oldjob_name, matching_work_dir, extension=".odb") if oldjob_name else ""
+        oldjob_value = get_first_chain_parameter(chain, "oldjob")
+        oldjob_name = oldjob_name_from_command_value(oldjob_value)
+        oldjob_path = resolve_external_job_path(oldjob_value, matching_work_dir, extension=".odb") if oldjob_value else ""
         cores = get_first_chain_parameter(chain, "cpus")
         memory_setting = get_first_chain_parameter(chain, "memory")
         job_key = (normalize_work_dir(matching_work_dir), job_name.lower())
@@ -1063,16 +1108,8 @@ def fetch_windows_process_rows():
     return []
 
 
-def get_abaqus_job_memory_usage(force=False):
-    """Return memory usage grouped by Abaqus job name."""
-    now = time.monotonic()
-    if not force and now - abaqus_memory_cache["timestamp"] < ABAQUS_MEMORY_POLL_INTERVAL_SECONDS:
-        return abaqus_memory_cache["usage"]
-
-    rows = fetch_psutil_process_rows()
-    if not rows:
-        rows = fetch_windows_process_rows()
-
+def build_abaqus_job_memory_usage(rows):
+    """从共享进程快照构建按 Abaqus 作业分组的内存统计。"""
     process_by_pid = {}
     for row in rows:
         try:
@@ -1115,6 +1152,20 @@ def get_abaqus_job_memory_usage(force=False):
     for usage in usage_by_job.values():
         usage["process_names"] = ", ".join(sorted(usage["process_names"]))
 
+    return usage_by_job
+
+
+def get_abaqus_job_memory_usage(force=False):
+    """Return memory usage grouped by Abaqus job name."""
+    now = time.monotonic()
+    if not force and now - abaqus_memory_cache["timestamp"] < ABAQUS_MEMORY_POLL_INTERVAL_SECONDS:
+        return abaqus_memory_cache["usage"]
+
+    rows = fetch_psutil_process_rows()
+    if not rows:
+        rows = fetch_windows_process_rows()
+    usage_by_job = build_abaqus_job_memory_usage(rows)
+
     abaqus_memory_cache["timestamp"] = now
     abaqus_memory_cache["usage"] = usage_by_job
     return usage_by_job
@@ -1142,6 +1193,7 @@ __all__ = [
     "get_first_chain_parameter",
     "get_chain_work_dir",
     "resolve_external_job_path",
+    "oldjob_name_from_command_value",
     "detect_external_job_type",
     "get_job_lock_info",
     "classify_external_job_runtime",
@@ -1153,5 +1205,6 @@ __all__ = [
     "fetch_psutil_process_rows",
     "fetch_windows_process_rows",
     "get_abaqus_job_memory_usage",
+    "build_abaqus_job_memory_usage",
     "get_cached_abaqus_job_memory_usage",
 ]

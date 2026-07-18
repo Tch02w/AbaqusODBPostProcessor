@@ -3,19 +3,28 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 from .constants import (
     ACTIVE_STATUSES,
     STATUS_COMPLETED,
-    STATUS_DATACHECK_COMPLETED,
-    STATUS_DATACHECK_FAILED,
     STATUS_FAILED,
     STATUS_PENDING_RUN,
     STATUS_WAITING_DEPENDENCY,
     TERMINAL_STATUSES,
 )
 from .models import QueueItem
+
+
+@dataclass(frozen=True)
+class RestartOldjobReference:
+    oldjob_name: str
+    source_dir: str
+    source_kind: str
+    oldjob_arg: str
+    reference_key: str
 
 
 def normalize_work_dir(work_dir: str) -> str:
@@ -159,6 +168,26 @@ def oldjob_name_from_item(item: QueueItem) -> str:
     return Path(oldjob_path).stem if oldjob_path else ""
 
 
+def queue_item_matches_oldjob_path(item: QueueItem, candidate: QueueItem) -> bool:
+    oldjob_path = (item.oldjob_path or "").strip()
+    if not oldjob_path:
+        return False
+    try:
+        path = Path(oldjob_path)
+        oldjob_dir = normalize_work_dir(str(path.parent))
+    except (OSError, ValueError):
+        return False
+    if path.stem.lower() != candidate.job_name.lower():
+        return False
+    candidate_dirs = [
+        candidate.archive_destination,
+        candidate.effective_work_dir,
+        candidate.external_work_dir,
+        os.path.dirname(candidate.inp_path),
+    ]
+    return any(oldjob_dir == normalize_work_dir(candidate_dir) for candidate_dir in candidate_dirs if candidate_dir)
+
+
 def find_queue_oldjob_item(
     oldjob_name: str,
     queue_items: list[QueueItem],
@@ -166,12 +195,181 @@ def find_queue_oldjob_item(
 ) -> QueueItem | None:
     if not oldjob_name:
         return None
+    candidates = []
     for item in queue_items:
         if current_item is not None and item.item_id == current_item.item_id:
             continue
         if item.job_name.lower() == oldjob_name.lower():
-            return item
-    return None
+            candidates.append(item)
+    if not candidates:
+        return None
+    if current_item is not None:
+        path_matches = [item for item in candidates if queue_item_matches_oldjob_path(current_item, item)]
+        completed_path_matches = [item for item in path_matches if item.status == STATUS_COMPLETED]
+        if completed_path_matches:
+            return completed_path_matches[0]
+        if path_matches:
+            return path_matches[0]
+    completed_candidates = [item for item in candidates if item.status == STATUS_COMPLETED]
+    if completed_candidates:
+        return completed_candidates[0]
+    return candidates[0]
+
+
+def _oldjob_odb_exists(source_dir: str, oldjob_name: str) -> bool:
+    if not source_dir or not oldjob_name:
+        return False
+    try:
+        return (Path(source_dir) / f"{oldjob_name}.odb").exists()
+    except OSError:
+        return False
+
+
+def oldjob_source_dir_from_path(raw_path: str, oldjob_name: str) -> str:
+    if not raw_path or not oldjob_name:
+        return ""
+    try:
+        path = Path(raw_path)
+    except (OSError, ValueError):
+        return ""
+    if path.suffix.lower() == ".odb" and path.stem.lower() == oldjob_name.lower() and path.exists():
+        return str(path.parent)
+    if path.suffix == "" and path.name.lower() == oldjob_name.lower():
+        candidate_odb = path.with_suffix(".odb")
+        if candidate_odb.exists():
+            return str(candidate_odb.parent)
+    return ""
+
+
+def oldjob_stem_arg(source_dir: str, oldjob_name: str) -> str:
+    if not source_dir or not oldjob_name:
+        return ""
+    return str(Path(source_dir) / oldjob_name)
+
+
+def restart_oldjob_reference_key(source_dir: str, oldjob_name: str) -> str:
+    normalized_source, normalized_oldjob = managed_job_key(source_dir, oldjob_name)
+    if not normalized_source or not normalized_oldjob:
+        return ""
+    return f"{normalized_source}::{normalized_oldjob}"
+
+
+def resolve_oldjob_source_dir(
+    oldjob_name: str,
+    queue_items: list[QueueItem],
+    *,
+    current_item: QueueItem | None = None,
+    run_records: Iterable[dict] = (),
+    candidate_paths: Iterable[str] = (),
+) -> str:
+    if not oldjob_name:
+        return ""
+    dependency = find_queue_oldjob_item(oldjob_name, queue_items, current_item)
+    if dependency is not None and dependency.status == STATUS_COMPLETED:
+        dependency_name = dependency.job_name
+        archive_destination = (dependency.archive_destination or "").strip()
+        if _oldjob_odb_exists(archive_destination, dependency_name):
+            return archive_destination
+        for run in reversed(list(run_records)):
+            if (run.get("job_name") or "").lower() != dependency_name.lower():
+                continue
+            run_archive_destination = (run.get("archive_destination") or "").strip()
+            if _oldjob_odb_exists(run_archive_destination, dependency_name):
+                return run_archive_destination
+            run_work_dir = (run.get("work_dir") or "").strip()
+            if _oldjob_odb_exists(run_work_dir, dependency_name):
+                return run_work_dir
+        for source_dir in (
+            dependency.effective_work_dir,
+            dependency.external_work_dir,
+            os.path.dirname(dependency.inp_path),
+        ):
+            if _oldjob_odb_exists(source_dir, dependency_name):
+                return source_dir
+
+    for raw_path in candidate_paths:
+        source_dir = oldjob_source_dir_from_path(raw_path, oldjob_name)
+        if source_dir:
+            return source_dir
+    return ""
+
+
+def restart_oldjob_source_kind(
+    oldjob_name: str,
+    source_dir: str,
+    queue_items: list[QueueItem],
+    *,
+    current_item: QueueItem | None = None,
+    run_records: Iterable[dict] = (),
+    manual_candidate_paths: Iterable[str] = (),
+    external_candidate_paths: Iterable[str] = (),
+) -> str:
+    if not oldjob_name or not source_dir:
+        return ""
+    normalized_source = managed_job_key(source_dir, "")[0]
+    for item in queue_items:
+        if current_item is not None and item.item_id == current_item.item_id:
+            continue
+        if item.job_name.lower() != oldjob_name.lower():
+            continue
+        archive_destination = (item.archive_destination or "").strip()
+        if archive_destination and managed_job_key(archive_destination, "")[0] == normalized_source:
+            return "archive"
+        for item_source in (
+            item.effective_work_dir,
+            item.external_work_dir,
+            os.path.dirname(item.inp_path),
+        ):
+            if item_source and managed_job_key(item_source, "")[0] == normalized_source:
+                return "queue-workdir"
+    for run in reversed(list(run_records)):
+        if (run.get("job_name") or "").lower() != oldjob_name.lower():
+            continue
+        archive_destination = (run.get("archive_destination") or "").strip()
+        if archive_destination and managed_job_key(archive_destination, "")[0] == normalized_source:
+            return "archive"
+        work_dir = (run.get("work_dir") or "").strip()
+        if work_dir and managed_job_key(work_dir, "")[0] == normalized_source:
+            return "queue-workdir"
+    for raw_path in manual_candidate_paths:
+        candidate_source = oldjob_source_dir_from_path(raw_path, oldjob_name)
+        if candidate_source and managed_job_key(candidate_source, "")[0] == normalized_source:
+            return "manual"
+    for raw_path in external_candidate_paths:
+        candidate_source = oldjob_source_dir_from_path(raw_path, oldjob_name)
+        if candidate_source and managed_job_key(candidate_source, "")[0] == normalized_source:
+            return "external"
+    return "external"
+
+
+def build_restart_oldjob_reference(
+    oldjob_name: str,
+    source_dir: str,
+    queue_items: list[QueueItem],
+    *,
+    current_item: QueueItem | None = None,
+    run_records: Iterable[dict] = (),
+    manual_candidate_paths: Iterable[str] = (),
+    external_candidate_paths: Iterable[str] = (),
+) -> RestartOldjobReference:
+    if not oldjob_name or not source_dir:
+        return RestartOldjobReference("", "", "", "", "")
+    source_kind = restart_oldjob_source_kind(
+        oldjob_name,
+        source_dir,
+        queue_items,
+        current_item=current_item,
+        run_records=run_records,
+        manual_candidate_paths=manual_candidate_paths,
+        external_candidate_paths=external_candidate_paths,
+    )
+    return RestartOldjobReference(
+        oldjob_name=oldjob_name,
+        source_dir=source_dir,
+        source_kind=source_kind,
+        oldjob_arg=oldjob_stem_arg(source_dir, oldjob_name),
+        reference_key=restart_oldjob_reference_key(source_dir, oldjob_name),
+    )
 
 
 def queue_item_dependency_state(
@@ -253,6 +451,18 @@ def unfinished_restart_dependents(
         if not queue_item_depends_on_job(item, job_name, work_dir):
             continue
         if not queue_item_is_finished(item):
+            dependents.append(item)
+    return dependents
+
+
+def restart_dependents_using_current_work_dir(
+    run: dict,
+    queue_items: list[QueueItem],
+) -> list[QueueItem]:
+    """Return Restart dependents that may already be using this run's current work dir."""
+    dependents = []
+    for item in unfinished_restart_dependents(run, queue_items):
+        if item.status in ACTIVE_STATUSES or item.active_job_key:
             dependents.append(item)
     return dependents
 

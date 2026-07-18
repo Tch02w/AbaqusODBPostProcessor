@@ -17,32 +17,32 @@ RUNTIME_LOG_WIDTH_SAMPLE = "****************************************************
 # Horizontal padding inside runtimeBodyCard: 8 + 8.
 RUNTIME_BODY_HORIZONTAL_MARGIN = 16
 
-APP_BG = "#eef3f8"
+APP_BG = "#f3f6fa"
 CARD_BG = "#ffffff"
 LOG_BG = "#f8fafc"
 TEXT = "#111827"
 HINT = "#64748b"
 PRIMARY = "#2563eb"
 PRIMARY_HOVER = "#1d4ed8"
-LIGHT = "#dbe3ee"
-LIGHT_HOVER = "#cbd5e1"
-DANGER = "#7f1d1d"
-DANGER_HOVER = "#991b1b"
-BORDER = "#cbd5e1"
-BORDER_SOFT = "#d8e1ee"
+LIGHT = "#e7edf6"
+LIGHT_HOVER = "#d8e2ef"
+DANGER = "#dc2626"
+DANGER_HOVER = "#b91c1c"
+BORDER = "#c7d2e1"
+BORDER_SOFT = "#dbe4ef"
 FOCUS = "#60a5fa"
 FIELD_BG = "#ffffff"
 FIELD_MUTED_BG = "#f8fafc"
-TABLE_HEADER_BG = "#f1f5f9"
+TABLE_HEADER_BG = "#edf2f8"
 TABLE_GRID = "#e5e7eb"
 SELECTION_BG = "#dbeafe"
 SELECTION_TEXT = "#0f172a"
 RUNTIME_SELECTOR_FALLBACK_BG = "#e2e8f0"
 
-RADIUS_CARD = 8
-RADIUS_CONTROL = 6
-CONTROL_HEIGHT = 30
-BUTTON_HEIGHT = 28
+RADIUS_CARD = 10
+RADIUS_CONTROL = 7
+CONTROL_HEIGHT = 32
+BUTTON_HEIGHT = 30
 SCROLLBAR_BG = "#f8fafc"
 SCROLLBAR_HANDLE = "#cbd5e1"
 SCROLLBAR_HANDLE_HOVER = "#94a3b8"
@@ -57,8 +57,8 @@ def _button_styles() -> str:
             QPushButton {{
                 background: {LIGHT};
                 color: {TEXT};
-                border: 0;
-                border-radius: {RADIUS_CARD}px;
+                border: 1px solid transparent;
+                border-radius: {RADIUS_CONTROL}px;
                 min-height: {BUTTON_HEIGHT}px;
                 max-height: {BUTTON_HEIGHT}px;
                 padding: 3px 10px;
@@ -88,9 +88,23 @@ def _button_styles() -> str:
             QPushButton#danger:hover {{
                 background: {DANGER_HOVER};
             }}
+            QPushButton:pressed {{
+                background: #cbd5e1;
+                padding-top: 4px;
+            }}
+            QPushButton#primary:pressed {{
+                background: #1e40af;
+            }}
+            QPushButton#danger:pressed {{
+                background: #991b1b;
+            }}
+            QPushButton:focus {{
+                border-color: {FOCUS};
+            }}
             QPushButton:disabled {{
                 background: #e5e7eb;
                 color: #94a3b8;
+                border-color: transparent;
             }}
             """
 
@@ -171,6 +185,7 @@ def _table_styles() -> str:
     return f"""
             QTableWidget {{
                 background: {CARD_BG};
+                alternate-background-color: #f8fafc;
                 color: {TEXT};
                 border: 1px solid {BORDER_SOFT};
                 border-radius: {RADIUS_CONTROL}px;
@@ -184,7 +199,7 @@ def _table_styles() -> str:
                 border: 0;
                 border-right: 1px solid {TABLE_GRID};
                 padding: 7px 6px;
-                font-weight: 500;
+                font-weight: 600;
             }}
             """
 
@@ -285,14 +300,14 @@ def build_queue_manager_stylesheet() -> str:
                 background: {CARD_BG};
                 border: 1px solid {BORDER_SOFT};
                 border-radius: {RADIUS_CARD}px;
-                margin-top: 10px;
-                padding-top: 12px;
+                margin-top: 12px;
+                padding-top: 14px;
                 font-weight: 600;
             }}
             QGroupBox::title {{
                 subcontrol-origin: margin;
-                left: 8px;
-                padding: 0 4px;
+                left: 10px;
+                padding: 0 6px;
                 background: {CARD_BG};
             }}
             QGroupBox QLabel,
@@ -323,8 +338,8 @@ def build_main_stylesheet() -> str:
             }}
             QFrame#card {{
                 background: {CARD_BG};
-                border: 1px solid #d8e1ee;
-                border-radius: 8px;
+                border: 1px solid {BORDER_SOFT};
+                border-radius: {RADIUS_CARD}px;
             }}
             QFrame#runtimeBodyCard {{
                 background-color: #ffffff;
@@ -341,6 +356,11 @@ def build_main_stylesheet() -> str:
             }}
             QLabel#hint {{
                 color: {HINT};
+            }}
+            QLabel#sectionTitle {{
+                color: {TEXT};
+                font-size: 13px;
+                font-weight: 700;
             }}
             QLabel#unitBadge {{
                 background: #f8fafc;
@@ -577,43 +597,12 @@ def build_main_stylesheet() -> str:
             QPlainTextEdit#runtimeLog QWidget {{
                 background: {LOG_BG};
             }}
-            QPushButton {{
-                background: {LIGHT};
-                color: {TEXT};
+            QToolTip {{
+                background: #0f172a;
+                color: #ffffff;
                 border: 0;
-                border-radius: 8px;
-                min-height: {BUTTON_HEIGHT}px;
-                max-height: {BUTTON_HEIGHT}px;
-                padding: 3px 10px;
-                font-weight: 600;
+                padding: 5px 7px;
             }}
-            QPushButton:hover {{
-                background: {LIGHT_HOVER};
-            }}
-            QPushButton#light {{
-                background: {LIGHT};
-                color: {TEXT};
-            }}
-            QPushButton#light:hover {{
-                background: {LIGHT_HOVER};
-            }}
-            QPushButton#primary {{
-                background: {PRIMARY};
-                color: #ffffff;
-            }}
-            QPushButton#primary:hover {{
-                background: {PRIMARY_HOVER};
-            }}
-            QPushButton#danger {{
-                background: {DANGER};
-                color: #ffffff;
-            }}
-            QPushButton#danger:hover {{
-                background: #991b1b;
-            }}
-            QPushButton:disabled {{
-                background: #e5e7eb;
-                color: #94a3b8;
-            }}
+            {_button_styles()}
             {_scrollbar_styles()}
             """

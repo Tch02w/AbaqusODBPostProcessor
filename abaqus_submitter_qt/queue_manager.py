@@ -37,6 +37,14 @@ from .queue_scheduler import (
     queue_item_conflict_key,
     queue_status_counts,
 )
+from .queue_presentation import (
+    QueuePresentationCoordinator,
+    candidate_row_projection,
+    formal_row_projection,
+    format_runtime_memory,
+    runtime_cell_projection,
+)
+from .restart_dependency import RestartDependencyLifecycle
 from .ui_styles import build_queue_manager_stylesheet
 
 RESULT_EXTENSIONS = (".odb", ".sta", ".msg", ".dat", ".log")
@@ -231,6 +239,11 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self._table_refresh_batch_size = 80
 
         self.build_ui()
+        self.queue_presentation = QueuePresentationCoordinator(
+            full_refresh=self.refresh_queue_table,
+            runtime_refresh=self.update_queue_runtime_cells,
+            parent=self,
+        )
         self._startup_timeline.mark("build-ui")
         QtCore.QTimer.singleShot(0, self.refresh_tables)
         self._startup_timeline.mark("schedule-initial-refresh")
@@ -273,21 +286,24 @@ class QueueManagerDialog(QtWidgets.QDialog):
         ):
             candidate_toolbar.addWidget(button)
         candidate_toolbar.addStretch(1)
-        candidate_toolbar.addWidget(QtWidgets.QLabel("SSD"))
+        candidate_layout.addLayout(candidate_toolbar)
+
+        candidate_paths = QtWidgets.QHBoxLayout()
+        candidate_paths.setSpacing(6)
+        candidate_paths.addWidget(QtWidgets.QLabel("SSD 工作目录"))
         self.ssd_dir_edit = QtWidgets.QLineEdit(self.saved_paths.get("qt_ssd_work_dir", ""))
         self.ssd_dir_edit.setPlaceholderText("固态工作目录")
-        self.ssd_dir_edit.setFixedWidth(170)
         self.choose_ssd_btn = self.make_button("选择")
-        candidate_toolbar.addWidget(self.ssd_dir_edit)
-        candidate_toolbar.addWidget(self.choose_ssd_btn)
-        candidate_toolbar.addWidget(QtWidgets.QLabel("ARC"))
+        candidate_paths.addWidget(self.ssd_dir_edit, 1)
+        candidate_paths.addWidget(self.choose_ssd_btn)
+        candidate_paths.addSpacing(10)
+        candidate_paths.addWidget(QtWidgets.QLabel("ARC 归档目录"))
         self.archive_dir_edit = QtWidgets.QLineEdit(self.saved_paths.get("qt_archive_dir", ""))
         self.archive_dir_edit.setPlaceholderText("结果存档目录")
-        self.archive_dir_edit.setFixedWidth(170)
         self.choose_archive_btn = self.make_button("选择")
-        candidate_toolbar.addWidget(self.archive_dir_edit)
-        candidate_toolbar.addWidget(self.choose_archive_btn)
-        candidate_layout.addLayout(candidate_toolbar)
+        candidate_paths.addWidget(self.archive_dir_edit, 1)
+        candidate_paths.addWidget(self.choose_archive_btn)
+        candidate_layout.addLayout(candidate_paths)
 
         candidate_options = QtWidgets.QHBoxLayout()
         candidate_options.setSpacing(14)
@@ -326,18 +342,22 @@ class QueueManagerDialog(QtWidgets.QDialog):
         queue_toolbar.addWidget(self.edit_queue_btn)
         queue_toolbar.addWidget(self.terminate_queue_btn)
         queue_toolbar.addWidget(self.clear_finished_btn)
-        queue_toolbar.addSpacing(12)
-        queue_toolbar.addWidget(QtWidgets.QLabel("工作目录："))
-        self.work_dir_edit = QtWidgets.QLineEdit(self.default_work_dir())
-        queue_toolbar.addWidget(self.work_dir_edit, 1)
-        self.choose_work_dir_btn = self.make_button("选择")
-        self.scan_external_btn = self.make_button("扫描", "primary")
-        queue_toolbar.addWidget(self.choose_work_dir_btn)
-        queue_toolbar.addWidget(self.scan_external_btn)
+        queue_toolbar.addStretch(1)
         self.summary_label = QtWidgets.QLabel("状态：队列为空")
         self.summary_label.setObjectName("hint")
         queue_toolbar.addWidget(self.summary_label)
         queue_layout.addLayout(queue_toolbar)
+
+        queue_scan_toolbar = QtWidgets.QHBoxLayout()
+        queue_scan_toolbar.setSpacing(6)
+        queue_scan_toolbar.addWidget(QtWidgets.QLabel("工作目录："))
+        self.work_dir_edit = QtWidgets.QLineEdit(self.default_work_dir())
+        queue_scan_toolbar.addWidget(self.work_dir_edit, 1)
+        self.choose_work_dir_btn = self.make_button("选择")
+        self.scan_external_btn = self.make_button("扫描", "primary")
+        queue_scan_toolbar.addWidget(self.choose_work_dir_btn)
+        queue_scan_toolbar.addWidget(self.scan_external_btn)
+        queue_layout.addLayout(queue_scan_toolbar)
 
         self.queue_table = QtWidgets.QTableWidget(0, len(FORMAL_COLUMNS))
         self.setup_table(self.queue_table, FORMAL_COLUMNS)
@@ -374,8 +394,9 @@ class QueueManagerDialog(QtWidgets.QDialog):
         table.setHorizontalHeaderLabels(columns)
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
-        table.setAlternatingRowColors(False)
+        table.setAlternatingRowColors(True)
         table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(30)
         table.setShowGrid(False)
         table.horizontalHeader().setStretchLastSection(True)
         table.setHorizontalScrollMode(QtWidgets.QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -1030,6 +1051,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
     def closeEvent(self, event) -> None:
         self.folder_scan_closing = True
+        self.queue_presentation.cancel()
         self.cancel_table_refreshes()
         super().closeEvent(event)
 
@@ -1163,6 +1185,11 @@ class QueueManagerDialog(QtWidgets.QDialog):
         item.oldjob_path = os.path.normpath(str(path))
         item.oldjob_name = path.stem
         item.oldjob_dir = os.path.normpath(str(path.parent))
+        self.clear_resolved_oldjob_info(item)
+
+    @staticmethod
+    def clear_resolved_oldjob_info(item: QueueItem) -> None:
+        RestartDependencyLifecycle.clear_queue_item(item)
 
     def select_fortran_file(self, initial_path: str = "") -> str:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1434,6 +1461,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
         item.oldjob_name = selected_result["oldjob_name"]
         item.oldjob_dir = selected_result["oldjob_dir"]
         item.oldjob_path = selected_result["oldjob_path"]
+        self.clear_resolved_oldjob_info(item)
         self.validate_candidate(item)
         return item.valid
 
@@ -1689,7 +1717,10 @@ class QueueManagerDialog(QtWidgets.QDialog):
             return
         item.cores = core_spin.value()
         item.memory = memory_edit.text().strip()
-        item.oldjob_path = oldjob_edit.text().strip()
+        oldjob_path = oldjob_edit.text().strip()
+        if oldjob_path != item.oldjob_path:
+            self.clear_resolved_oldjob_info(item)
+        item.oldjob_path = oldjob_path
         item.fortran_path = fortran_edit.text().strip()
         self.detect_restart(item)
         self.validate_candidate(item)
@@ -1819,7 +1850,14 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.ensure_formal_columns_initialized()
         self.refresh_summaries()
 
-    def update_queue_memory_cells(self, updated_item_ids: set[str]) -> None:
+    def request_queue_refresh(self, updated_item_ids: set[str] | None = None) -> None:
+        """请求正式队列刷新；同一事件循环内的请求会自动合并。"""
+        if updated_item_ids is None:
+            self.queue_presentation.request_full()
+        else:
+            self.queue_presentation.request_items(updated_item_ids)
+
+    def update_queue_runtime_cells(self, updated_item_ids: set[str]) -> None:
         """Update volatile queue cells without rebuilding the whole table."""
         if not updated_item_ids:
             return
@@ -1833,11 +1871,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
                 row = row_by_key.get(item.item_id)
                 if row is None:
                     continue
-                updates = {
-                    7: self.format_runtime_memory(item.rss_bytes),
-                    8: item.status,
-                    9: item.message,
-                }
+                updates = runtime_cell_projection(item)
                 for column, value in updates.items():
                     self.update_table_cell(
                         self.queue_table,
@@ -1912,55 +1946,16 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.summary_label.setToolTip(f"正式队列：{detail}")
 
     def candidate_row_values(self, item: QueueItem, index: int) -> tuple[str, ...]:
-        dependency = item.oldjob_name or (Path(item.oldjob_path).stem if item.oldjob_path else "")
-        return (
-            "",
-            str(index),
-            item.job_name,
-            item.inp_path,
-            item.source or "文件",
-            item.job_type or ("重启动" if item.run_mode == "restart" else "普通"),
-            dependency,
-            os.path.basename(item.fortran_path) if item.fortran_path else "",
-            item.message,
-        )
+        return candidate_row_projection(item, index)
 
     @staticmethod
     def format_runtime_memory(
         size_bytes: int,
     ) -> str:
-        """将最近一次统计到的内存占用量格式化为 MB 或 GB。"""
-        try:
-            size_bytes = int(size_bytes or 0)
-        except (TypeError, ValueError):
-            return "未统计"
-
-        if size_bytes <= 0:
-            return "未统计"
-
-        gib = size_bytes / 1024**3
-
-        if gib >= 1:
-            return f"{gib:.1f} GB"
-
-        mib = size_bytes / 1024**2
-
-        return f"{mib:.0f} MB"
+        return format_runtime_memory(size_bytes)
 
     def formal_row_values(self, item: QueueItem, index: int) -> tuple[str, ...]:
-        dependency = item.oldjob_name or (Path(item.oldjob_path).stem if item.oldjob_path else "")
-        return (
-            str(index),
-            item.job_name,
-            item.inp_path,
-            item.job_type or ("重启动" if item.run_mode == "restart" else "普通"),
-            dependency,
-            os.path.basename(item.fortran_path) if item.fortran_path else "",
-            "" if int(item.cores or 0) <= 0 else str(item.cores),
-            self.format_runtime_memory(item.rss_bytes),
-            item.status,
-            item.message,
-        )
+        return formal_row_projection(item, index)
 
     def ensure_candidate_columns_initialized(self) -> None:
         if self.candidate_columns_initialized:

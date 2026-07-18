@@ -13,7 +13,8 @@ except ImportError:  # pragma: no cover - depends on user environment
     psutil = None
 
 from .memory_monitor import MemoryMonitorService, format_memory_size
-from .process_scanner import get_abaqus_job_memory_usage
+from .process_observation import ProcessObservationService
+from .process_scanner import build_abaqus_job_memory_usage, get_abaqus_job_memory_usage
 from .qt_compat import QtCore, Signal, Slot
 
 
@@ -48,14 +49,23 @@ class MemoryScanWorker(QtCore.QObject):
     finished = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, tracked_jobs: Iterable[TrackedMemoryJob | dict]):
+    def __init__(
+        self,
+        tracked_jobs: Iterable[TrackedMemoryJob | dict],
+        process_rows: list[dict] | None = None,
+    ):
         super().__init__()
         self.tracked_jobs = list(tracked_jobs)
+        self.process_rows = process_rows
 
     @Slot()
     def run(self) -> None:
         try:
-            usage_by_job = get_abaqus_job_memory_usage(force=True)
+            usage_by_job = (
+                build_abaqus_job_memory_usage(self.process_rows)
+                if self.process_rows is not None
+                else get_abaqus_job_memory_usage(force=True)
+            )
             self.finished.emit(
                 {
                     "usage_by_job": usage_by_job,
@@ -79,10 +89,12 @@ class QtMemoryMonitorAdapter(QtCore.QObject):
     def __init__(
         self,
         service: MemoryMonitorService | None = None,
+        process_observation: ProcessObservationService | None = None,
         parent: QtCore.QObject | None = None,
     ):
         super().__init__(parent)
         self.service = service or MemoryMonitorService()
+        self.process_observation = process_observation
         self.memory_scan_running = False
         self.closing = False
         self.last_slot_signature: tuple[int, int, int] | None = None
@@ -103,6 +115,8 @@ class QtMemoryMonitorAdapter(QtCore.QObject):
     def stop(self) -> None:
         self.closing = True
         self.timer.stop()
+        if self.process_observation is not None:
+            self.process_observation.set_consumer_active("memory", False)
         self.memory_scan_running = False
         thread = self._thread
         if thread is not None and thread.isRunning():
@@ -135,7 +149,10 @@ class QtMemoryMonitorAdapter(QtCore.QObject):
             )
 
         self._thread = QtCore.QThread(self)
-        self._worker = MemoryScanWorker(tracked_jobs)
+        process_rows = None
+        if self.process_observation is not None:
+            process_rows = self.process_observation.latest_snapshot()
+        self._worker = MemoryScanWorker(tracked_jobs, process_rows=process_rows)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._handle_finished)
@@ -184,10 +201,18 @@ class QtMemoryMonitorAdapter(QtCore.QObject):
 
     def activate_job(self, job_key: str) -> None:
         self.service.activate_job(job_key)
+        if self.process_observation is not None:
+            self.process_observation.set_consumer_active("memory", True)
         self.start()
 
     def finalize_job(self, job_key: str) -> None:
         self.service.finalize_job(job_key)
+        if self.process_observation is not None:
+            has_active_jobs = any(
+                state.monitor_active and not state.finalized
+                for state in self.service.tracking_states.values()
+            )
+            self.process_observation.set_consumer_active("memory", has_active_jobs)
         self.start()
 
     def apply_scan_payload(

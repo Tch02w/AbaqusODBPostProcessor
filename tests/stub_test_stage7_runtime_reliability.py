@@ -5,6 +5,7 @@ import time
 import unittest
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -12,7 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from abaqus_submitter_qt import job_runtime, runtime_evidence
 from abaqus_submitter_qt.abaqus_diagnostics import inspect_sta_structure
 from abaqus_submitter_qt.constants import (
-    STA_POLL_INTERVAL_MS,
     STATUS_DATACHECK_COMPLETED,
     STATUS_DATACHECK_FAILED,
 )
@@ -20,6 +20,8 @@ from abaqus_submitter_qt.job_controller import (
     FinalizationInput,
     resolve_finalization_status,
 )
+from abaqus_submitter_qt.main import MainWindow
+from abaqus_submitter_qt.process_scanner import get_runtime_process_evidence
 from abaqus_submitter_qt.runtime_evidence import (
     collect_runtime_evidence,
     runtime_completion_ready,
@@ -55,7 +57,7 @@ def base_run(work_dir: str, *, job_name: str = "Job_A") -> dict:
     }
 
 
-def inactive_process_evidence(*_args) -> dict:
+def inactive_process_evidence(*_args, **_kwargs) -> dict:
     return {
         "active": False,
         "confidence": "",
@@ -425,6 +427,32 @@ class Stage7RuntimeReliabilityTests(unittest.TestCase):
         source = Path(job_runtime.__file__).read_text(encoding="utf-8")
         self.assertIn("timer.setInterval(STA_POLL_INTERVAL_MS)", source)
         self.assertNotIn("timer.setInterval(5000)", source)
+
+    def test_shared_process_index_avoids_rescanning_snapshot(self) -> None:
+        class NonIterableRows(list):
+            def __iter__(self):
+                raise AssertionError("shared process rows should not be rescanned")
+
+        evidence = get_runtime_process_evidence(
+            "G:/jobs",
+            "Job_A",
+            process_rows=NonIterableRows(),
+            process_by_pid={},
+            solver_rows=[],
+        )
+        self.assertFalse(evidence["active"])
+
+    def test_runtime_update_uses_incremental_queue_refresh(self) -> None:
+        refreshed = []
+        host = SimpleNamespace(
+            run_records={"run1": {"queue_item": SimpleNamespace(item_id="item1")}},
+            selected_job_key=lambda: "",
+            refresh_selected_run_status=lambda _job_key: None,
+            refresh_visible_queue_manager=refreshed.append,
+            update_queue_status_label=lambda: None,
+        )
+        MainWindow.on_runtime_job_updated(host, "run1")
+        self.assertEqual(refreshed, [{"item1"}])
 
 
 if __name__ == "__main__":

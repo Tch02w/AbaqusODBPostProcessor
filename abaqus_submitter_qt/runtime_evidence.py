@@ -286,6 +286,8 @@ def collect_runtime_evidence(run: dict) -> dict:
         str(run.get("work_dir", "") or ""),
         str(run.get("job_name", "") or ""),
         process_rows=run.get("process_snapshot") if process_snapshot_available else None,
+        process_by_pid=run.get("process_snapshot_by_pid") if process_snapshot_available else None,
+        solver_rows=run.get("process_snapshot_solver_rows") if process_snapshot_available else None,
         snapshot_available=process_snapshot_available,
         known_solver_pids=tuple(run.get("known_solver_pids") or ()),
     )

@@ -64,8 +64,6 @@ from .command import (
     build_direct_submit_queue_item,
     build_abaqus_command,
     derive_job_name,
-    derive_oldjob_name,
-    inp_has_restart_keyword,
     validate_options,
 )
 from .diagnostics import StartupTimeline, external_scan_debug_enabled, hang_probe_function
@@ -78,18 +76,17 @@ from .external_jobs import (
 )
 from .job_controller import JobController
 from .job_runtime import JobRuntimeController
+from .process_observation import ProcessObservationService
+from .restart_dependency import RestartDependencyLifecycle
+from .runtime_record import RuntimeRecord
 from .qt_compat import QtCore, QtGui, QtWidgets, Signal
 from .queue_manager import QueueManagerDialog, load_joblist_state, save_joblist_state
 from .queue_scheduler import (
     find_queue_item_by_key as scheduler_find_queue_item_by_key,
-    find_queue_oldjob_item as scheduler_find_queue_oldjob_item,
     get_managed_active_job_keys as scheduler_get_managed_active_job_keys,
     get_managed_active_job_names as scheduler_get_managed_active_job_names,
     managed_active_statuses as scheduler_managed_active_statuses,
-    oldjob_name_from_item as scheduler_oldjob_name_from_item,
-    queue_item_is_finished as scheduler_queue_item_is_finished,
     queue_status_counts as scheduler_queue_status_counts,
-    refresh_queue_dependencies as scheduler_refresh_queue_dependencies,
     submit_conflict_key as scheduler_submit_conflict_key,
 )
 from .ui_components import (
@@ -275,7 +272,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.external_scan_reason = "manual"
         self.external_job_coordinator = ExternalJobCoordinator(self)
         self._start_queue_after_restore_scan = False
-        self._restored_status_scan_after_queue_open_scheduled = False
+        self._restored_status_scan_scheduled = False
         self.abaqus_status_thread: QtCore.QThread | None = None
         self.abaqus_status_worker: AbaqusPathCheckWorker | None = None
         self.job_notification_boxes: list[QtWidgets.QMessageBox] = []
@@ -293,8 +290,10 @@ class MainWindow(QtWidgets.QMainWindow):
             safety_factor=JOB_MEMORY_BASE_SAFETY_FACTOR,
             unlimited_job_slots=UNLIMITED_JOB_SLOTS,
         )
+        self.process_observation = ProcessObservationService(self)
         self.memory_adapter = QtMemoryMonitorAdapter(
             service=self.memory_monitor_service,
+            process_observation=self.process_observation,
             parent=self,
         )
         self.memory_adapter.scanFinished.connect(self.apply_memory_scan_result)
@@ -302,6 +301,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.memory_adapter.memorySlotEstimateChanged.connect(self.on_memory_slot_estimate_changed)
         self.runtime_controller = JobRuntimeController(
             memory_adapter=self.memory_adapter,
+            process_observation=self.process_observation,
             parent=self,
         )
         self.runtime_controller.jobLogReceived.connect(lambda job_key, text: self.append_job_log(text, job_key))
@@ -312,6 +312,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._closing = False
         self._dispatch_pending = False
         self._dispatch_running = False
+        self._selected_run_meta_signature: tuple | None = None
         self._dispatch_timer = QtCore.QTimer(self)
         self._dispatch_timer.setSingleShot(True)
         self._dispatch_timer.timeout.connect(self._run_scheduled_dispatch_queue)
@@ -329,6 +330,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.archive_move_service = ArchiveMoveService(self)
         self._archive_move_contexts: dict[str, dict] = {}
         self._archive_move_reserved_keys: set[tuple[str, str]] = set()
+        self.restart_dependencies = RestartDependencyLifecycle(
+            self.queue_items,
+            self.run_records,
+            self._archive_move_reserved_keys,
+        )
         self.job_controller = JobController(self)
         self.runtime_controller.jobFinished.connect(self.finalize_completed_run)
         self.workspace_prepare_service.succeeded.connect(self.on_workspace_prepare_succeeded)
@@ -400,9 +406,15 @@ class MainWindow(QtWidgets.QMainWindow):
         card_layout.setContentsMargins(18, 16, 18, 16)
         card_layout.setSpacing(11)
 
+        submit_header = QtWidgets.QHBoxLayout()
+        submit_title = QtWidgets.QLabel("单作业提交")
+        submit_title.setObjectName("sectionTitle")
+        submit_header.addWidget(submit_title)
+        submit_header.addStretch(1)
         self.abaqus_status_label = QtWidgets.QLabel("Abaqus 状态：待检测")
         self.abaqus_status_label.setObjectName("hint")
-        card_layout.addWidget(self.abaqus_status_label)
+        submit_header.addWidget(self.abaqus_status_label)
+        card_layout.addLayout(submit_header)
 
         self.inp_row = FilePickerRow("INP", "点击选择 INP 文件")
         self.oldjob_row = FilePickerRow("ODB", "点击选择重启动 ODB（可选）")
@@ -531,7 +543,9 @@ class MainWindow(QtWidgets.QMainWindow):
         history_layout = QtWidgets.QVBoxLayout(history_card)
         history_layout.setContentsMargins(18, 14, 18, 14)
         history_layout.setSpacing(8)
-        history_layout.addWidget(QtWidgets.QLabel("运行监控"))
+        history_title = QtWidgets.QLabel("运行监控")
+        history_title.setObjectName("sectionTitle")
+        history_layout.addWidget(history_title)
         self.history = QtWidgets.QPlainTextEdit()
         self.history.setReadOnly(True)
         self.history.setObjectName("log")
@@ -878,6 +892,7 @@ class MainWindow(QtWidgets.QMainWindow):
         candidates, queue_items, error = load_joblist_state()
         self.candidate_queue_items = candidates
         self.queue_items = queue_items
+        self.restart_dependencies.replace_queue_items(queue_items)
         self.joblist_load_error = error
 
     def request_joblist_save(self) -> None:
@@ -1046,24 +1061,39 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def request_restored_status_scan_after_queue_manager_render(self) -> None:
-        if self._restored_status_scan_after_queue_open_scheduled:
+        self.request_restored_status_scan_after_render(delay_ms=350, require_queue_dialog=True)
+
+    def request_restored_status_scan_after_main_window_render(self) -> None:
+        self.request_restored_status_scan_after_render(delay_ms=650, require_queue_dialog=False)
+
+    def request_restored_status_scan_after_render(
+        self,
+        *,
+        delay_ms: int,
+        require_queue_dialog: bool,
+    ) -> None:
+        if self._restored_status_scan_scheduled:
             return
-        if not self.restored_unknown_queue_items():
+        if not self.restored_status_recheck_queue_items():
             return
 
-        self._restored_status_scan_after_queue_open_scheduled = True
+        self._restored_status_scan_scheduled = True
 
         def run_restore_scan() -> None:
-            self._restored_status_scan_after_queue_open_scheduled = False
-            dialog = self.queue_manager_dialog
-            if dialog is None or not dialog.isVisible():
+            self._restored_status_scan_scheduled = False
+            if self._closing or not self.isVisible():
                 return
+            if require_queue_dialog:
+                dialog = self.queue_manager_dialog
+                if dialog is None or not dialog.isVisible():
+                    return
             self.request_restored_queue_status_scan()
 
-        QtCore.QTimer.singleShot(350, run_restore_scan)
+        QtCore.QTimer.singleShot(delay_ms, run_restore_scan)
 
     def refresh_visible_queue_manager(
         self,
+        updated_item_ids: set[str] | None = None,
     ) -> None:
         """队列管理窗口可见时刷新正式队列表格。"""
         dialog = self.queue_manager_dialog
@@ -1071,7 +1101,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if dialog is None or not dialog.isVisible():
             return
 
-        dialog.refresh_queue_table()
+        dialog.request_queue_refresh(updated_item_ids)
 
     def position_queue_manager(self, dialog: QueueManagerDialog) -> None:
         screen = (
@@ -1133,6 +1163,7 @@ class MainWindow(QtWidgets.QMainWindow):
         worker = ExternalJobScanWorker(
             work_dir,
             self.collect_known_external_jobs(work_dir),
+            process_rows=self.process_observation.latest_snapshot(max_age=1.0),
         )
 
         worker.moveToThread(thread)
@@ -1182,9 +1213,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def restored_unknown_queue_items(self) -> list[QueueItem]:
         return [item for item in self.queue_items if item.status == STATUS_UNKNOWN]
 
+    def restored_status_recheck_queue_items(self) -> list[QueueItem]:
+        active_statuses = scheduler_managed_active_statuses()
+        return [
+            item
+            for item in self.queue_items
+            if item.status == STATUS_UNKNOWN
+            or (
+                item.status in active_statuses
+                and (not item.active_job_key or item.active_job_key not in self.active_runs)
+            )
+        ]
+
     def request_restored_queue_status_scan(self, *, start_queue_after: bool = False) -> bool:
-        unknown_items = self.restored_unknown_queue_items()
-        if not unknown_items:
+        recheck_items = self.restored_status_recheck_queue_items()
+        if not recheck_items:
             return False
 
         if start_queue_after:
@@ -1195,12 +1238,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return True
 
         scan_root = ""
-        for item in unknown_items:
+        for item in recheck_items:
             scan_root = self.queue_item_runtime_work_dir(item)
             if scan_root:
                 break
         if not scan_root:
-            for item in unknown_items:
+            for item in recheck_items:
                 item.status = STATUS_PENDING_CONFIRM
                 item.message = "程序重启后缺少运行目录，请人工确认"
             self.update_queue_status_label()
@@ -1208,7 +1251,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.request_joblist_save()
             return False
 
-        self.append_history(f"开始恢复队列状态复核：{len(unknown_items)} 个待确认作业")
+        self.append_history(f"开始恢复队列状态复核：{len(recheck_items)} 个待确认作业")
         self.scan_external_jobs(
             scan_root,
             show_summary=False,
@@ -1502,7 +1545,7 @@ class MainWindow(QtWidgets.QMainWindow):
         box.setText(f"检测到作业 {job_name} 已存在同名 ODB 文件：\n\n{odb_path}\n\n请选择处理方式。{suffix}")
         overwrite_button = box.addButton("覆盖旧结果", QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
         backup_button = box.addButton("备份旧结果", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
-        cancel_button = box.addButton("取消提交", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        box.addButton("取消提交", QtWidgets.QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(backup_button)
         box.exec()
 
@@ -1550,9 +1593,7 @@ class MainWindow(QtWidgets.QMainWindow):
         )
 
     def submit_requires_restart_dependency(self, options: SubmitOptions, queue_item: QueueItem | None) -> bool:
-        if queue_item is not None and queue_item.run_mode == "restart":
-            return True
-        return inp_has_restart_keyword(options.inp_file)
+        return self.restart_dependencies.requires_dependency(options, queue_item)
 
     def block_missing_restart_dependency(
         self,
@@ -1632,9 +1673,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.append_history(f"{job_name} 进程错误：{error}")
 
     def on_runtime_job_updated(self, job_key: str) -> None:
+        run = self.run_records.get(job_key)
+        queue_item = run.get("queue_item") if run is not None else None
+        updated_item_ids = {queue_item.item_id} if queue_item is not None else set()
         if job_key == self.selected_job_key():
             self.refresh_selected_run_status(job_key)
-        self.refresh_visible_queue_manager()
+        self.refresh_visible_queue_manager(updated_item_ids)
         self.update_queue_status_label()
 
     def apply_memory_scan_result(self, payload: object) -> None:
@@ -1660,7 +1704,7 @@ class MainWindow(QtWidgets.QMainWindow):
             for run in self.active_runs.values():
                 if (run.get("job_name") or "").lower() != str(job_name).lower():
                     continue
-                run["memory_current"] = rss_bytes
+                RuntimeRecord.update_memory(run, current=rss_bytes)
                 queue_item = run.get("queue_item")
                 if queue_item is not None:
                     queue_item.rss_bytes = rss_bytes
@@ -1694,53 +1738,25 @@ class MainWindow(QtWidgets.QMainWindow):
             if run is None:
                 continue
 
-            run["memory_current"] = safe_int(
-                updated_job.get(
-                    "rss_bytes",
-                    0,
-                )
-            )
-
-            run["memory_peak"] = safe_int(
-                updated_job.get(
-                    "peak_memory",
-                    0,
-                )
-            )
-
-            run["memory_estimated"] = safe_int(
-                updated_job.get(
-                    "estimated_memory",
-                    0,
-                )
-            )
-
-            run["memory_monitor_mode"] = str(
-                updated_job.get(
-                    "monitor_mode",
-                    "learning",
-                )
-                or "learning"
-            )
-
-            run["memory_monitor_stable"] = bool(
-                updated_job.get(
-                    "stable",
-                    False,
-                )
+            RuntimeRecord.update_memory(
+                run,
+                current=safe_int(updated_job.get("rss_bytes", 0)),
+                peak=safe_int(updated_job.get("peak_memory", 0)),
+                estimated=safe_int(updated_job.get("estimated_memory", 0)),
+                mode=str(updated_job.get("monitor_mode", "learning") or "learning"),
+                stable=bool(updated_job.get("stable", False)),
             )
 
         self.refresh_selected_run_meta()
 
-        if self.queue_manager_dialog is not None and self.queue_manager_dialog.isVisible():
-            self.queue_manager_dialog.update_queue_memory_cells(updated_item_ids)
+        self.refresh_visible_queue_manager(updated_item_ids)
 
         self.update_queue_status_label()
         if self.queue_active:
             self.request_dispatch_queue()
 
     def on_memory_scan_failed(self, message: str) -> None:
-        self.append_history(f"Memory scan failed: {message}")
+        self.append_history(f"内存扫描失败：{message}")
 
     def on_memory_slot_estimate_changed(
         self,
@@ -1828,7 +1844,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def refresh_queue_dependencies(self) -> None:
         previous = {item.item_id: (item.status, item.message) for item in self.queue_items}
-        scheduler_refresh_queue_dependencies(self.queue_items)
+        self.restart_dependencies.refresh_queue()
         for item in self.queue_items:
             old_status, old_message = previous.get(
                 item.item_id,
@@ -1843,47 +1859,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.append_history(f"跳过重启动作业：{item.job_name}\n{item.message}")
 
     def resolve_oldjob_source_dir(self, options: SubmitOptions, queue_item: QueueItem | None) -> str:
-        oldjob_name = derive_oldjob_name(options.oldjob_path)
-        if not oldjob_name and queue_item is not None:
-            oldjob_name = scheduler_oldjob_name_from_item(queue_item)
-        if not oldjob_name:
-            return ""
-
-        dependency = scheduler_find_queue_oldjob_item(
-            oldjob_name,
-            self.queue_items,
-            queue_item,
-        )
-        if dependency is not None and dependency.status == STATUS_COMPLETED:
-            for run in reversed(list(self.run_records.values())):
-                if (run.get("job_name") or "").lower() != dependency.job_name.lower():
-                    continue
-                work_dir = (run.get("work_dir") or "").strip()
-                if work_dir and (Path(work_dir) / f"{dependency.job_name}.odb").exists():
-                    return work_dir
-                archive_destination = (run.get("archive_destination") or "").strip()
-                if archive_destination and (Path(archive_destination) / f"{dependency.job_name}.odb").exists():
-                    return archive_destination
-
-        candidate_paths = [options.oldjob_path]
-        if queue_item is not None:
-            candidate_paths.extend(
-                [
-                    queue_item.oldjob_path,
-                    str(Path(queue_item.oldjob_dir) / f"{oldjob_name}.odb") if queue_item.oldjob_dir else "",
-                ]
-            )
-        for raw_path in candidate_paths:
-            if not raw_path:
-                continue
-            path = Path(raw_path)
-            if path.suffix.lower() != ".odb":
-                continue
-            if path.stem.lower() != oldjob_name.lower():
-                continue
-            if path.exists():
-                return str(path.parent)
-        return ""
+        return self.restart_dependencies.resolve_source(options, queue_item)
 
     def run_is_ssd_independent_archive_candidate(self, run: dict) -> bool:
         return self.job_controller.run_is_ssd_independent_archive_candidate(run)
@@ -2308,10 +2284,58 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(card, 0, column)
 
     def set_job_meta_empty(self) -> None:
+        empty_signature = ("empty",)
+        if self._selected_run_meta_signature == empty_signature:
+            return
+        self._selected_run_meta_signature = empty_signature
         self.clear_layout(self.job_meta_layout)
         label = self.make_meta_label("尚未提交作业。", "metaEmpty")
         self.job_meta_layout.addWidget(label)
         self.job_meta_layout.addStretch(1)
+
+    def selected_run_meta_signature(self, selected_key: str, run: dict) -> tuple:
+        queue_item = run.get("queue_item")
+        queue_signature = None
+        shared_reference_count = 0
+        if queue_item is not None:
+            reference_key = queue_item.resolved_oldjob_reference_key
+            if reference_key:
+                shared_reference_count = sum(
+                    1
+                    for item in self.queue_items
+                    if item.resolved_oldjob_reference_key == reference_key
+                )
+            queue_signature = (
+                queue_item.source_inp_path,
+                queue_item.rss_bytes,
+                queue_item.cores,
+                queue_item.datacheck_only,
+                queue_item.job_type,
+                queue_item.fortran_path,
+                queue_item.oldjob_name,
+                queue_item.oldjob_dir,
+                queue_item.oldjob_path,
+                queue_item.resolved_oldjob_arg,
+                queue_item.resolved_oldjob_source,
+                queue_item.resolved_oldjob_reference_key,
+                queue_item.status,
+                queue_item.message,
+                shared_reference_count,
+            )
+        return (
+            selected_key,
+            run.get("source_inp_path", ""),
+            run.get("work_dir", ""),
+            safe_int(run.get("memory_current", 0)),
+            safe_int(run.get("memory_peak", 0)),
+            safe_int(run.get("memory_estimated", 0)),
+            str(run.get("memory_monitor_mode", "learning") or "learning"),
+            run.get("resolved_oldjob_arg", ""),
+            run.get("resolved_oldjob_source", ""),
+            run.get("resolved_oldjob_reference_key", ""),
+            tuple(str(message) for message in (run.get("backup_messages") or ())[:3]),
+            queue_signature,
+        )
 
     def refresh_selected_run_status(
         self,
@@ -2379,6 +2403,10 @@ class MainWindow(QtWidgets.QMainWindow):
             self.set_job_meta_empty()
             return
 
+        signature = self.selected_run_meta_signature(selected_key, run)
+        if signature == self._selected_run_meta_signature:
+            return
+        self._selected_run_meta_signature = signature
         self.clear_layout(self.job_meta_layout)
         queue_item = run.get("queue_item")
         source_inp_path = run.get("source_inp_path", "") or (
@@ -2402,8 +2430,8 @@ class MainWindow(QtWidgets.QMainWindow):
         monitor_mode = str(run.get("memory_monitor_mode", "learning") or "learning")
         monitor_mode_text = {
             "learning": "学习中",
-            "patrol": "patrol",
-            "external": "external",
+            "patrol": "巡检",
+            "external": "外部监测",
             "stable": "稳定",
         }.get(monitor_mode, monitor_mode)
         memory_metrics = [
@@ -2447,6 +2475,38 @@ class MainWindow(QtWidgets.QMainWindow):
             restart_row = 0
             self.add_meta_row(restart_grid, restart_row, "oldjob", queue_item.oldjob_name or "-")
             restart_row += 1
+            resolved_oldjob_arg = queue_item.resolved_oldjob_arg or run.get("resolved_oldjob_arg", "")
+            resolved_oldjob_source = queue_item.resolved_oldjob_source or run.get("resolved_oldjob_source", "")
+            resolved_oldjob_reference_key = (
+                queue_item.resolved_oldjob_reference_key
+                or run.get("resolved_oldjob_reference_key", "")
+            )
+            source_labels = {
+                "archive": "归档目录",
+                "queue-workdir": "临时计算目录",
+                "external": "外部目录",
+                "manual": "手动选择目录",
+            }
+            if resolved_oldjob_source:
+                self.add_meta_row(
+                    restart_grid,
+                    restart_row,
+                    "来源",
+                    source_labels.get(resolved_oldjob_source, resolved_oldjob_source),
+                )
+                restart_row += 1
+            if resolved_oldjob_arg:
+                self.add_meta_row(restart_grid, restart_row, "实际 oldjob", resolved_oldjob_arg)
+                restart_row += 1
+            if resolved_oldjob_reference_key:
+                shared_count = sum(
+                    1
+                    for item in self.queue_items
+                    if item.resolved_oldjob_reference_key == resolved_oldjob_reference_key
+                )
+                if shared_count > 1:
+                    self.add_meta_row(restart_grid, restart_row, "共享引用", f"{shared_count} 个 Restart 作业")
+                    restart_row += 1
             dependency_dir = queue_item.oldjob_dir or (
                 os.path.dirname(queue_item.oldjob_path) if queue_item.oldjob_path else ""
             )
@@ -2816,6 +2876,7 @@ def main(
     window.show()
     startup_timeline.mark("mainwindow-shown")
     QtCore.QTimer.singleShot(0, lambda: startup_timeline.mark("event-loop-first-tick"))
+    QtCore.QTimer.singleShot(0, window.request_restored_status_scan_after_main_window_render)
     return app.exec()
 
 

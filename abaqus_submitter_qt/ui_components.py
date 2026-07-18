@@ -35,7 +35,14 @@ def format_run_status(run: dict) -> str:
         return "Terminating"
 
     parts: list[str] = []
-    parts.append("Suspended" if run.get("is_paused", False) else "Running")
+    completion_detected = (
+        str(run.get("runtime_diagnostic_status") or "") == "完成"
+        or run.get("runtime_phase") == "FINISH_CANDIDATE"
+    )
+    if completion_detected:
+        parts.append("Confirming")
+    else:
+        parts.append("Suspended" if run.get("is_paused", False) else "Running")
 
     current_step = run.get("current_step", "")
     if current_step:

@@ -12,10 +12,11 @@ from .abaqus_diagnostics import (
     parse_sta_progress,
     update_abaqus_stage_from_text,
 )
-from .constants import SOLVER_START_GRACE_SECONDS, STA_POLL_INTERVAL_MS
-from .process_scanner import get_psutil_process_snapshot
+from .constants import SOLVER_START_GRACE_SECONDS, STA_POLL_INTERVAL_MS, STATUS_CONFIRMING
 from .diagnostics import hang_probe, hang_probe_function, hang_probe_log
+from .process_observation import ProcessObservationService
 from .qt_compat import QtCore, Signal
+from .runtime_record import RuntimeRecord
 from .runtime_evidence import (
     collect_runtime_evidence,
     runtime_completion_ready,
@@ -38,108 +39,11 @@ VS_INIT_NOISE_SUBSTRINGS = (
     "WARNING: vars.bat does not set up dependencies when invoked directly.",
 )
 
+# 保留旧导入名称，外部扩展可逐步迁移到 ProcessObservationService。
+ProcessScanService = ProcessObservationService
+
 MAX_CONSOLE_OUTPUT_CHARS = 12000
 LAUNCHER_START_TIMEOUT_MS = 3000
-PROCESS_SCAN_ACTIVE_INTERVAL_MS = 8000
-PROCESS_SCAN_IDLE_INTERVAL_MS = 10000
-PROCESS_SNAPSHOT_MAX_AGE_SECONDS = 20.0
-_ACTIVE_PROCESS_SCAN_THREADS: set[QtCore.QThread] = set()
-
-
-class ProcessScanWorker(QtCore.QObject):
-    succeeded = Signal(object)
-    failed = Signal(str)
-    done = Signal()
-
-    def run(self) -> None:
-        try:
-            rows = get_psutil_process_snapshot(force=True, include_details=True)
-        except Exception as exc:  # pragma: no cover - defensive for psutil edge cases
-            self.failed.emit(str(exc))
-        else:
-            self.succeeded.emit(rows)
-        finally:
-            self.done.emit()
-
-
-class ProcessScanService(QtCore.QObject):
-    snapshotReady = Signal(object)
-    scanFailed = Signal(str)
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self._timer = QtCore.QTimer(self)
-        self._timer.setInterval(PROCESS_SCAN_IDLE_INTERVAL_MS)
-        self._timer.timeout.connect(self.request_scan)
-        self._active = False
-        self._closing = False
-        self._thread: QtCore.QThread | None = None
-        self._worker: ProcessScanWorker | None = None
-        self._latest_rows: list[dict] | None = None
-        self._latest_at: float = 0.0
-
-    def set_active(self, active: bool) -> None:
-        if self._closing:
-            return
-        self._active = active
-        self._timer.setInterval(PROCESS_SCAN_ACTIVE_INTERVAL_MS if active else PROCESS_SCAN_IDLE_INTERVAL_MS)
-        if active:
-            if not self._timer.isActive():
-                self._timer.start()
-            self.request_scan()
-        else:
-            self._timer.stop()
-
-    def latest_snapshot(self, *, max_age: float = PROCESS_SNAPSHOT_MAX_AGE_SECONDS) -> list[dict] | None:
-        if self._latest_rows is None:
-            return None
-        if time.monotonic() - self._latest_at > max_age:
-            return None
-        return self._latest_rows
-
-    def request_scan(self) -> None:
-        if self._closing or self._thread is not None:
-            return
-        thread = QtCore.QThread()
-        worker = ProcessScanWorker()
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.succeeded.connect(self.on_snapshot_ready)
-        worker.failed.connect(self.on_scan_failed)
-        worker.done.connect(thread.quit)
-        worker.done.connect(worker.deleteLater)
-        thread.finished.connect(self.on_thread_finished)
-        thread.finished.connect(lambda thread=thread: _ACTIVE_PROCESS_SCAN_THREADS.discard(thread))
-        thread.finished.connect(thread.deleteLater)
-        _ACTIVE_PROCESS_SCAN_THREADS.add(thread)
-        self._thread = thread
-        self._worker = worker
-        thread.start()
-
-    def on_snapshot_ready(self, rows: object) -> None:
-        if self._closing:
-            return
-        self._latest_rows = list(rows or [])
-        self._latest_at = time.monotonic()
-        self.snapshotReady.emit(self._latest_rows)
-
-    def on_scan_failed(self, message: str) -> None:
-        if self._closing:
-            return
-        self.scanFailed.emit(message)
-
-    def on_thread_finished(self) -> None:
-        self._thread = None
-        self._worker = None
-        if self._active and not self._closing and not self._timer.isActive():
-            self._timer.start()
-
-    def shutdown(self) -> None:
-        self._closing = True
-        self._active = False
-        self._timer.stop()
-
-
 def run_is_datacheck(run: dict) -> bool:
     queue_item = run.get("queue_item")
     return bool(run.get("datacheck_only") or getattr(queue_item, "datacheck_only", False))
@@ -249,14 +153,16 @@ class JobRuntimeController(QtCore.QObject):
         self,
         *,
         memory_adapter,
+        process_observation: ProcessObservationService | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.memory_adapter = memory_adapter
         self.runs: dict[str, dict] = {}
-        self.process_scan_service = ProcessScanService(self)
+        self._owns_process_observation = process_observation is None
+        self.process_scan_service = process_observation or ProcessObservationService(self)
         self.process_scan_service.scanFailed.connect(
-            lambda message: self.historyEvent.emit(f"Process snapshot scan failed: {message}")
+            lambda message: self.historyEvent.emit(f"进程快照扫描失败：{message}")
         )
 
     def register_run(
@@ -265,7 +171,12 @@ class JobRuntimeController(QtCore.QObject):
         run: dict,
     ) -> None:
         self.runs[job_key] = run
-        self.process_scan_service.set_active(True)
+        self._set_process_observation_active(True)
+
+    def _set_process_observation_active(self, active: bool) -> None:
+        # 主窗口注入共享服务；独立控制器只保留兼容快照接口，不擅自创建后台线程。
+        if not self._owns_process_observation:
+            self.process_scan_service.set_active(active)
 
     def unregister_run(
         self,
@@ -276,7 +187,7 @@ class JobRuntimeController(QtCore.QObject):
             None,
         )
         if run is None:
-            self.process_scan_service.set_active(bool(self.runs))
+            self._set_process_observation_active(bool(self.runs))
             return
 
         timer = run.get("timer")
@@ -301,13 +212,13 @@ class JobRuntimeController(QtCore.QObject):
         process = run.get("process")
         run["process"] = None
         if process is None:
-            self.process_scan_service.set_active(bool(self.runs))
+            self._set_process_observation_active(bool(self.runs))
             return
 
         try:
             process_running = process.state() != QtCore.QProcess.ProcessState.NotRunning
         except RuntimeError:
-            self.process_scan_service.set_active(bool(self.runs))
+            self._set_process_observation_active(bool(self.runs))
             return
 
         if process_running:
@@ -315,14 +226,14 @@ class JobRuntimeController(QtCore.QObject):
                 process.finished.connect(process.deleteLater)
             except (RuntimeError, TypeError):
                 pass
-            self.process_scan_service.set_active(bool(self.runs))
+            self._set_process_observation_active(bool(self.runs))
             return
 
         try:
             process.deleteLater()
         except RuntimeError:
             pass
-        self.process_scan_service.set_active(bool(self.runs))
+        self._set_process_observation_active(bool(self.runs))
 
     def shutdown(self) -> None:
         self.process_scan_service.shutdown()
@@ -342,57 +253,34 @@ class JobRuntimeController(QtCore.QObject):
         timer = QtCore.QTimer(self)
         timer.setInterval(STA_POLL_INTERVAL_MS)
 
-        run["process"] = process
-        run["timer"] = timer
-        run.setdefault("activity_seen", False)
-        run.setdefault("solver_started", False)
-        run.setdefault("solver_kind", "")
-        run.setdefault("known_solver_pids", ())
-        run.setdefault("solver_pid_seen_at", None)
-        run.setdefault("solver_pid_last_seen_at", None)
-        run.setdefault("solver_pid_confidence", "")
-        run.setdefault("runtime_phase", "STARTING")
-        run.setdefault("runtime_started_monotonic", time.monotonic())
-        run.setdefault("last_runtime_activity_at", time.monotonic())
-        run.setdefault("runtime_phase_text_pending", "")
-        run.setdefault("runtime_diagnostic_status", "")
-        run.setdefault("runtime_diagnostic_detail", "")
-        run.setdefault("log_position", 0)
-        run.setdefault("msg_position", 0)
-        run.setdefault("dat_position", 0)
-        run.setdefault("launcher_finished_at", None)
-        run.setdefault("launcher_finished_monotonic", None)
-        run.setdefault("launcher_started", False)
-        run.setdefault("launcher_started_monotonic", None)
-        run.setdefault("solver_start_timeout", False)
-        run.setdefault("solver_start_timeout_detail", "")
-        run.setdefault("seen_sta", False)
-        run.setdefault("sta_valid", False)
-        run.setdefault("datacheck_stable_polls", 0)
-        run.setdefault("sta_signature", None)
-        run.setdefault("sta_stable_polls", 0)
-        run.setdefault("finish_candidate_since", None)
-        run.setdefault("termination_stable_polls", 0)
-        run.setdefault("termination_candidate_since", None)
-        run.setdefault("runtime_completion_confirmed", False)
-        run.setdefault("runtime_completion_reason", "")
-        run.setdefault("finish_emitted", False)
+        RuntimeRecord.prepare_internal_monitor(
+            run,
+            process=process,
+            timer=timer,
+        )
         self.register_run(
             job_key,
             run,
         )
 
-        timer_callback = lambda key=job_key: self.poll_sta_file(key)
-        output_callback = lambda key=job_key: self.read_process_output(key)
-        started_callback = lambda key=job_key: self.on_process_started(key)
-        finished_callback = (
-            lambda exit_code, exit_status, key=job_key: self.on_process_finished(
+        def timer_callback(key=job_key):
+            self.poll_sta_file(key)
+
+        def output_callback(key=job_key):
+            self.read_process_output(key)
+
+        def started_callback(key=job_key):
+            self.on_process_started(key)
+
+        def finished_callback(exit_code, exit_status, key=job_key):
+            self.on_process_finished(
                 key,
                 exit_code,
                 exit_status,
             )
-        )
-        error_callback = lambda error, key=job_key: self.on_process_error(key, error)
+
+        def error_callback(error, key=job_key):
+            self.on_process_error(key, error)
         timer.timeout.connect(timer_callback)
         process.readyReadStandardOutput.connect(output_callback)
         process.started.connect(started_callback)
@@ -446,58 +334,20 @@ class JobRuntimeController(QtCore.QObject):
         timer = QtCore.QTimer(self)
         timer.setInterval(STA_POLL_INTERVAL_MS)
 
-        run["process"] = None
-        run["timer"] = timer
-        run.setdefault("is_external", True)
-        run.setdefault("activity_seen", True)
-        run.setdefault("solver_started", True)
-        run.setdefault("solver_kind", "")
-        run.setdefault("known_solver_pids", ())
-        if run.get("known_solver_pids"):
-            run.setdefault("solver_pid_seen_at", now)
-            run.setdefault("solver_pid_last_seen_at", now)
-            run.setdefault("solver_pid_confidence", "high")
-        else:
-            run.setdefault("solver_pid_seen_at", None)
-            run.setdefault("solver_pid_last_seen_at", None)
-            run.setdefault("solver_pid_confidence", "")
-        run.setdefault("runtime_phase", "SOLVING")
-        run.setdefault("runtime_started_monotonic", now)
-        run.setdefault("last_runtime_activity_at", now)
-        run.setdefault("runtime_phase_text_pending", "")
-        run.setdefault("runtime_diagnostic_status", "")
-        run.setdefault("runtime_diagnostic_detail", "")
-        run.setdefault("log_position", 0)
-        run.setdefault("msg_position", 0)
-        run.setdefault("dat_position", 0)
-        run.setdefault("launcher_finished", True)
-        run.setdefault("launcher_exit_code", 0)
-        run.setdefault("launcher_exit_status", None)
-        run.setdefault("launcher_finished_at", time.time())
-        run.setdefault("launcher_finished_monotonic", now)
-        run.setdefault("launcher_started", True)
-        run.setdefault("launcher_started_monotonic", now)
-        run.setdefault("solver_start_timeout", False)
-        run.setdefault("solver_start_timeout_detail", "")
-        run.setdefault("seen_sta", False)
-        run.setdefault("sta_valid", False)
-        run.setdefault("datacheck_stable_polls", 0)
-        run.setdefault("sta_signature", None)
-        run.setdefault("sta_stable_polls", 0)
-        run.setdefault("finish_candidate_since", None)
-        run.setdefault("termination_stable_polls", 0)
-        run.setdefault("termination_candidate_since", None)
-        run.setdefault("runtime_completion_confirmed", False)
-        run.setdefault("runtime_completion_reason", "")
-        run.setdefault("finish_emitted", False)
-        run.setdefault("_process_connections", ())
+        RuntimeRecord.prepare_external_monitor(
+            run,
+            timer=timer,
+            monotonic_now=now,
+        )
 
         self.register_run(
             job_key,
             run,
         )
 
-        timer_callback = lambda key=job_key: self.poll_sta_file(key)
+        def timer_callback(key=job_key):
+            self.poll_sta_file(key)
+
         timer.timeout.connect(timer_callback)
         run["_timer_callback"] = timer_callback
         timer.start()
@@ -622,9 +472,9 @@ class JobRuntimeController(QtCore.QObject):
             run["launcher_finished_monotonic"] = time.monotonic()
             queue_item = run.get("queue_item")
             if queue_item is not None:
-                queue_item.message = "Launcher command finished; monitoring background solver state."
+                queue_item.message = "启动命令已结束，正在监测后台求解状态"
             self.historyEvent.emit(
-                f"{run['job_name']} launcher command finished: exit_code={exit_code}; monitoring background solver state."
+                f"{run['job_name']} 启动命令已结束：退出码={exit_code}；正在监测后台求解状态。"
             )
             timer = run.get("timer")
             if timer is not None and not timer.isActive():
@@ -682,12 +532,21 @@ class JobRuntimeController(QtCore.QObject):
         if queue_item is None:
             return
 
+        completion_detected = str(run.get("runtime_diagnostic_status") or "") == "完成"
         if run.get("runtime_phase") == "FINISH_CANDIDATE":
             message = "状态确认中，等待 STA/LCK 稳定"
+        elif completion_detected:
+            message = "检测到完成信息，等待 STA/LCK/PID 稳定"
         else:
             message = "正式求解中"
+        status_changed = False
+        if completion_detected and queue_item.status != STATUS_CONFIRMING:
+            queue_item.status = STATUS_CONFIRMING
+            status_changed = True
         if queue_item.message != message:
             queue_item.message = message
+            status_changed = True
+        if status_changed:
             self.jobUpdated.emit(job_key)
 
     @hang_probe_function("JobRuntimeController.poll_sta_file")
@@ -700,9 +559,18 @@ class JobRuntimeController(QtCore.QObject):
         if not run:
             return
 
-        process_snapshot = self.process_scan_service.latest_snapshot()
-        run["process_snapshot"] = process_snapshot if process_snapshot is not None else ()
-        run["process_snapshot_available"] = process_snapshot is not None
+        process_snapshot_bundle = self.process_scan_service.latest_snapshot_bundle()
+        if process_snapshot_bundle is None:
+            run["process_snapshot"] = ()
+            run["process_snapshot_by_pid"] = {}
+            run["process_snapshot_solver_rows"] = ()
+            run["process_snapshot_available"] = False
+        else:
+            process_snapshot, process_by_pid, solver_rows = process_snapshot_bundle
+            run["process_snapshot"] = process_snapshot
+            run["process_snapshot_by_pid"] = process_by_pid
+            run["process_snapshot_solver_rows"] = solver_rows
+            run["process_snapshot_available"] = True
 
         evidence_start = time.monotonic()
         evidence = collect_runtime_evidence(run)

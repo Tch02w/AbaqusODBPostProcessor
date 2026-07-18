@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 from collections import deque
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ class WorkspacePreparePlan:
     target_work_dir: str = ""
     oldjob_name: str = ""
     oldjob_source_dir: str = ""
+    copy_oldjob_dependencies: bool = True
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,34 @@ class WorkspacePrepareResult:
     prepared_work_dir: str = ""
     copied_inp_path: str = ""
     copied_oldjob_files: tuple[str, ...] = ()
+
+
+def restart_dependency_target_is_current(source: Path, target: Path) -> bool:
+    if not target.exists() or not target.is_file():
+        return False
+    try:
+        if source.samefile(target):
+            return True
+    except OSError:
+        pass
+    try:
+        source_stat = source.stat()
+        target_stat = target.stat()
+    except OSError:
+        return False
+    return source_stat.st_size == target_stat.st_size and source_stat.st_mtime_ns == target_stat.st_mtime_ns
+
+
+def prepare_restart_dependency_file(source: Path, target: Path) -> bool:
+    if restart_dependency_target_is_current(source, target):
+        return False
+    if target.exists():
+        target.unlink()
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copy2(source, target)
+    return True
 
 
 def copy_restart_dependency_files(source_dir: Path, target_dir: Path, oldjob_name: str) -> list[Path]:
@@ -58,8 +88,8 @@ def copy_restart_dependency_files(source_dir: Path, target_dir: Path, oldjob_nam
         target = target_dir / source.name
         if source.resolve() == target.resolve():
             continue
-        shutil.copy2(source, target)
-        copied.append(target)
+        if prepare_restart_dependency_file(source, target):
+            copied.append(target)
     return copied
 
 
@@ -77,11 +107,13 @@ def execute_workspace_prepare(plan: WorkspacePreparePlan) -> WorkspacePrepareRes
     try:
         shutil.copy2(source_inp, copied_inp)
         copied_inp_done = True
-        copied_oldjob_files = copy_restart_dependency_files(
-            Path(plan.oldjob_source_dir),
-            calc_dir,
-            plan.oldjob_name,
-        )
+        copied_oldjob_files = []
+        if plan.copy_oldjob_dependencies:
+            copied_oldjob_files = copy_restart_dependency_files(
+                Path(plan.oldjob_source_dir),
+                calc_dir,
+                plan.oldjob_name,
+            )
     except OSError as exc:
         if copied_inp_done:
             setattr(exc, "copied_inp_path", str(copied_inp))

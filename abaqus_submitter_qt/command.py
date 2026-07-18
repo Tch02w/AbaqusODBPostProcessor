@@ -20,6 +20,7 @@ class SubmitOptions:
     job_name: str = ""
     cpus: int = DEFAULT_CPUS
     oldjob_path: str = ""
+    oldjob_arg: str = ""
     for_file: str = ""
     interactive: bool = False
     datacheck: bool = False
@@ -39,10 +40,13 @@ def derive_oldjob_name(oldjob_path: str) -> str:
     """Return the oldjob argument from an ODB path or raw name."""
     if not oldjob_path:
         return ""
-    path = Path(oldjob_path)
+    value = oldjob_path.strip()
+    path = Path(value)
     if path.suffix.lower() == ".odb":
         return path.stem
-    return oldjob_path.strip()
+    if path.is_absolute() or str(path.parent) not in {"", "."}:
+        return path.name
+    return value
 
 
 def inp_has_restart_keyword(inp_file: str) -> bool:
@@ -106,9 +110,11 @@ def build_abaqus_command(options: SubmitOptions) -> str:
     if options.datacheck and options.inp_file:
         parts.append(f"input={os.path.basename(options.inp_file)}")
 
-    oldjob_name = derive_oldjob_name(options.oldjob_path)
-    if oldjob_name:
-        parts.append(f"oldjob={oldjob_name}")
+    oldjob_argument = (options.oldjob_arg or "").strip() or derive_oldjob_name(options.oldjob_path)
+    if oldjob_argument:
+        if re.search(r"\s", oldjob_argument):
+            oldjob_argument = f'"{oldjob_argument}"'
+        parts.append(f"oldjob={oldjob_argument}")
 
     if options.for_file:
         parts.append(f'user="{options.for_file}"')

@@ -5,16 +5,19 @@ from __future__ import annotations
 import os
 import time
 
-from .abaqus_diagnostics import parse_datetime_from_abaqus_text, read_file_head
+from .abaqus_diagnostics import inspect_job_files, parse_datetime_from_abaqus_text, read_file_head
 from .constants import ACTIVE_STATUSES, STATUS_PENDING_CONFIRM, STATUS_RUNNING, STATUS_UNKNOWN, TERMINAL_STATUSES
 from .models import QueueItem
 from .process_scanner import (
     EXTERNAL_SCAN_MAX_CHILD_DEPTH,
+    classify_external_job_runtime,
+    fetch_psutil_process_rows_for_external_scan,
     normalize_work_dir,
     scan_running_abaqus_jobs_by_psutil,
     work_dir_matches_scan_root,
 )
 from .qt_compat import QtCore, Signal
+from .runtime_record import RuntimeRecord
 from .queue_scheduler import (
     effective_queue_item_work_dir,
     managed_job_key,
@@ -29,10 +32,16 @@ class ExternalJobScanWorker(QtCore.QObject):
     finished = Signal(str, list, list)
     failed = Signal(str, str)
 
-    def __init__(self, work_dir: str, known_external_jobs: list[dict] | None = None):
+    def __init__(
+        self,
+        work_dir: str,
+        known_external_jobs: list[dict] | None = None,
+        process_rows: list[dict] | None = None,
+    ):
         super().__init__()
         self.work_dir = work_dir
         self.known_external_jobs = known_external_jobs or []
+        self.process_rows = process_rows
 
     def run(self) -> None:
         try:
@@ -54,6 +63,10 @@ class ExternalJobScanWorker(QtCore.QObject):
                 seen_roots.add(normalized_known_root)
                 scan_roots.append(known_work_dir)
 
+            process_rows = self.process_rows
+            if process_rows is None:
+                process_rows = fetch_psutil_process_rows_for_external_scan(force=True)
+
             merged_jobs = {}
             skipped = []
             for scan_root in scan_roots:
@@ -61,6 +74,7 @@ class ExternalJobScanWorker(QtCore.QObject):
                     scan_root,
                     force=True,
                     known_external_jobs=self.known_external_jobs,
+                    process_rows=process_rows,
                 )
                 skipped.extend(root_skipped)
                 for job in root_jobs:
@@ -116,6 +130,57 @@ def build_queue_item_index(
             continue
         index[key] = item
     return index
+
+
+def resolve_unmatched_restored_unknown_items(
+    *,
+    queue_items: list[QueueItem],
+    scanned_keys: set[tuple[str, str]],
+) -> tuple[list[QueueItem], list[dict]]:
+    updated_items = []
+    terminal_records = []
+    for item in queue_items:
+        if item.status != STATUS_UNKNOWN:
+            continue
+        key = queue_item_conflict_key(item)
+        if not key[0] or key in scanned_keys:
+            continue
+        work_dir = effective_queue_item_work_dir(item)
+        if not work_dir:
+            item.status = STATUS_PENDING_CONFIRM
+            item.message = "程序重启后缺少运行目录，请人工确认"
+            updated_items.append(item)
+            continue
+        diagnostics_status, diagnostics_detail = inspect_job_files(work_dir, item.job_name)
+        runtime = classify_external_job_runtime(
+            job_name=item.job_name,
+            work_dir=work_dir,
+            process_names=[],
+            process_cmdlines=[],
+            diagnostics_status=diagnostics_status,
+            diagnostics_detail=diagnostics_detail,
+        )
+        status = runtime["status"]
+        if status == STATUS_UNKNOWN:
+            item.status = STATUS_PENDING_CONFIRM
+            item.message = "程序重启后未发现运行进程或终态证据，请人工确认"
+            updated_items.append(item)
+            continue
+        item.status = status
+        item.message = runtime["message"]
+        updated_items.append(item)
+        if item.status in TERMINAL_STATUSES:
+            terminal_records.append(
+                {
+                    "item": item,
+                    "job": {},
+                    "key": key,
+                    "work_dir": work_dir,
+                    "previous_status": STATUS_UNKNOWN,
+                    "status": item.status,
+                }
+            )
+    return updated_items, terminal_records
 
 
 class ExternalJobCoordinator:
@@ -265,89 +330,17 @@ class ExternalJobCoordinator:
             solver_kind = "standard"
         attach_source_text = "external" if item.is_external else "restored"
 
-        run = {
-            "key": job_key,
-            "process": None,
-            "timer": None,
-            "work_dir": work_dir,
-            "job_name": item.job_name,
-            "command": f"{attach_source_text} Abaqus job",
-            "is_external": bool(item.is_external),
-            "is_scan_attached": True,
-            "is_paused": False,
-            "datacheck_only": bool(item.datacheck_only),
-            "terminating": False,
-            "terminating_at": 0.0,
-            "sta_position": 0,
-            "sta_state": {},
-            "log": f"{attach_source_text.capitalize()} Abaqus job attached to runtime monitor.",
-            "queue_item": item,
-            "source_inp_path": item.source_inp_path or item.inp_path,
-            "calculation_root_dir": item.calculation_root_dir or "",
-            "archive_dir": "",
-            "archive_destination": "",
-            "archive_status": "",
-            "archive_error": "",
-            "cleanup_after_archive": False,
-            "existing_result_action": "",
-            "backup_odb_path": "",
-            "backup_sta_path": "",
-            "memory_monitor_activated": True,
-            "memory_stable_logged": False,
-            "memory_current": rss_bytes,
-            "memory_peak": rss_bytes,
-            "memory_estimated": rss_bytes,
-            "memory_monitor_mode": "external",
-            "memory_monitor_stable": True,
-            "launcher_finished": True,
-            "launcher_exit_code": 0,
-            "launcher_exit_status": None,
-            "launcher_finished_at": time.time(),
-            "launcher_finished_monotonic": now,
-            "launcher_started": True,
-            "launcher_started_monotonic": now,
-            "console_output": "",
-            "console_failed": False,
-            "console_failed_detail": "",
-            "activity_seen": True,
-            "solver_started": True,
-            "solver_kind": solver_kind,
-            "runtime_phase": "SOLVING",
-            "runtime_started_monotonic": now,
-            "last_runtime_activity_at": now,
-            "runtime_phase_text_pending": "",
-            "runtime_diagnostic_status": "",
-            "runtime_diagnostic_detail": "",
-            "log_position": 0,
-            "msg_position": 0,
-            "dat_position": 0,
-            "solver_start_timeout": False,
-            "solver_start_timeout_detail": "",
-            "runtime_completion_confirmed": False,
-            "runtime_completion_reason": "",
-            "pre_started": False,
-            "pre_finished": False,
-            "standard_started": solver_kind == "standard",
-            "package_started": False,
-            "explicit_started": solver_kind == "explicit",
-            "seen_sta": False,
-            "sta_valid": False,
-            "datacheck_stable_polls": 0,
-            "sta_signature": None,
-            "sta_stable_polls": 0,
-            "finish_candidate_since": None,
-            "termination_stable_polls": 0,
-            "termination_candidate_since": None,
-            "diagnostic_baseline": {},
-            "submitted_at": submitted_at,
-            "finish_emitted": False,
-            "finalizing": False,
-            "finalized": False,
-            "known_solver_pids": solver_pids,
-            "solver_pid_seen_at": now if solver_pids else None,
-            "solver_pid_last_seen_at": now if solver_pids else None,
-            "solver_pid_confidence": "high" if solver_pids else "",
-        }
+        run = RuntimeRecord.for_attached(
+            key=job_key,
+            item=item,
+            work_dir=work_dir,
+            source_label=attach_source_text,
+            solver_pids=solver_pids,
+            solver_kind=solver_kind,
+            rss_bytes=rss_bytes,
+            submitted_at=submitted_at,
+            monotonic_now=now,
+        )
 
         self.host.run_records[job_key] = run
         self.host.active_runs[job_key] = run
@@ -414,6 +407,7 @@ def merge_external_scan_results(
     terminal_external_records: list[dict] = []
     debug_records: list[dict] = []
     memory_records: list[dict] = []
+    scanned_keys: set[tuple[str, str]] = set()
 
     for job in jobs:
         job_name = job.get("job_name", "")
@@ -425,6 +419,7 @@ def merge_external_scan_results(
             job_work_dir,
             job_name,
         )
+        scanned_keys.add(key)
         matched = queue_item_by_key.get(key)
         runtime_status = job.get("runtime_status") or STATUS_UNKNOWN
         runtime_message = job.get("runtime_message") or "外部作业状态待确认"
@@ -447,7 +442,12 @@ def merge_external_scan_results(
                         "work_dir": job_work_dir,
                     }
                 )
-                track_scan_runtime = matched.is_external or previous_status == STATUS_UNKNOWN
+                restored_active_without_run = previous_status in ACTIVE_STATUSES and not matched.active_job_key
+                track_scan_runtime = (
+                    matched.is_external
+                    or previous_status == STATUS_UNKNOWN
+                    or restored_active_without_run
+                )
                 if track_scan_runtime and matched.status in ACTIVE_STATUSES:
                     active_external_items.append(matched)
                 if (
@@ -516,7 +516,12 @@ def merge_external_scan_results(
             updated += 1
 
         updated_items.append(target_item)
-        track_scan_runtime = target_item.is_external or previous_status == STATUS_UNKNOWN
+        restored_active_without_run = previous_status in ACTIVE_STATUSES and not target_item.active_job_key
+        track_scan_runtime = (
+            target_item.is_external
+            or previous_status == STATUS_UNKNOWN
+            or restored_active_without_run
+        )
         if track_scan_runtime:
             memory_records.append(
                 {
@@ -552,6 +557,15 @@ def merge_external_scan_results(
                 "runtime_message": runtime_message,
             }
         )
+
+    restored_updates, restored_terminal_records = resolve_unmatched_restored_unknown_items(
+        queue_items=queue_items,
+        scanned_keys=scanned_keys,
+    )
+    if restored_updates:
+        status_only_updates += len(restored_updates)
+        updated_items.extend(restored_updates)
+    terminal_external_records.extend(restored_terminal_records)
 
     return {
         "added": added,

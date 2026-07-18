@@ -110,6 +110,10 @@ def hang_probe_log(label: str, elapsed: float | None = None, threshold: float = 
 
 @contextmanager
 def hang_probe(label: str, threshold: float = 0.2, **fields):
+    if not hang_probe_enabled():
+        yield
+        return
+
     start = time.monotonic()
     try:
         yield
@@ -121,6 +125,9 @@ def hang_probe_function(label: str | None = None, threshold: float = 0.2):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
+            if not hang_probe_enabled():
+                return func(*args, **kwargs)
+
             with hang_probe(label or func.__qualname__, threshold):
                 return func(*args, **kwargs)
 

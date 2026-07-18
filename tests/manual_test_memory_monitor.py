@@ -9,7 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from abaqus_submitter.memory_monitor import (
+from abaqus_submitter.memory_monitor import (  # noqa: E402
     JobMemoryUsage,
     MemoryMonitorService,
     format_memory_size,

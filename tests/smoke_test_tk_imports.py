@@ -9,6 +9,6 @@ import abaqus_submitter_tk.models
 import abaqus_submitter_tk.persistence
 import abaqus_submitter_tk.process_scanner
 import abaqus_submitter_tk.abaqus_diagnostics
-import abaqus_submitter_tk.memory_monitor
+import abaqus_submitter_tk.memory_monitor  # noqa: F401
 
 print("Tk imports OK")

@@ -13,13 +13,11 @@ from .command import SubmitOptions, derive_oldjob_name
 from .models import QueueItem
 from .diagnostics import hang_probe_log
 from .qt_compat import QtCore, Signal, Slot
-from .queue_scheduler import unfinished_restart_dependents
+from .restart_dependency import RestartDependencyLifecycle
 from .workspace_prepare import (
-    RESTART_DEPENDENCY_EXTENSIONS,
     SerialTaskService,
     WorkspacePreparePlan,
     WorkspacePrepareResult,
-    copy_restart_dependency_files,
     execute_workspace_prepare,
 )
 
@@ -409,6 +407,7 @@ def build_workspace_info(
         "cleanup_after_archive": False,
         "copied_inp_path": "",
         "copied_oldjob_files": [],
+        "referenced_oldjob_arg": (getattr(options, "oldjob_arg", "") or "").strip(),
     }
     if queue_item is None:
         return workspace_info
@@ -458,9 +457,12 @@ def build_workspace_prepare_plan(
         )
 
     oldjob_name = derive_oldjob_name(options.oldjob_path)
+    if not oldjob_name and queue_item is not None:
+        oldjob_name = (queue_item.oldjob_name or "").strip()
     oldjob_source = ""
     if oldjob_name:
         oldjob_source = str(Path(oldjob_source_dir) if oldjob_source_dir else Path(options.oldjob_path).parent)
+    copy_oldjob_dependencies = not bool((getattr(options, "oldjob_arg", "") or "").strip())
 
     return WorkspacePreparePlan(
         enabled=True,
@@ -469,6 +471,7 @@ def build_workspace_prepare_plan(
         target_work_dir=str(Path(ssd_root) / options.job_name),
         oldjob_name=oldjob_name,
         oldjob_source_dir=oldjob_source,
+        copy_oldjob_dependencies=copy_oldjob_dependencies,
     )
 
 
@@ -542,7 +545,7 @@ class ArchiveCoordinator:
     ) -> tuple[bool, list[QueueItem]]:
         if not (run.get("archive_dir") or "").strip():
             return False, []
-        dependents = unfinished_restart_dependents(
+        dependents = RestartDependencyLifecycle.archive_blockers(
             run,
             self.queue_items,
         )
@@ -615,10 +618,7 @@ class ArchiveCoordinator:
     ) -> list[dict]:
         processed = []
         for key, run in list(self.deferred_archive_runs.items()):
-            if unfinished_restart_dependents(
-                run,
-                self.queue_items,
-            ):
+            if self.should_defer_archive(run)[0]:
                 continue
             self.deferred_archive_runs.pop(key, None)
             run["archive_deferred"] = False
@@ -635,5 +635,8 @@ class ArchiveCoordinator:
         queue_item = run.get("queue_item")
         if queue_item is None:
             return
+        archive_destination = str(run.get("archive_destination", "") or "")
+        if archive_destination:
+            queue_item.archive_destination = archive_destination
         queue_item.archive_status = status
         queue_item.archive_error = error

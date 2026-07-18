@@ -6,6 +6,7 @@ import os
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from .abaqus_diagnostics import build_diagnostic_file_baseline, classify_job_text
@@ -27,7 +28,6 @@ from .workspace_prepare import WorkspacePrepareTask
 from .command import (
     SubmitOptions,
     build_abaqus_command,
-    derive_oldjob_name,
     queue_item_to_options,
     validate_options,
 )
@@ -46,15 +46,18 @@ from .constants import (
     STATUS_WAITING_DEPENDENCY,
 )
 from .models import QueueItem
+from .job_orchestration import JobOrchestrationHost
+from .restart_dependency import RestartDependencyLifecycle
 from .diagnostics import hang_probe_function
 from .qt_compat import QtCore, QtWidgets
+from .runtime_record import RuntimeRecord
 from .queue_scheduler import (
+    RestartOldjobReference,
     active_submit_conflict_message as scheduler_active_submit_conflict_message,
     effective_queue_item_work_dir as scheduler_effective_queue_item_work_dir,
     find_formal_queue_conflict as scheduler_find_formal_queue_conflict,
     managed_active_statuses as scheduler_managed_active_statuses,
     managed_job_key as scheduler_managed_job_key,
-    oldjob_name_from_item as scheduler_oldjob_name_from_item,
     queue_item_conflict_key as scheduler_queue_item_conflict_key,
 )
 from .ui_components import runtime_job_display_label as ui_runtime_job_display_label
@@ -213,21 +216,176 @@ def resolve_finalization_status(finalization: FinalizationInput) -> Finalization
 class JobController:
     """Coordinate job business flow while delegating UI work to MainWindow."""
 
-    def __init__(self, window) -> None:  # noqa: ANN001
-        object.__setattr__(self, "_window", window)
+    def __init__(self, window: JobOrchestrationHost) -> None:
+        self._window = window
 
     @property
-    def window(self):  # noqa: ANN201
-        return object.__getattribute__(self, "_window")
+    def window(self) -> JobOrchestrationHost:
+        return self._window
 
-    def __getattr__(self, name: str):  # noqa: ANN204
-        return getattr(self.window, name)
+    @property
+    def queue_items(self) -> list[QueueItem]:
+        return self.window.queue_items
 
-    def __setattr__(self, name: str, value) -> None:  # noqa: ANN001
-        if name == "_window":
-            object.__setattr__(self, name, value)
-            return
-        setattr(self.window, name, value)
+    @property
+    def active_runs(self) -> dict[str, dict]:
+        return self.window.active_runs
+
+    @property
+    def run_records(self) -> dict[str, dict]:
+        return self.window.run_records
+
+    @property
+    def queue_active(self) -> bool:
+        return self.window.queue_active
+
+    @queue_active.setter
+    def queue_active(self, value: bool) -> None:
+        self.window.queue_active = value
+
+    @property
+    def queue_stop_requested(self) -> bool:
+        return self.window.queue_stop_requested
+
+    @queue_stop_requested.setter
+    def queue_stop_requested(self, value: bool) -> None:
+        self.window.queue_stop_requested = value
+
+    @property
+    def current_job_key(self) -> str:
+        return self.window.current_job_key
+
+    @property
+    def current_job_name(self) -> str:
+        return self.window.current_job_name
+
+    @current_job_name.setter
+    def current_job_name(self, value: str) -> None:
+        self.window.current_job_name = value
+
+    @property
+    def current_work_dir(self) -> str:
+        return self.window.current_work_dir
+
+    @current_work_dir.setter
+    def current_work_dir(self, value: str) -> None:
+        self.window.current_work_dir = value
+
+    @property
+    def command_preview(self) -> str:
+        return self.window.command_preview
+
+    @command_preview.setter
+    def command_preview(self, value: str) -> None:
+        self.window.command_preview = value
+
+    @property
+    def deferred_archive_runs(self) -> dict[str, dict]:
+        return self.window.deferred_archive_runs
+
+    @property
+    def _archive_move_contexts(self) -> dict[str, dict]:
+        return self.window._archive_move_contexts
+
+    @property
+    def _archive_move_reserved_keys(self) -> set[tuple[str, str]]:
+        return self.window._archive_move_reserved_keys
+
+    @property
+    def _workspace_prepare_contexts(self) -> dict[str, dict]:
+        return self.window._workspace_prepare_contexts
+
+    @property
+    def _closing(self) -> bool:
+        return self.window._closing
+
+    @property
+    def archive_move_service(self) -> Any:
+        return self.window.archive_move_service
+
+    @property
+    def workspace_prepare_service(self) -> Any:
+        return self.window.workspace_prepare_service
+
+    @property
+    def memory_adapter(self) -> Any:
+        return self.window.memory_adapter
+
+    @property
+    def runtime_controller(self) -> Any:
+        return self.window.runtime_controller
+
+    @property
+    def restart_dependencies(self) -> RestartDependencyLifecycle:
+        return self.window.restart_dependencies
+
+    @property
+    def pause_btn(self) -> Any:
+        return self.window.pause_btn
+
+    @property
+    def status_label(self) -> Any:
+        return self.window.status_label
+
+    def append_history(self, message: str, **kwargs: Any) -> None:
+        self.window.append_history(message, **kwargs)
+
+    def update_queue_status_label(self) -> None:
+        self.window.update_queue_status_label()
+
+    def refresh_visible_queue_manager(self, *args: Any) -> None:
+        self.window.refresh_visible_queue_manager(*args)
+
+    def request_dispatch_queue(self) -> None:
+        self.window.request_dispatch_queue()
+
+    def submit_requires_restart_dependency(
+        self,
+        options: SubmitOptions,
+        queue_item: QueueItem | None,
+    ) -> bool:
+        return self.window.submit_requires_restart_dependency(options, queue_item)
+
+    def resolve_oldjob_source_dir(
+        self,
+        options: SubmitOptions,
+        queue_item: QueueItem | None,
+    ) -> str:
+        return self.window.resolve_oldjob_source_dir(options, queue_item)
+
+    def archive_move_conflict_message(
+        self,
+        options: SubmitOptions,
+        queue_item: QueueItem | None,
+    ) -> str:
+        return self.window.archive_move_conflict_message(options, queue_item)
+
+    def refresh_job_selector(self) -> None:
+        self.window.refresh_job_selector()
+
+    def refresh_job_stats(self) -> None:
+        self.window.refresh_job_stats()
+
+    def show_runtime_panel(self) -> None:
+        self.window.show_runtime_panel()
+
+    def select_run(self, job_key: str) -> None:
+        self.window.select_run(job_key)
+
+    def selected_job_key(self) -> str:
+        return self.window.selected_job_key()
+
+    def refresh_selected_run_status(self, job_key: str) -> None:
+        self.window.refresh_selected_run_status(job_key)
+
+    def update_process_buttons(self, is_running: bool) -> None:
+        self.window.update_process_buttons(is_running)
+
+    def inspect_finished_job(self, job_key: str) -> tuple[str, str]:
+        return self.window.inspect_finished_job(job_key)
+
+    def notify_job_finished(self, run: dict, status: str, detail: str = "") -> None:
+        self.window.notify_job_finished(run, status, detail)
 
     def _queue_items(self) -> list[QueueItem]:
         return self.window.queue_items
@@ -622,34 +780,46 @@ class JobController:
         *,
         queue_mode: bool,
     ) -> str:
-        if not self.submit_requires_restart_dependency(options, queue_item):
-            return ""
-
-        oldjob_name = derive_oldjob_name(options.oldjob_path)
-        if not oldjob_name and queue_item is not None:
-            oldjob_name = scheduler_oldjob_name_from_item(queue_item)
-        if not oldjob_name:
-            message = "未选择有效的 Restart 前置作业"
+        resolution = self.restart_dependencies.resolve(options, queue_item)
+        if not resolution.ready:
             self.block_missing_restart_dependency(
                 options,
                 queue_item,
                 queue_mode=queue_mode,
-                message=message,
+                message=resolution.message,
             )
             return ""
+        return resolution.source_dir
 
-        oldjob_source_dir = self.resolve_oldjob_source_dir(options, queue_item)
-        if not oldjob_source_dir:
-            message = f"未找到 Restart 前置作业 ODB：{oldjob_name}"
-            self.block_missing_restart_dependency(
-                options,
-                queue_item,
-                queue_mode=queue_mode,
-                message=message,
-            )
-            return ""
+    def restart_oldjob_source_is_reserved(self, oldjob_source_dir: str, oldjob_name: str) -> bool:
+        return self.restart_dependencies.source_is_reserved(oldjob_source_dir, oldjob_name)
 
-        return oldjob_source_dir
+    @staticmethod
+    def restart_oldjob_name(options: SubmitOptions, queue_item: QueueItem | None) -> str:
+        return RestartDependencyLifecycle.oldjob_name(options, queue_item)
+
+    @staticmethod
+    def restart_manual_candidate_paths(queue_item: QueueItem | None, oldjob_name: str) -> list[str]:
+        return RestartDependencyLifecycle.manual_candidate_paths(queue_item, oldjob_name)
+
+    def build_restart_oldjob_reference(
+        self,
+        options: SubmitOptions,
+        queue_item: QueueItem | None,
+        oldjob_source_dir: str,
+    ) -> RestartOldjobReference:
+        return self.restart_dependencies.build_reference(
+            options,
+            queue_item,
+            oldjob_source_dir,
+        )
+
+    @staticmethod
+    def record_restart_oldjob_info(
+        workspace_info: dict,
+        oldjob_reference: RestartOldjobReference,
+    ) -> None:
+        RestartDependencyLifecycle.record_workspace(workspace_info, oldjob_reference)
 
     @hang_probe_function("JobController.start_job")
     def start_job(
@@ -695,6 +865,9 @@ class JobController:
             )
             if self.submit_requires_restart_dependency(options, queue_item) and not oldjob_source_dir:
                 return False
+            oldjob_reference = self.build_restart_oldjob_reference(options, queue_item, oldjob_source_dir)
+            if oldjob_reference.oldjob_arg:
+                options = replace(options, oldjob_arg=oldjob_reference.oldjob_arg)
             plan = build_workspace_prepare_plan(
                 options,
                 queue_item,
@@ -702,6 +875,10 @@ class JobController:
             )
             if plan.enabled:
                 workspace_info = build_workspace_info(options, queue_item)
+                self.record_restart_oldjob_info(
+                    workspace_info,
+                    oldjob_reference,
+                )
                 return self.enqueue_workspace_prepare(
                     options=options,
                     queue_item=queue_item,
@@ -710,6 +887,10 @@ class JobController:
                     workspace_info=workspace_info,
                 )
             options, workspace_info = prepare_calculation_workspace(options, queue_item, oldjob_source_dir)
+            self.record_restart_oldjob_info(
+                workspace_info,
+                oldjob_reference,
+            )
         except OSError as exc:
             self.append_history(f"准备计算工作目录失败：{options.job_name}\n{exc}")
             if queue_item is not None:
@@ -842,6 +1023,11 @@ class JobController:
                 f"已复制重启动依赖文件到固态工作目录：{options.job_name}\n"
                 + "\n".join(workspace_info["copied_oldjob_files"])
             )
+        if workspace_info.get("referenced_oldjob_arg"):
+            self.append_history(
+                f"重启动依赖使用绝对路径引用：{options.job_name}\n"
+                f"{workspace_info['referenced_oldjob_arg']}"
+            )
 
     @hang_probe_function("JobController.continue_start_job_after_workspace_ready")
     def continue_start_job_after_workspace_ready(
@@ -884,88 +1070,16 @@ class JobController:
             work_dir,
             options.job_name,
         )
-        submitted_at = time.time()
-        runtime_started_monotonic = time.monotonic()
-
-        run = {
-            "key": job_key,
-            "process": None,
-            "timer": None,
-            "work_dir": work_dir,
-            "job_name": options.job_name,
-            "command": command,
-            "is_paused": False,
-            "datacheck_only": options.datacheck,
-            "terminating": False,
-            "terminating_at": 0.0,
-            "sta_position": 0,
-            "sta_state": {},
-            "log": "",
-            "queue_item": queue_item,
-            "source_inp_path": workspace_info.get("source_inp_path", ""),
-            "calculation_root_dir": calculation_root_dir,
-            "archive_dir": workspace_info.get("archive_dir", ""),
-            "archive_destination": "",
-            "archive_status": "",
-            "archive_error": "",
-            "cleanup_after_archive": workspace_info.get("cleanup_after_archive", False),
-            "existing_result_action": existing_result_info.get("action", ""),
-            "backup_odb_path": existing_result_info.get("odb", "")
-            if existing_result_info.get("action") == "backup"
-            else "",
-            "backup_sta_path": existing_result_info.get("sta", "")
-            if existing_result_info.get("action") == "backup"
-            else "",
-            "memory_monitor_activated": False,
-            "memory_stable_logged": False,
-            "memory_current": 0,
-            "memory_peak": 0,
-            "memory_estimated": 0,
-            "memory_monitor_mode": "learning",
-            "memory_monitor_stable": False,
-            "launcher_finished": False,
-            "launcher_exit_code": None,
-            "launcher_exit_status": None,
-            "launcher_finished_at": None,
-            "launcher_finished_monotonic": None,
-            "console_output": "",
-            "console_failed": False,
-            "console_failed_detail": "",
-            "activity_seen": False,
-            "solver_started": False,
-            "solver_kind": "",
-            "runtime_phase": "STARTING",
-            "runtime_started_monotonic": runtime_started_monotonic,
-            "last_runtime_activity_at": runtime_started_monotonic,
-            "runtime_phase_text_pending": "",
-            "runtime_diagnostic_status": "",
-            "runtime_diagnostic_detail": "",
-            "log_position": 0,
-            "msg_position": 0,
-            "dat_position": 0,
-            "solver_start_timeout": False,
-            "solver_start_timeout_detail": "",
-            "runtime_completion_confirmed": False,
-            "runtime_completion_reason": "",
-            "pre_started": False,
-            "pre_finished": False,
-            "standard_started": False,
-            "package_started": False,
-            "explicit_started": False,
-            "seen_sta": False,
-            "sta_valid": False,
-            "datacheck_stable_polls": 0,
-            "sta_signature": None,
-            "sta_stable_polls": 0,
-            "finish_candidate_since": None,
-            "termination_stable_polls": 0,
-            "termination_candidate_since": None,
-            "diagnostic_baseline": diagnostic_baseline,
-            "submitted_at": submitted_at,
-            "finish_emitted": False,
-            "finalizing": False,
-            "finalized": False,
-        }
+        run = RuntimeRecord.for_internal(
+            key=job_key,
+            options=options,
+            command=command,
+            queue_item=queue_item,
+            workspace_info=workspace_info,
+            existing_result_info=existing_result_info,
+            diagnostic_baseline=diagnostic_baseline,
+            calculation_root_dir=calculation_root_dir,
+        )
 
         self.run_records[job_key] = run
         self.active_runs[job_key] = run
@@ -1012,9 +1126,11 @@ class JobController:
                     False,
                 )
             )
+            self.restart_dependencies.record_queue_item(queue_item, workspace_info)
 
             self.refresh_visible_queue_manager()
             self.update_queue_status_label()
+            self.window.request_joblist_save()
 
         if not self.runtime_controller.start_process(
             job_key=job_key,
@@ -1141,8 +1257,12 @@ class JobController:
         run["archive_error"] = error
         queue_item = run.get("queue_item")
         if queue_item is not None:
+            archive_destination = str(run.get("archive_destination", "") or "")
+            if archive_destination:
+                queue_item.archive_destination = archive_destination
             queue_item.archive_status = status
             queue_item.archive_error = error
+            self.window.request_joblist_save()
 
     def enqueue_archive_move(self, run_key: str, run: dict) -> bool:
         if not self.run_is_ssd_independent_archive_candidate(run):

@@ -11,6 +11,7 @@ from abaqus_submitter_qt.memory_adapter import QtMemoryMonitorAdapter
 from abaqus_submitter_qt.memory_monitor import MemoryMonitorService
 from abaqus_submitter_qt.models import QueueItem
 from abaqus_submitter_qt.qt_compat import QtCore, QtWidgets
+from abaqus_submitter_qt.queue_scheduler import get_managed_active_job_keys
 
 
 def wait_for_signal(signal, trigger, timeout_ms=3000):
@@ -164,7 +165,7 @@ def main() -> int:
                 external_work_dir="G:/test",
             )
         ]
-        assert len(window.get_managed_active_job_keys()) == 1
+        assert len(get_managed_active_job_keys(window.active_runs, window.queue_items)) == 1
         window.close()
 
         adapter.stop()

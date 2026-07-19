@@ -1,7 +1,7 @@
 import unittest
 
-from abaqus_submitter_qt.process_observation import build_process_snapshot
-from abaqus_submitter_qt.process_scanner import (
+from abaqus_submitter.process_observation import build_process_snapshot
+from abaqus_submitter.process_scanner import (
     build_abaqus_job_memory_usage,
     scan_running_abaqus_jobs_by_psutil,
 )

@@ -1,6 +1,6 @@
 """Abaqus diagnostic file parsing and STA log formatting helpers.
 
-This module is deliberately independent from the Tkinter GUI and queue globals.
+This module is deliberately independent from GUI globals.
 It reads Abaqus output files, classifies job status, and formats STA progress text.
 """
 
@@ -8,18 +8,43 @@ import os
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 
-from abaqus_submitter.constants import (
+from .constants import (
     COMPLETE_MARKERS,
     DIAGNOSTIC_EXTENSIONS,
     ERROR_MARKERS,
     LOG_SEPARATOR_WIDTH,
     TERMINATE_MARKERS,
 )
-from abaqus_submitter.ui_performance import measure_ui_callback
+from .diagnostics import hang_probe
 
 
 diagnostic_file_cache = {}
+STA_PROGRESS_ROW_PATTERN = re.compile(r"^\s*(\d+)\s+(\d+)\s+(\d+)\s+")
+STA_PLAIN_ERROR_PATTERN = re.compile(
+    r"(?im)^\s*(?:\*+\s*)?(?:ABAQUS(?:/STANDARD|/EXPLICIT|/ANALYSIS)?\s+)?ERROR(?:\s|:|$)"
+)
+
+
+def build_diagnostic_file_baseline(work_dir, job_name):
+    """Capture diagnostic file signatures before launching a job."""
+    baseline = {}
+
+    for extension in DIAGNOSTIC_EXTENSIONS:
+        path = os.path.join(work_dir, job_name + extension)
+
+        try:
+            stat_result = os.stat(path)
+        except OSError:
+            continue
+
+        baseline[extension] = (
+            stat_result.st_mtime_ns,
+            stat_result.st_size,
+        )
+
+    return baseline
 
 
 def clear_diagnostic_file_cache(work_dir="", job_name=""):
@@ -93,6 +118,96 @@ def read_file_head(path, max_bytes=262144):
         return ""
 
 
+def inspect_sta_structure(
+    path: Path,
+    *,
+    baseline: tuple[int, int] | None = None,
+    submitted_after: float | None = None,
+) -> dict:
+    """Inspect whether one STA file is current, readable, and structurally useful."""
+    sta_path = Path(path)
+    result = {
+        "exists": False,
+        "readable": False,
+        "is_current_run": False,
+        "has_header": False,
+        "has_progress_rows": False,
+        "parse_ok": False,
+        "last_step": None,
+        "last_increment": None,
+        "tail_failure_hint": False,
+        "signature": None,
+        "reason": "",
+    }
+
+    try:
+        stat_result = sta_path.stat()
+    except OSError as exc:
+        result["reason"] = str(exc)
+        return result
+
+    result["exists"] = True
+    current_signature = (stat_result.st_mtime_ns, stat_result.st_size)
+    result["signature"] = (stat_result.st_size, stat_result.st_mtime_ns)
+
+    if baseline is not None:
+        try:
+            baseline_signature = (int(baseline[0]), int(baseline[1]))
+        except (TypeError, ValueError, IndexError):
+            baseline_signature = None
+        result["is_current_run"] = baseline_signature != current_signature
+    elif submitted_after:
+        result["is_current_run"] = stat_result.st_mtime >= float(submitted_after)
+    else:
+        result["is_current_run"] = True
+
+    try:
+        with sta_path.open("rb") as stream:
+            if stat_result.st_size > 65536:
+                stream.seek(stat_result.st_size - 65536)
+            data = stream.read()
+    except OSError as exc:
+        result["reason"] = str(exc)
+        return result
+
+    result["readable"] = True
+    if not data:
+        result["reason"] = "STA 文件为空"
+        return result
+
+    text = decode_abaqus_text(data)
+    if "\x00" in text or (text and text.count("\ufffd") / len(text) > 0.02):
+        result["reason"] = "STA 文件包含不可解析文本"
+        return result
+
+    for line in text.splitlines():
+        normalized_line = re.sub(r"[_/]+", " ", line.upper())
+        header_tokens = set(re.findall(r"[A-Z]+", normalized_line))
+        if {"STEP", "INC", "ATT"}.issubset(header_tokens) and "TIME" in header_tokens:
+            result["has_header"] = True
+
+        match = STA_PROGRESS_ROW_PATTERN.match(line)
+        if match is None:
+            continue
+        result["has_progress_rows"] = True
+        result["last_step"] = int(match.group(1))
+        result["last_increment"] = int(match.group(2))
+
+    status, _detail = classify_job_text(text)
+    result["tail_failure_hint"] = status in {"失败", "终止"} or bool(
+        STA_PLAIN_ERROR_PATTERN.search(text)
+    )
+    result["parse_ok"] = bool(result["has_header"] or result["has_progress_rows"])
+
+    if not result["is_current_run"]:
+        result["reason"] = "STA 文件在本次提交后未发生变化"
+    elif result["tail_failure_hint"]:
+        result["reason"] = "STA 尾部包含失败或终止提示"
+    elif not result["has_progress_rows"]:
+        result["reason"] = "STA 文件中未识别到有效增量数据行"
+    return result
+
+
 def format_backup_time_tag(timestamp):
     """将时间戳格式化为备份文件名使用的时间标签。"""
     return time.strftime("%Y%m%d%H%M", time.localtime(timestamp))
@@ -112,7 +227,7 @@ def parse_datetime_from_abaqus_text(text):
         r"\s*(\d{1,2})/(\d{1,2})/(\d{4})\s+"
         r"(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM)?",
         text,
-        re.IGNORECASE
+        re.IGNORECASE,
     )
     if match:
         month, day, year, hour, minute, second, ampm = match.groups()
@@ -126,14 +241,7 @@ def parse_datetime_from_abaqus_text(text):
                 hour = 0
 
         try:
-            return datetime(
-                int(year),
-                int(month),
-                int(day),
-                hour,
-                int(minute),
-                int(second)
-            )
+            return datetime(int(year), int(month), int(day), hour, int(minute), int(second))
         except ValueError:
             pass
 
@@ -144,20 +252,13 @@ def parse_datetime_from_abaqus_text(text):
         r"\bDATE\s+(\d{1,2})[-/](\d{1,2})\D*[-/](\d{4})\s+"
         r"TIME\s+(\d{1,2}):(\d{2}):(\d{2})",
         text,
-        re.IGNORECASE
+        re.IGNORECASE,
     )
     if match:
         day, month, year, hour, minute, second = match.groups()
 
         try:
-            return datetime(
-                int(year),
-                int(month),
-                int(day),
-                int(hour),
-                int(minute),
-                int(second)
-            )
+            return datetime(int(year), int(month), int(day), int(hour), int(minute), int(second))
         except ValueError:
             pass
 
@@ -168,7 +269,7 @@ def parse_datetime_from_abaqus_text(text):
         r"\b(\d{1,2})/(\d{1,2})/(\d{4})\s+"
         r"(\d{1,2}):(\d{2}):(\d{2})\s*(AM|PM)?\b",
         text,
-        re.IGNORECASE
+        re.IGNORECASE,
     )
     if match:
         month, day, year, hour, minute, second, ampm = match.groups()
@@ -182,14 +283,7 @@ def parse_datetime_from_abaqus_text(text):
                 hour = 0
 
         try:
-            return datetime(
-                int(year),
-                int(month),
-                int(day),
-                hour,
-                int(minute),
-                int(second)
-            )
+            return datetime(int(year), int(month), int(day), hour, int(minute), int(second))
         except ValueError:
             pass
 
@@ -198,20 +292,13 @@ def parse_datetime_from_abaqus_text(text):
     match = re.search(
         r"\b(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+"
         r"(\d{1,2}):(\d{2}):(\d{2})\b",
-        text
+        text,
     )
     if match:
         year, month, day, hour, minute, second = match.groups()
 
         try:
-            return datetime(
-                int(year),
-                int(month),
-                int(day),
-                int(hour),
-                int(minute),
-                int(second)
-            )
+            return datetime(int(year), int(month), int(day), int(hour), int(minute), int(second))
         except ValueError:
             pass
 
@@ -248,15 +335,19 @@ def get_existing_job_backup_time_tag(work_dir, job_name, odb_path=""):
 
 def extract_key_diagnostic_line(text):
     """从 Abaqus 输出中提取最关键的一行诊断信息。"""
-    important_words = ERROR_MARKERS + TERMINATE_MARKERS + (
-        "TOO MANY ATTEMPTS",
-        "NUMERICAL SINGULARITY",
-        "ZERO PIVOT",
-        "THE SYSTEM MATRIX HAS",
-        "TIME INCREMENT REQUIRED IS LESS THAN",
-        "EXCESSIVE DISTORTION",
-        "DUE TO ERRORS",
-        "ERRORS DETECTED",
+    important_words = (
+        ERROR_MARKERS
+        + TERMINATE_MARKERS
+        + (
+            "TOO MANY ATTEMPTS",
+            "NUMERICAL SINGULARITY",
+            "ZERO PIVOT",
+            "THE SYSTEM MATRIX HAS",
+            "TIME INCREMENT REQUIRED IS LESS THAN",
+            "EXCESSIVE DISTORTION",
+            "DUE TO ERRORS",
+            "ERRORS DETECTED",
+        )
     )
 
     for line in text.splitlines():
@@ -292,7 +383,7 @@ def classify_job_text(text):
 
 
 def update_abaqus_stage_from_text(job_state, text):
-    """根据控制台输出记录 Abaqus 是否进入 pre 或 standard 阶段。"""
+    """根据控制台输出记录 Abaqus 当前启动阶段。"""
     if job_state is None:
         return
 
@@ -308,62 +399,44 @@ def update_abaqus_stage_from_text(job_state, text):
     if "END ANALYSIS INPUT FILE PROCESSOR" in upper_text:
         job_state["pre_finished"] = True
 
-    if (
-        "BEGIN ABAQUS/STANDARD ANALYSIS" in upper_text
-        or "RUN STANDARD.EXE" in upper_text
-    ):
+    if "BEGIN ABAQUS/STANDARD ANALYSIS" in upper_text or "RUN STANDARD.EXE" in upper_text:
         job_state["standard_started"] = True
 
+    if "ABAQUS/EXPLICIT PACKAGER" in upper_text or "RUN PACKAGE.EXE" in upper_text or "PACKAGE.EXE" in upper_text:
+        job_state["package_started"] = True
 
-def abaqus_stage_started(job_state):
-    """只要 pre 或 standard 启动过，就不能因为没有 sta 直接判失败。"""
-    return (
-        job_state.get("pre_started")
-        or job_state.get("pre_finished")
-        or job_state.get("standard_started")
-    )
+    if "BEGIN ABAQUS/EXPLICIT ANALYSIS" in upper_text or "RUN EXPLICIT.EXE" in upper_text:
+        job_state["explicit_started"] = True
 
 
-def inspect_job_files(work_dir, job_name, submitted_after=0):
+def inspect_job_files(work_dir, job_name, submitted_after=0, diagnostic_baseline=None):
     """读取 sta/msg/dat/log 文件判断最终状态。"""
-    with measure_ui_callback("inspect_job_files"):
+    with hang_probe("inspect_job_files"):
         combined_text = ""
-    
+        diagnostic_baseline = diagnostic_baseline or {}
+
         for extension in DIAGNOSTIC_EXTENSIONS:
             path = os.path.join(work_dir, job_name + extension)
-    
-            if not os.path.exists(path):
+
+            try:
+                stat_result = os.stat(path)
+            except OSError:
                 continue
-    
-            if submitted_after:
-                try:
-                    if os.path.getmtime(path) < submitted_after:
-                        continue
-                except OSError:
+
+            signature = (
+                stat_result.st_mtime_ns,
+                stat_result.st_size,
+            )
+            baseline_signature = diagnostic_baseline.get(extension)
+            if baseline_signature is not None:
+                if tuple(baseline_signature) == signature:
                     continue
-    
+            elif submitted_after and stat_result.st_mtime < submitted_after:
+                continue
+
             combined_text += "\n" + read_file_tail_cached(path)
-    
+
         return classify_job_text(combined_text)
-
-
-def inspect_job_files_throttled(monitor_state, force=False, interval_seconds=20):
-    """Throttle diagnostic file inspection during normal polling."""
-    with measure_ui_callback("inspect_job_files_throttled"):
-        now = time.time()
-        if (
-                not force
-                and now - monitor_state.get("last_file_inspection_at", 0) < interval_seconds
-        ):
-            return "", ""
-    
-        monitor_state["last_file_inspection_at"] = now
-        job_state = monitor_state["job_state"]
-        return inspect_job_files(
-            job_state["work_dir"],
-            job_state["job_name"],
-            monitor_state["submitted_at"]
-        )
 
 
 def parse_sta_progress(text):
@@ -423,12 +496,7 @@ def format_abaqus_standard_title(line):
     if match:
         left_text = match.group(1)
         right_text = match.group(2)
-        gap_width = max(
-            2,
-            LOG_SEPARATOR_WIDTH
-            - get_display_width(left_text)
-            - get_display_width(right_text)
-        )
+        gap_width = max(2, LOG_SEPARATOR_WIDTH - get_display_width(left_text) - get_display_width(right_text))
         return [f"{left_text}{' ' * gap_width}{right_text}"]
 
     return [line]
@@ -532,6 +600,7 @@ def format_sta_output_for_log(text, job_state):
 
 
 __all__ = [
+    "build_diagnostic_file_baseline",
     "clear_diagnostic_file_cache",
     "decode_abaqus_text",
     "read_file_tail",
@@ -542,10 +611,9 @@ __all__ = [
     "get_existing_job_backup_time_tag",
     "extract_key_diagnostic_line",
     "classify_job_text",
+    "inspect_sta_structure",
     "update_abaqus_stage_from_text",
-    "abaqus_stage_started",
     "inspect_job_files",
-    "inspect_job_files_throttled",
     "parse_sta_progress",
     "is_sta_progress_line",
     "append_sta_separator_once",

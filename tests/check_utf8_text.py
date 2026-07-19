@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CURRENT_FILE = Path(__file__).resolve()
+INTENTIONAL_TOKEN_FILES = {ROOT / "AGENTS.md"}
 
 TEXT_SUFFIXES = {
     ".py",
@@ -40,7 +42,7 @@ SUSPICIOUS_TOKENS = (
 def should_check(path: Path) -> bool:
     resolved_path = path.resolve()
 
-    if resolved_path == CURRENT_FILE:
+    if resolved_path == CURRENT_FILE or resolved_path in INTENTIONAL_TOKEN_FILES:
         return False
 
     if path.suffix.lower() not in TEXT_SUFFIXES:
@@ -50,6 +52,8 @@ def should_check(path: Path) -> bool:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
     errors: list[str] = []
 
     for path in ROOT.rglob("*"):

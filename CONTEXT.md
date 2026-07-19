@@ -4,21 +4,15 @@ AbaqusSubmitter is a desktop tool for submitting, monitoring, and managing Abaqu
 
 ## Product Direction
 
-The Qt version is the main development direction going forward.
+The Qt desktop application is the only product implementation and the only development mainline.
 
-The Tk version is retained as a legacy compatibility implementation and as a behavior reference for older functionality.
-
-New features should be implemented in the Qt mainline first.
-
-When migrating behavior from the legacy version, it is acceptable to read the Tk code as a behavioral reference, but do not directly reuse Tk modules from the Qt implementation.
-
-Unless explicitly requested, do not modify the legacy Tk version.
+All application code lives in the canonical `abaqus_submitter` package. Do not introduce a second frontend package or any parallel product implementation.
 
 ## Implementation Boundaries
 
-The Qt and Tk implementations must remain independent.
+Keep the Scheduler Core and other UI-independent domain Modules free of Qt dependencies. Qt Adapters may depend on their Interfaces, but domain Modules must not import UI Modules.
 
-Do not cross-import between the Qt code and the Tk code.
+Runtime state belongs under the operating system application-data directory, not in the source tree.
 
 ## Domain Language
 
@@ -27,6 +21,15 @@ Do not cross-import between the Qt code and the Tk code.
 - **Queue Presentation**: the projection of Queue Items into candidate/formal table rows plus the coalescing of full and incremental refresh requests.
 - **Process Observation**: one shared lifecycle for collecting a process snapshot and building PID and solver indexes consumed by runtime evidence, memory monitoring, and external-job discovery.
 - **Restart Dependency Lifecycle**: resolution of an oldjob source, creation and persistence of its reference, workspace handoff, archive blocking, and reference invalidation.
+- **Job Specification**: the stable, UI-independent description submitted to scheduling: identity, work directory, resource request, priority, dependencies, conflict key, and hold state.
+- **Scheduler Core**: the Qt-free Deep Module that owns job ordering, dependency checks, resource allocation, pending reasons, and legal lifecycle transitions.
+- **Resource Snapshot**: the scheduler input describing resources currently available for new local work. It is a point-in-time value, not mutable UI state.
+- **Allocation**: the Scheduler Core decision that reserves resources for one Job Specification and creates a unique Execution Attempt.
+- **Execution Attempt**: one fenced launch of a job, identified by `attempt_id`. Late events from an older attempt must not change the current attempt.
+- **Execution Event**: the one-way report from local execution to the Scheduler Core, such as starting, started, completing, succeeded, failed, canceled, or lost.
+- **Local Execution Backend**: the Interface implemented by the QProcess-based Adapter that launches and unregisters local Abaqus Execution Attempts. It reports outcomes through Execution Events.
+- **Scheduler State Repository**: the SQLite-backed Adapter that transactionally persists scheduler snapshots and append-only event history for restart recovery.
+- **Application Data Directory**: the operating-system-specific location that owns configuration, queue JSON, and Scheduler State Repository files outside the source tree.
 
 ## Operational Guardrails
 

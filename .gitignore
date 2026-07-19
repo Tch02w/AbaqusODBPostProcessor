@@ -3,18 +3,21 @@ venv/
 .venv/
 
 __pycache__/
+*.db
+*.db-shm
+*.db-wal
+*.db.corrupt-*
+*.db-wal.corrupt-*
+*.db-shm.corrupt-*
 *.py[cod]
 
 .idea/
 
 build/
 dist/
-*.spec
 
 *.log
 *.tmp
-
-config.json
 
 config.json
 joblist.json

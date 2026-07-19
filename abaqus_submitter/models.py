@@ -1,4 +1,3 @@
-import ctypes
 from dataclasses import dataclass, field
 from uuid import uuid4
 
@@ -8,6 +7,7 @@ from .constants import STATUS_PENDING_CONFIRM
 @dataclass
 class QueueItem:
     item_id: str = field(default_factory=lambda: uuid4().hex)
+    job_id: str = ""
     inp_path: str = ""
     job_name: str = ""
     source: str = ""
@@ -19,17 +19,23 @@ class QueueItem:
     oldjob_name: str = ""
     oldjob_dir: str = ""
     oldjob_path: str = ""
+    resolved_oldjob_arg: str = ""
+    resolved_oldjob_source: str = ""
+    resolved_oldjob_dir: str = ""
+    resolved_oldjob_reference_key: str = ""
     fortran_path: str = ""
-    cores: int = 1
+    cores: int = 0
     memory: str = ""
     interactive: bool = False
     datacheck_only: bool = False
     complete_notify: bool = False
     source_inp_path: str = ""
-    calculation_work_dir: str = ""
+    calculation_root_dir: str = ""
+    effective_work_dir: str = ""
     archive_dir: str = ""
     archive_after_complete: bool = False
     cleanup_after_archive: bool = False
+    archive_destination: str = ""
     archive_status: str = ""
     archive_error: str = ""
     active_job_key: str = ""
@@ -40,21 +46,17 @@ class QueueItem:
     pids: list = field(default_factory=list)
     pid_create_times: dict = field(default_factory=dict)
     rss_bytes: int = 0
+    priority: int = 0
+    held: bool = False
+    scheduler_state: str = ""
+    pending_reason: str = ""
+    attempt_id: str = ""
+    dependency_job_ids: list[str] = field(default_factory=list)
+    submitted_at: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not self.job_id:
+            self.job_id = self.item_id
 
 
-class MemoryStatusEx(ctypes.Structure):
-    """Windows GlobalMemoryStatusEx structure reused across queue checks."""
-    _fields_ = [
-        ("dwLength", ctypes.c_ulong),
-        ("dwMemoryLoad", ctypes.c_ulong),
-        ("ullTotalPhys", ctypes.c_ulonglong),
-        ("ullAvailPhys", ctypes.c_ulonglong),
-        ("ullTotalPageFile", ctypes.c_ulonglong),
-        ("ullAvailPageFile", ctypes.c_ulonglong),
-        ("ullTotalVirtual", ctypes.c_ulonglong),
-        ("ullAvailVirtual", ctypes.c_ulonglong),
-        ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-    ]
-
-
-__all__ = ["QueueItem", "MemoryStatusEx"]
+__all__ = ["QueueItem"]

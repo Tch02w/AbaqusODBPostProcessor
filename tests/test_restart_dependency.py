@@ -2,11 +2,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from abaqus_submitter_qt.command import SubmitOptions
-from abaqus_submitter_qt.constants import STATUS_COMPLETED, STATUS_RUNNING
-from abaqus_submitter_qt.models import QueueItem
-from abaqus_submitter_qt.queue_scheduler import managed_job_key
-from abaqus_submitter_qt.restart_dependency import RestartDependencyLifecycle
+from abaqus_submitter.command import SubmitOptions
+from abaqus_submitter.constants import STATUS_COMPLETED, STATUS_RUNNING
+from abaqus_submitter.models import QueueItem
+from abaqus_submitter.queue_scheduler import managed_job_key
+from abaqus_submitter.restart_dependency import RestartDependencyLifecycle
 
 
 class RestartDependencyLifecycleTests(unittest.TestCase):

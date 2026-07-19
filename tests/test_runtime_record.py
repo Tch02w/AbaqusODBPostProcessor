@@ -1,8 +1,8 @@
 import unittest
 
-from abaqus_submitter_qt.command import SubmitOptions
-from abaqus_submitter_qt.models import QueueItem
-from abaqus_submitter_qt.runtime_record import RuntimeRecord
+from abaqus_submitter.command import SubmitOptions
+from abaqus_submitter.models import QueueItem
+from abaqus_submitter.runtime_record import RuntimeRecord
 
 
 class RuntimeRecordTests(unittest.TestCase):

@@ -76,10 +76,10 @@ def format_memory_size(size_bytes: int) -> str:
     size_bytes = int(size_bytes or 0)
     if size_bytes <= 0:
         return "未统计"
-    gib = size_bytes / 1024 ** 3
+    gib = size_bytes / 1024**3
     if gib >= 1:
         return f"{gib:.1f} GB"
-    return f"{size_bytes / 1024 ** 2:.0f} MB"
+    return f"{size_bytes / 1024**2:.0f} MB"
 
 
 def infer_model_group(job_name: str) -> str:
@@ -91,13 +91,6 @@ def infer_model_group(job_name: str) -> str:
     return ""
 
 
-def get_job_memory_step(job_state: Mapping[str, Any] | None) -> str:
-    """Return current Abaqus step from a legacy job-state mapping."""
-    progress = (job_state or {}).get("progress") or {}
-    step = progress.get("step")
-    return str(step) if step not in (None, "") else "unknown"
-
-
 def get_memory_safety_factor(
     *,
     group: str = "",
@@ -105,36 +98,6 @@ def get_memory_safety_factor(
 ) -> float:
     """Return the default memory safety factor for a job group."""
     return float(base_factor)
-
-
-def sync_legacy_job_state_from_tracking_state(
-    legacy_state: dict[str, Any],
-    tracking_state: JobMemoryTrackingState,
-) -> None:
-    """Copy service tracking fields back to the legacy Tk dictionary."""
-    legacy_state["memory_monitor_active"] = tracking_state.monitor_active
-    legacy_state["memory_monitor_mode"] = tracking_state.monitor_mode
-    legacy_state["next_memory_sample_at"] = tracking_state.next_sample_at
-    legacy_state["memory_samples"] = list(tracking_state.memory_samples)
-    legacy_state["memory_peak"] = tracking_state.memory_peak
-    legacy_state["memory_stable_polls"] = tracking_state.memory_stable_polls
-    legacy_state["finalized"] = tracking_state.finalized
-
-
-def sync_tracking_state_from_legacy_job_state(
-    tracking_state: JobMemoryTrackingState,
-    legacy_state: Mapping[str, Any],
-) -> None:
-    """Copy legacy Tk dictionary fields into a service tracking state."""
-    tracking_state.finalized = bool(legacy_state.get("finalized", tracking_state.finalized))
-    tracking_state.monitor_active = bool(legacy_state.get("memory_monitor_active", tracking_state.monitor_active))
-    tracking_state.monitor_mode = str(legacy_state.get("memory_monitor_mode", tracking_state.monitor_mode) or "learning")
-    tracking_state.next_sample_at = float(legacy_state.get("next_memory_sample_at", tracking_state.next_sample_at) or 0)
-    tracking_state.memory_samples = [int(value or 0) for value in legacy_state.get("memory_samples", tracking_state.memory_samples) or []]
-    tracking_state.memory_peak = int(legacy_state.get("memory_peak", tracking_state.memory_peak) or 0)
-    tracking_state.memory_stable_polls = int(
-        legacy_state.get("memory_stable_polls", tracking_state.memory_stable_polls) or 0
-    )
 
 
 class MemoryMonitorService:
@@ -210,9 +173,7 @@ class MemoryMonitorService:
         return [
             state
             for state in self.tracking_states.values()
-            if state.monitor_active
-            and not state.finalized
-            and float(state.next_sample_at or 0) <= now
+            if state.monitor_active and not state.finalized and float(state.next_sample_at or 0) <= now
         ]
 
     def get_next_delay_ms(
@@ -330,10 +291,7 @@ class MemoryMonitorService:
         usage_by_job: Mapping[str, JobMemoryUsage | Mapping[str, Any]] | None = None,
         active_job_names: set[str] | None = None,
     ) -> MemorySlotEstimate:
-        usage = {
-            job_name: self._coerce_usage(job_name, value)
-            for job_name, value in (usage_by_job or {}).items()
-        }
+        usage = {job_name: self._coerce_usage(job_name, value) for job_name, value in (usage_by_job or {}).items()}
         current_abaqus_memory = sum(self._usage_memory(value) for value in usage.values())
         usable_memory = int(max(0, int(available_memory or 0)) * self.usable_memory_ratio)
         memory_available_for_new_jobs = max(0, usable_memory - current_abaqus_memory)
@@ -420,7 +378,7 @@ class MemoryMonitorService:
         state.memory_peak = peak_after
         samples.append(memory)
         if len(samples) > self.max_samples:
-            del samples[:-self.max_samples]
+            del samples[: -self.max_samples]
 
         estimate = self._estimate_for_job(state.job_name)
         estimate.step_peaks[step] = max(int(estimate.step_peaks.get(step, 0)), memory)
@@ -446,12 +404,8 @@ class MemoryMonitorService:
             state.memory_stable_polls += 1
 
         stable_event = None
-        stable_now = (
-            mode_before == "learning"
-            and (
-                state.memory_stable_polls >= self.stable_polls
-                or len(samples) >= self.max_samples
-            )
+        stable_now = mode_before == "learning" and (
+            state.memory_stable_polls >= self.stable_polls or len(samples) >= self.max_samples
         )
         if stable_now:
             estimate.stable = True
@@ -488,8 +442,5 @@ __all__ = [
     "MemoryMonitorService",
     "format_memory_size",
     "infer_model_group",
-    "get_job_memory_step",
     "get_memory_safety_factor",
-    "sync_legacy_job_state_from_tracking_state",
-    "sync_tracking_state_from_legacy_job_state",
 ]

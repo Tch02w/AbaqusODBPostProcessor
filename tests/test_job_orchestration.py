@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from abaqus_submitter_qt.job_controller import JobController
+from abaqus_submitter.job_controller import JobController
 
 
 class JobOrchestrationInterfaceTests(unittest.TestCase):

@@ -2,6 +2,7 @@ import ctypes
 import os
 import re
 
+
 def get_physical_cpu_count():
     """Return the physical CPU core count, falling back to logical CPUs."""
     if os.name == "nt":
@@ -10,27 +11,15 @@ def get_physical_cpu_count():
             returned_length = ctypes.c_uint32(0)
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             get_processor_info = kernel32.GetLogicalProcessorInformationEx
-            get_processor_info.argtypes = [
-                ctypes.c_uint32,
-                ctypes.c_void_p,
-                ctypes.POINTER(ctypes.c_uint32)
-            ]
+            get_processor_info.argtypes = [ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
             get_processor_info.restype = ctypes.c_int
 
-            get_processor_info(
-                relation_processor_core,
-                None,
-                ctypes.byref(returned_length)
-            )
+            get_processor_info(relation_processor_core, None, ctypes.byref(returned_length))
             if returned_length.value <= 0:
                 raise OSError("CPU core information is unavailable.")
 
             buffer = ctypes.create_string_buffer(returned_length.value)
-            success = get_processor_info(
-                relation_processor_core,
-                buffer,
-                ctypes.byref(returned_length)
-            )
+            success = get_processor_info(relation_processor_core, buffer, ctypes.byref(returned_length))
             if not success:
                 raise OSError("Failed to read CPU core information.")
 
@@ -63,12 +52,12 @@ JOB_MEMORY_LEARNING_INTERVAL_MS = 15000
 JOB_MEMORY_PATROL_INTERVAL_MS = 90000
 EXTERNAL_JOB_MONITOR_INTERVAL_MS = 5000
 STALE_LOCK_GRACE_SECONDS = 30
+SOLVER_START_GRACE_SECONDS = 60
 PROCESS_SNAPSHOT_CACHE_SECONDS = 5
 FORMAL_QUEUE_SAVE_DEBOUNCE_MS = 500
 MAX_JOB_LOG_LINES = 5000
 MAX_HISTORY_LOG_LINES = 2000
 LOG_TRIM_CHECK_INTERVAL = 50
-ENABLE_PERFORMANCE_LOG = False
 JOB_MEMORY_MIN_SAMPLES = 4
 JOB_MEMORY_STABLE_POLLS = 4
 JOB_MEMORY_STABLE_RELATIVE_DELTA = 0.08
@@ -85,7 +74,7 @@ LOG_SCROLLBAR_WIDTH = 12
 LOG_VIEW_PIXEL_WIDTH = LOG_TEXT_PIXEL_WIDTH + LOG_SCROLLBAR_WIDTH
 RIGHT_PANEL_HORIZONTAL_PADDING = 0
 RIGHT_PANEL_MIN_WIDTH = LOG_VIEW_PIXEL_WIDTH + RIGHT_PANEL_HORIZONTAL_PADDING
-UNLIMITED_JOB_SLOTS = 10 ** 9
+UNLIMITED_JOB_SLOTS = 10**9
 WINDOW_HORIZONTAL_PADDING = 24
 WINDOW_VERTICAL_PADDING = 24
 WINDOW_HEIGHT = 720
@@ -107,6 +96,11 @@ COMPLETE_MARKERS = (
 TERMINATE_MARKERS = (
     "THE ANALYSIS HAS BEEN TERMINATED",
     "TERMINATED",
+    "HAS BEEN STOPPED",
+    "JOB HAS STOPPED",
+    "JOB STOPPED",
+    "ANALYSIS STOPPED",
+    "STOPPED BY USER",
     "USER REQUESTED TERMINATION",
 )
 
@@ -149,7 +143,8 @@ def calculate_default_joblist_parallel(cpus=None):
     requested_cpus = MAX_CPUS if cpus == 0 else max(1, cpus)
     return max(1, (MAX_THREADS * 3) // (2 * requested_cpus))
 
-JOB_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+
+JOB_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
 DIAGNOSTIC_EXTENSIONS = (".sta", ".msg", ".dat", ".log")
 OVERWRITE_PROMPT_MARKERS = (
     "OLD JOB FILES EXIST",
@@ -216,21 +211,20 @@ FONT_QUEUE_HEADING = (FONT_FAMILY, 10)
 APP_BG = "#ffffff"
 CARD_BG = "#ffffff"
 LOG_BG = "#f9fafb"
-JOBLIST_FILENAME = "joblist.json"
 BTN_LIGHT_FG = "#dbe3ee"
 BTN_LIGHT_HOVER = "#cbd5e1"
 BTN_LIGHT_TEXT = "#111827"
 
-BTN_PAUSE_FG = "#facc15"      # 黄色：暂停
+BTN_PAUSE_FG = "#facc15"  # 黄色：暂停
 BTN_PAUSE_HOVER = "#eab308"
-BTN_RESUME_FG = "#22c55e"     # 绿色：继续
+BTN_RESUME_FG = "#22c55e"  # 绿色：继续
 BTN_RESUME_HOVER = "#16a34a"
 BTN_STATUS_TEXT_DARK = "#111827"
 BTN_STATUS_TEXT_LIGHT = "#ffffff"
 
 STATUS_PENDING_CONFIRM = "待确认"
 STATUS_PENDING_RUN = "待运行"
-STATUS_STARTING = "正在启动"
+STATUS_STARTING = "启动中"
 STATUS_RUNNING = "运行中"
 STATUS_COMPLETED = "已完成"
 STATUS_FAILED = "运行失败"
@@ -241,19 +235,34 @@ STATUS_WAITING_DEPENDENCY = "等待前置"
 STATUS_UNKNOWN = "状态未知"
 STATUS_CONFIRMING = "状态确认中"
 STATUS_INTERRUPTED = "疑似异常中断"
+STATUS_DATACHECK_COMPLETED = "Datacheck Completed"
+STATUS_DATACHECK_FAILED = "Datacheck Failed"
 
-TERMINAL_QUEUE_STATUSES = {
+ACTIVE_STATUSES = frozenset(
+    {
+        STATUS_STARTING,
+        STATUS_RUNNING,
+        STATUS_CONFIRMING,
+        STATUS_TERMINATING,
+    }
+)
+
+TERMINAL_STATUSES = frozenset(
+    {
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_CANCELED,
     STATUS_TERMINATED,
+    STATUS_INTERRUPTED,
     STATUS_UNKNOWN,
-    "Datacheck Completed",
-    "Datacheck Failed",
-}
+    STATUS_DATACHECK_COMPLETED,
+    STATUS_DATACHECK_FAILED,
+    }
+)
 
 
 __all__ = [
-    name for name in globals()
+    name
+    for name in globals()
     if name.isupper() or name in {"get_physical_cpu_count", "calculate_default_joblist_parallel"}
 ]

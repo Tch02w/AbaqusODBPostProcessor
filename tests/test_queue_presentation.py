@@ -1,7 +1,7 @@
 import unittest
 
-from abaqus_submitter_qt.models import QueueItem
-from abaqus_submitter_qt.queue_presentation import (
+from abaqus_submitter.models import QueueItem
+from abaqus_submitter.queue_presentation import (
     QueueRefreshBatch,
     formal_row_projection,
     runtime_cell_projection,
@@ -29,10 +29,10 @@ class QueuePresentationTests(unittest.TestCase):
 
     def test_runtime_projection_only_contains_volatile_cells(self):
         item = QueueItem(job_name="demo", rss_bytes=2 * 1024**3, status="运行中", message="求解中")
-        self.assertEqual(runtime_cell_projection(item), {7: "2.0 GB", 8: "运行中", 9: "求解中"})
+        self.assertEqual(runtime_cell_projection(item), {7: "2.0 GB", 10: "运行中", 11: "求解中"})
         row = formal_row_projection(item, 3)
         self.assertEqual(row[0], "3")
-        self.assertEqual(row[7:10], ("2.0 GB", "运行中", "求解中"))
+        self.assertEqual(row[7:12], ("2.0 GB", "0", "可调度", "运行中", "求解中"))
 
 
 if __name__ == "__main__":

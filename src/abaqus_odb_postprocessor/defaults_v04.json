@@ -1,0 +1,31 @@
+{
+  "abaqus_command": "D:\\SIMULIA\\Commands\\abaqus.bat",
+  "default_odb_folder": "G:\\Job\\GJA_ODB",
+  "default_load_set": "SET-LOAD",
+  "default_pile_set": "SET-PILE",
+  "default_concrete_set": "SET-PILE_CON",
+  "default_rebar_set": "SET-REBAR",
+  "default_longitudinal_material": "HRB400",
+  "default_soil_set": "SET-SOIL_CUT",
+  "default_soil_fallback_set": "SET-SOIL_FULL",
+  "default_steel_component_set": "SET-KEY",
+  "default_cf_concrete_set": "SET-PILECON",
+  "default_cf_steel_set": "SETPILESTEEL",
+  "animation_fps": 5,
+  "axial_cut_count": 100,
+  "pile_head_above_ground_mm": 500.0,
+  "longitudinal_orientation_threshold": 0.95,
+  "damage_threshold": 0.9,
+  "damage_angular_coverage": 0.9,
+  "damage_colors": [
+    "#F2F2F2", "#D9E8F5", "#B7D4EA", "#7BC8B8", "#2FBF71",
+    "#B7DD3B", "#F2D13D", "#E85B2A", "#CC1F2F", "#FF0000"
+  ],
+  "camera_view_vector": [1.0, 1.0, 0.5],
+  "camera_up_vector": [0.0, 0.0, 1.0],
+  "soil_section_plane": "XZ",
+  "soil_section_coordinate": 0.0,
+  "soil_view_vector": [0.0, 1.0, 0.0],
+  "soil_zoom_factor": 3.0,
+  "full_timehistory_freebody": false
+}

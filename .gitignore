@@ -1,0 +1,40 @@
+# Local Python/runtime files
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+build/
+dist/
+*.egg-info/
+
+# IDE and user state
+.idea/
+.vscode/
+project_state.json
+*.lnk
+
+# Abaqus models, scratch files, and solver output
+*.odb
+*.lck
+*.sim
+*.sta
+*.msg
+*.dat
+*.com
+*.prt
+*.res
+*.mdl
+*.stt
+abaqus.rpy*
+abaqus_argv.json
+
+# Generated postprocessing data and caches
+runs/
+scan_cache/
+AbaqusODBPostProcessor_Results/
+_AbaqusODBPostProcessor_Results/
+*.png
+*.gif
+*.xlsx
+*.csv
+

@@ -1,0 +1,19 @@
+{
+  "odb_path": "G:\\Job\\GJA_ODB\\GJA-32_U20D_V20D.odb",
+  "output_dir": "G:\\PythonProject\\AbaqusODBPostProcessor\\runs\\example_GJA-32",
+  "start_step": "U10D",
+  "end_step": "V20D",
+  "load_direction": "1+3",
+  "load_set": "SET-LOAD",
+  "pile_type": "RC",
+  "pile_display_set": "SET-PILE",
+  "pile_concrete_set": "SET-PILE_CON",
+  "pile_steel_set": "",
+  "soil_set": "SET-SOIL_FULL",
+  "rebar_set": "SET-REBAR",
+  "rebar_diameter_mm": 32.0,
+  "prefracture_sequence_index": -1,
+  "full_timehistory_freebody": false,
+  "note": "ODB detects 32 longitudinal bars; catalog count 30 is reference only."
+}
+

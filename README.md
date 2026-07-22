@@ -1,68 +1,89 @@
-# Abaqus ODB PostProcessor 0.5
+# Abaqus ODB PostProcessor
 
-面向 Abaqus 2025 的 ODB 批量后处理程序。项目源代码采用 `src` 布局，位于：
+Abaqus 2025 ODB 批量后处理工具。当前工作树只保留唯一最新版代码；旧实现通过 Git 历史保存，不再使用 `*_v2.py`、`*_final.py` 等本地副本。
 
-`G:\PythonProject\AbaqusODBPostProcessor\src\abaqus_odb_postprocessor`
+GitHub：<https://github.com/Tch02w/AbaqusODBPostProcessor>
 
-双击项目根目录的 `打开源代码文件夹.bat` 可直接打开源码；双击 `Abaqus ODB 后处理器.lnk` 启动程序。
+## 本地目录职责
 
-## 两阶段扫描
+- 项目与源码：`G:\PythonProject\AbaqusODBPostProcessor`
+- ODB：`G:\Job\GJA_ODB`
+- 提取结果：`G:\Job\GJA_ODB\AbaqusODBPostProcessor_Results`
+- 扫描/预扫描缓存：`%TEMP%\AbaqusODBPostProcessor`
+- 用户界面状态：`%APPDATA%\AbaqusODBPostProcessor\project_state.json`
 
-1. 选择 ODB 文件夹并点击“发现并选择 ODB”。
-2. 第一阶段只枚举文件，不会打开 ODB。
-3. 在选择窗口中搜索、全选、全不选、反选或勾选指定文件。
-4. 点击“开始读取”后，Abaqus 只打开所选文件。
+项目目录中不存放 ODB、云图、CSV、GIF、XLSX、运行结果或扫描缓存。`.venv`、`.git`、源代码、测试、配置、文档与启动入口保留在项目中。
 
-每个 ODB 开始读取前都会写入时间戳，例如：
+## 启动
 
-```text
-[2026-07-22 19:03:05] 正在读取 [2/5] GJA-32_U20D_V20D.odb
-```
+- 双击 `Abaqus ODB 后处理器.lnk`；或
+- 双击 `启动AbaqusODB后处理器.bat`。
 
-## 文件名自动识别
+双击 `打开源代码文件夹.bat` 可直接打开当前源码目录。
 
-程序把 `GJA-1-R_U100D` 解析为：
+## 文件名规则
+
+以 `GJA-1-R_U100D` 为例：
 
 - `GJA`：A 方案钢筋混凝土模型；
 - `1`：样本编号；
 - `R`：配筋模型；
-- `U100D`：上拔位移 100 mm，对应 Abaqus 全局 3 方向；
-- `V20D`：水平位移 20 mm，对应 Abaqus 全局 1 方向；
-- 同时存在 U、V：复合加载，读取 1+3 方向。
+- `U100D`：上拔位移 100 mm，对应全局 3 方向；
+- `V20D`：水平位移 20 mm，对应全局 1 方向；
+- 同时存在 U、V：复合加载，读取 1+3 方向；
+- `miu03/miu04`：变参数标签，不参与工况组名。
 
-加载方向默认显示“自动（文件名）”，也可在表格中手动覆盖。主筋直径按照已提供的样本表自动匹配；手动改成不同数值后会作为覆盖值持久保存。
+扫描后自动建立 `工况-U100D`、`工况-U40D_V20D` 等初始组。主筋直径按样本编号自动匹配，并允许手动覆盖。
 
-## 自动工况组与多选
+## 扫描、分组与并行
 
-扫描后按 U/V 位移字段建立初始工况组，例如 `工况-U100D`、`工况-U40D_V20D`。`R`、`miu03/miu04` 和样本编号不进入工况组名；同工况的变参数模型会进入同一个初始组。
+1. 点击“发现并选择 ODB”，第一阶段只枚举文件。
+2. 勾选需要 Abaqus 打开的 ODB 后点击“开始读取”。
+3. “全部 ODB”支持 `Ctrl` 离散多选、`Shift` 连续多选和批量拖放。
+4. ODB 右侧灰色数字表示当前所属组数；同一 ODB 可属于多个组。
+5. 并行数范围 1–4，默认 2；每个工作单元是独立 Abaqus CAE 进程。
+6. 组内 ODB 完成预扫描后统一确定图例上下限，再并行正式提取。
+7. “取消当前批次”只停止本工具启动的 CAE 后处理进程，不结束 `standard.exe` 求解。
 
-“全部 ODB”支持 Windows 标准多选：
+## 结果结构
 
-- `Ctrl`：离散多选；
-- `Shift`：连续多选；
-- 选中后可一次拖入对比组；
-- ODB 名称右侧的灰色数字表示它当前属于几个组；
-- 同一 ODB 仍可属于多个对比组，组不可嵌套。
+```text
+G:\Job\GJA_ODB\AbaqusODBPostProcessor_Results\
+├─ 工况-U100D\
+│  └─ YYYYMMDD_HHMMSS\
+│     └─ ODB名称\
+├─ 工况-U40D_V20D\
+├─ 未分组\
+├─ _批次记录\
+└─ _历史测试\
+```
 
-## 并行提取与取消
+自定义对比组使用对应组名作为结果第一层目录。同一 ODB 属于多个组时，只提取一次数值数据，其他组复用数值缓存并按各组图例重渲染。
 
-“并行 ODB 进程数”范围为 1–4，默认 2。这里使用多个独立 Abaqus CAE 进程分别处理不同 ODB，不在同一 ODB 内使用线程。流程分为：
+## 当前代码结构
 
-1. 多 ODB 并行预扫描；
-2. 等待组内所有 ODB 完成，统一计算每个对比组的图例上下限；
-3. 多 ODB 并行正式提取；
-4. 同一 ODB 属于多个组时复用数值缓存，仅按各组图例重渲染。
+- `app.py`：两阶段选择和程序入口；
+- `main_window.py`：基础表格与作业配置；
+- `comparison_groups.py`：非嵌套、多成员对比组；
+- `batch_window.py`：自动命名、并行批处理、取消与结果布局；
+- `paths.py`：缓存、状态与结果路径；
+- `runner.py` / `process_runner.py` / `runner_parallel.py`：进程调度；
+- `postprocess.py` / `postprocess_core.py`：宿主机后处理；
+- `abaqus_scripts/`：唯一当前 Abaqus 运行链；
+- `tests/`：自动化测试。
 
-点击“取消当前批次”只会结束本程序启动的 Abaqus CAE 后处理进程，不会主动结束 Abaqus `standard.exe` 求解作业。受许可证、内存和磁盘速度限制，通常建议并行数设为 2。
+## Git 版本管理
 
-## 主要代码
+- `127df4b`：整理前全部旧版本与开发脚本快照；
+- 当前提交：单一最新版工作树。
 
-- `app.py`：两阶段 ODB 选择与程序入口；
-- `app_groups_v1_base.py`：0.5 界面增强和并行批处理；
-- `app_groups_v1_legacy.py`：0.4 分组基础实现；
-- `naming.py`：文件名、加载方向、工况和直径解析；
-- `runner_parallel.py`：可取消的多 Abaqus 进程控制；
-- `group_ui.py`：比较组树与拖放；
-- `abaqus_scripts/`：Abaqus 2025 ODB 读取、云图和 FreeBody 脚本。
+后续迭代直接修改当前文件并提交 Git，不再复制带版本号的 Python 文件。
 
-运行结果保存在 `runs\YYYYMMDD_HHMMSS`，扫描缓存保存在 `scan_cache`。
+常用命令：
+
+```powershell
+git status -sb
+git add <本次修改文件>
+git commit -m "说明本次修改"
+git push origin main
+```

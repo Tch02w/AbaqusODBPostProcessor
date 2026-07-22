@@ -14,7 +14,7 @@ script_candidates = [
 if not script_candidates:
     raise RuntimeError("Cannot locate render_group_contours.py in argv")
 script_path = os.path.abspath(script_candidates[-1])
-base_path = os.path.join(os.path.dirname(script_path), "render_group_contours_base.py")
+base_path = os.path.join(os.path.dirname(script_path), "render_group_contours_core.py")
 with open(base_path, "r", encoding="utf-8") as stream:
     source = stream.read()
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 
-entry_path = Path(__file__).with_name("validate_output_v3_entry.py")
+entry_path = Path(__file__).with_name("validation_compat.py")
 entry = entry_path.read_text(encoding="utf-8")
 needle = 'exec(compile(source, str(base_path), "exec"), globals(), globals())\n'
 injection = (

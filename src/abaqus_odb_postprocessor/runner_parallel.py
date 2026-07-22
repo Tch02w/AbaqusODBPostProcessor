@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from .config import abaqus_script
-from .runner_selection_base import ProcessCancelled, run_process
+from .process_runner import ProcessCancelled, run_process
 
 
 LogCallback = Callable[[str], None]
@@ -70,7 +70,7 @@ def scan_field_ranges(
         [
             abaqus_command,
             "cae",
-            f"noGUI={abaqus_script('scan_legend_limits_compat_v3.py')}",
+            f"noGUI={abaqus_script('scan_legend_worker.py')}",
             "--",
             "--config",
             str(job_config_path),
@@ -95,7 +95,7 @@ def run_job(
         [
             abaqus_command,
             "cae",
-            f"noGUI={abaqus_script('extract_job_final_v23.py')}",
+            f"noGUI={abaqus_script('extract_job_worker.py')}",
             "--",
             str(job_config_path),
         ],

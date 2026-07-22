@@ -1,5 +1,6 @@
 @echo off
 setlocal
+set PYTHONDONTWRITEBYTECODE=1
 cd /d "%~dp0"
 
 if not exist ".venv\Scripts\pythonw.exe" (

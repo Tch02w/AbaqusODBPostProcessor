@@ -1,3 +1,5 @@
+"""Incremental Assembly-level scanner with an optional explicit ODB selection."""
+
 from __future__ import print_function
 
 import argparse
@@ -5,132 +7,91 @@ import json
 import os
 import sys
 
-from odbAccess import openOdb
 
+script_candidates = [
+    value
+    for value in sys.argv
+    if value.lower().replace("/", "\\").endswith("scan_odb.py")
+]
+if not script_candidates:
+    raise RuntimeError("Cannot locate scan_odb.py in argv: {0}".format(repr(sys.argv)))
+script_path = os.path.abspath(script_candidates[-1])
+base_path = os.path.join(os.path.dirname(script_path), "scan_odb_core.py")
+namespace = {"__name__": "scan_odb_core_module"}
+with open(base_path, "r", encoding="utf-8") as stream:
+    base_source = stream.read()
+exec(compile(base_source, base_path, "exec"), namespace, namespace)
 
-def flatten(groups):
-    for group in groups:
-        try:
-            for item in group:
-                yield item
-        except TypeError:
-            yield group
+arguments = sys.argv[1:]
+if "--" in arguments:
+    arguments = arguments[arguments.index("--") + 1:]
+parser = argparse.ArgumentParser()
+parser.add_argument("--folder", required=True)
+parser.add_argument("--output", required=True)
+parser.add_argument("--selection")
+args = parser.parse_args(arguments)
 
-
-def count_groups(groups):
-    return len(list(flatten(groups)))
-
-
-def bounding_box(nodes):
-    coordinates = []
-    for node in flatten(nodes):
-        coordinates.append(tuple(float(value) for value in node.coordinates))
-    if not coordinates:
-        return None
-    return {
-        "x": [min(item[0] for item in coordinates), max(item[0] for item in coordinates)],
-        "y": [min(item[1] for item in coordinates), max(item[1] for item in coordinates)],
-        "z": [min(item[2] for item in coordinates), max(item[2] for item in coordinates)],
-    }
-
-
-def inspect_odb(path):
-    result = {"path": path, "error": ""}
-    odb = None
-    try:
-        odb = openOdb(path, readOnly=True)
-        assembly = odb.rootAssembly
-        step_names = list(odb.steps.keys())
-        field_outputs = set()
-        step_details = []
-        for step_name in step_names:
-            step = odb.steps[step_name]
-            for frame in step.frames:
-                field_outputs.update(frame.fieldOutputs.keys())
-            step_details.append(
-                {
-                    "name": step_name,
-                    "frame_count": len(step.frames),
-                    "end_time": float(step.frames[-1].frameValue) if step.frames else 0.0,
-                }
-            )
-
-        node_names = sorted(assembly.nodeSets.keys())
-        element_names = sorted(assembly.elementSets.keys())
-        details = {}
-        for name in sorted(set(node_names + element_names)):
-            node_set = assembly.nodeSets.get(name)
-            element_set = assembly.elementSets.get(name)
-            details[name] = {
-                "node_count": count_groups(node_set.nodes) if node_set is not None else 0,
-                "element_count": count_groups(element_set.elements)
-                if element_set is not None
-                else 0,
-                "bbox": bounding_box(node_set.nodes) if node_set is not None else None,
-            }
-
-        instance_details = {}
-        for name, instance in assembly.instances.items():
-            element_types = {}
-            for element in instance.elements:
-                element_types[element.type] = element_types.get(element.type, 0) + 1
-            instance_details[name] = {
-                "nodes": len(instance.nodes),
-                "elements": len(instance.elements),
-                "element_types": element_types,
-            }
-
-        result.update(
-            {
-                "steps": step_names,
-                "step_details": step_details,
-                "field_outputs": sorted(field_outputs),
-                "assembly_node_sets": node_names,
-                "assembly_element_sets": element_names,
-                "set_details": details,
-                "instances": instance_details,
-                "size_bytes": os.path.getsize(path),
-            }
-        )
-    except Exception as exc:
-        result["error"] = repr(exc)
-    finally:
-        if odb is not None:
-            odb.close()
-    return result
-
-
-def parse_args():
-    arguments = sys.argv[1:]
-    if "--" in arguments:
-        arguments = arguments[arguments.index("--") + 1 :]
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--folder", required=True)
-    parser.add_argument("--output", required=True)
-    return parser.parse_args(arguments)
-
-
-def main():
-    args = parse_args()
-    folder = os.path.abspath(args.folder)
+folder = os.path.abspath(args.folder)
+output = os.path.abspath(args.output)
+all_paths = [
+    os.path.join(folder, name)
+    for name in sorted(os.listdir(folder))
+    if name.lower().endswith(".odb") and os.path.isfile(os.path.join(folder, name))
+]
+if args.selection:
+    with open(os.path.abspath(args.selection), "r", encoding="utf-8") as stream:
+        requested = json.load(stream).get("paths", [])
     paths = []
-    for name in sorted(os.listdir(folder)):
-        if name.lower().endswith(".odb"):
-            paths.append(os.path.join(folder, name))
-    report = {
-        "folder": folder,
-        "odb_count": len(paths),
-        "odbs": [inspect_odb(path) for path in paths],
-    }
-    output = os.path.abspath(args.output)
+    folder_key = os.path.normcase(os.path.normpath(folder))
+    for value in requested:
+        path = os.path.abspath(value)
+        if (
+            os.path.normcase(os.path.normpath(os.path.dirname(path))) == folder_key
+            and path.lower().endswith(".odb")
+            and os.path.isfile(path)
+            and path not in paths
+        ):
+            paths.append(path)
+else:
+    paths = all_paths
+
+report = {
+    "folder": folder,
+    "discovered_count": len(all_paths),
+    "odb_count": len(paths),
+    "completed_count": 0,
+    "cancelled": False,
+    "selected_paths": paths,
+    "odbs": [],
+}
+
+
+def publish(message):
+    print(message)
+    sys.stdout.flush()
+
+
+def save_partial():
     directory = os.path.dirname(output)
     if directory and not os.path.isdir(directory):
         os.makedirs(directory)
-    with open(output, "w", encoding="utf-8") as stream:
+    temporary = output + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as stream:
         json.dump(report, stream, ensure_ascii=False, indent=2)
-    print(json.dumps({"output": output, "odb_count": len(paths)}))
+    if os.path.isfile(output):
+        os.remove(output)
+    os.rename(temporary, output)
 
 
-if __name__ == "__main__":
-    main()
+publish("SCAN_DISCOVERED|{0}".format(len(paths)))
+save_partial()
+for index, path in enumerate(paths, 1):
+    publish("SCAN_START|{0}|{1}|{2}".format(index, len(paths), os.path.basename(path)))
+    report["odbs"].append(namespace["inspect_odb"](path))
+    report["completed_count"] = index
+    save_partial()
+    publish("SCAN_DONE|{0}|{1}|{2}".format(index, len(paths), os.path.basename(path)))
+
+publish("SCAN_FINISHED|{0}|{1}".format(len(paths), len(paths)))
+print(json.dumps({"output": output, "odb_count": len(paths)}, ensure_ascii=False))
 

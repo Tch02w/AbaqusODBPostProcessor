@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Iterable
 
 from .config import abaqus_script
-from .runner_selection_base import *
-from .runner_selection_base import ProcessCancelled, ProcessController, run_process
+from .process_runner import *
+from .process_runner import ProcessCancelled, ProcessController, run_process
 
 
 def scan_folder(
@@ -22,7 +22,7 @@ def scan_folder(
     arguments = [
         abaqus_command,
         "python",
-        str(abaqus_script("scan_odb_fixed.py")),
+        str(abaqus_script("scan_odb.py")),
         "--folder",
         str(odb_folder),
         "--output",

@@ -22,8 +22,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from . import app_groups_v1_base as _base
-from .config import project_root
+from . import batch_window as _base
+from .paths import scan_cache_dir
 from .runner import ProcessController, scan_folder
 
 
@@ -118,7 +118,7 @@ class OdbSelectionDialog(QDialog):
 class MainWindow(_base.MainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Abaqus ODB PostProcessor 0.5")
+        self.setWindowTitle("Abaqus ODB PostProcessor 0.6")
         self.scan_button.setText("发现并选择 ODB")
 
     def _set_busy(self, busy: bool) -> None:
@@ -154,7 +154,7 @@ class MainWindow(_base.MainWindow):
         self.scan_progress.setRange(0, max(len(selected_paths), 1))
         self.scan_progress.setValue(0)
         self.elapsed_timer.start(1000)
-        cache = project_root() / "scan_cache"
+        cache = scan_cache_dir()
         self._append_log(
             f"文件发现完成：共 {len(paths)} 个 ODB；本次选择 {len(selected_paths)} 个"
         )

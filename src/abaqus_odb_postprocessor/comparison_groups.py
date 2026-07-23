@@ -14,9 +14,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
+    QDialogButtonBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -26,6 +28,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QTabBar,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -50,6 +54,82 @@ from .runner import (
 def safe_folder_name(value: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*]+', "_", value).strip(" .")
     return cleaned or "未命名组"
+
+
+class GroupNameTable(QTableWidget):
+    """Single-column name editor that grows for typing and large pastes."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(10, 1, parent)
+        self.setHorizontalHeaderLabels(["对比组名称"])
+        self.horizontalHeader().setStretchLastSection(True)
+        self.verticalHeader().setDefaultSectionSize(30)
+        self.cellChanged.connect(self._ensure_trailing_row)
+
+    def _ensure_trailing_row(self, *_args) -> None:
+        if self.rowCount() == 0:
+            self.setRowCount(1)
+            return
+        item = self.item(self.rowCount() - 1, 0)
+        if item is not None and item.text().strip():
+            self.setRowCount(self.rowCount() + 1)
+
+    def paste_names(self, text: str, start_row: int | None = None) -> None:
+        lines = text.splitlines()
+        if not lines:
+            return
+        row = self.currentRow() if start_row is None else int(start_row)
+        row = max(row, 0)
+        required = row + len(lines)
+        if required > self.rowCount():
+            self.setRowCount(required)
+        self.blockSignals(True)
+        try:
+            for offset, line in enumerate(lines):
+                name = line.split("\t", 1)[0].strip()
+                self.setItem(row + offset, 0, QTableWidgetItem(name))
+        finally:
+            self.blockSignals(False)
+        self._ensure_trailing_row()
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.Paste):
+            self.paste_names(QApplication.clipboard().text())
+            return
+        super().keyPressEvent(event)
+
+    def names(self) -> list[str]:
+        return [
+            self.item(row, 0).text().strip()
+            for row in range(self.rowCount())
+            if self.item(row, 0) is not None
+            and self.item(row, 0).text().strip()
+        ]
+
+
+class BatchGroupDialog(QDialog):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("批量新建对比组")
+        self.resize(520, 520)
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "每行填写一个组名。可从 Excel 或文本粘贴单列名称；"
+            "行数会自动扩展。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.name_table = GroupNameTable(self)
+        layout.addWidget(self.name_table, 1)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def names(self) -> list[str]:
+        return self.name_table.names()
 
 
 class MainWindow(_previous.MainWindow):
@@ -166,6 +246,9 @@ class MainWindow(_previous.MainWindow):
         self.create_group_button = QPushButton("新建对比组")
         self.create_group_button.clicked.connect(self._create_group)
         tabs_layout.addWidget(self.create_group_button)
+        self.batch_create_group_button = QPushButton("批量新建")
+        self.batch_create_group_button.clicked.connect(self._create_groups_batch)
+        tabs_layout.addWidget(self.batch_create_group_button)
         right_layout.addWidget(self.tabs_header)
         self.table.odbPathsDropped.connect(self._drop_paths_into_current_group)
         right_layout.addWidget(self.table, 1)
@@ -596,6 +679,7 @@ class MainWindow(_previous.MainWindow):
         )
         menu = QMenu(self)
         create_action = menu.addAction("新建对比组")
+        batch_create_action = menu.addAction("批量新建对比组…")
         rename_action = legend_action = delete_action = None
         if group_id in self.groups:
             menu.addSeparator()
@@ -605,6 +689,8 @@ class MainWindow(_previous.MainWindow):
         chosen = menu.exec(self.group_tabs.mapToGlobal(position))
         if chosen is create_action:
             self._create_group()
+        elif chosen is batch_create_action:
+            self._create_groups_batch()
         elif chosen is rename_action:
             self._rename_group(group_id)
         elif chosen is legend_action:
@@ -651,6 +737,63 @@ class MainWindow(_previous.MainWindow):
         self.groups[group_id] = {"name": name, "members": [], "legend_overrides": {}}
         self._rebuild_tree(group_id)
         self._save_state()
+
+    def _create_groups_batch(self) -> None:
+        dialog = BatchGroupDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._create_groups_from_names(dialog.names())
+
+    def _create_groups_from_names(self, names: list[str]) -> list[str]:
+        existing = {
+            str(group["name"]).strip().casefold() for group in self.groups.values()
+        }
+        accepted_names: list[str] = []
+        accepted_keys: set[str] = set()
+        duplicates: list[str] = []
+        for raw_name in names:
+            name = str(raw_name).strip()
+            if not name:
+                continue
+            key = name.casefold()
+            if key in existing or key in accepted_keys:
+                duplicates.append(name)
+                continue
+            accepted_names.append(name)
+            accepted_keys.add(key)
+
+        if duplicates:
+            shown = "、".join(duplicates[:8])
+            if len(duplicates) > 8:
+                shown += f" 等 {len(duplicates)} 项"
+            answer = QMessageBox.question(
+                self,
+                "存在重复组名",
+                f"以下名称与现有组或本批其他名称重复：\n{shown}\n\n"
+                "继续将忽略重复名称；取消可返回修改。",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Yes:
+                return []
+        if not accepted_names:
+            QMessageBox.information(
+                self, "没有可创建的组", "没有找到非空且不重复的组名。"
+            )
+            return []
+
+        created_ids: list[str] = []
+        for name in accepted_names:
+            group_id = uuid.uuid4().hex
+            self.groups[group_id] = {
+                "name": name,
+                "members": [],
+                "legend_overrides": {},
+            }
+            created_ids.append(group_id)
+        self._rebuild_tree(created_ids[0])
+        self._save_state()
+        return created_ids
 
     def _rename_group(self, group_id: str) -> None:
         group = self.groups.get(group_id)

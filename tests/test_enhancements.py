@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, Qt
@@ -161,7 +163,7 @@ def test_condition_categories_are_browse_only_and_real_groups_are_preserved(
     assert [
         first_row["direction"].itemText(index)
         for index in range(first_row["direction"].count())
-    ] == ["X方向", "Z方向", "XZ方向", "自动"]
+    ] == ["X方向", "Z方向", "XZ方向", "自动（XZ方向）"]
     window.close()
 
 
@@ -213,4 +215,33 @@ def test_manual_direction_and_diameter_are_persisted(tmp_path: Path) -> None:
     assert saved["direction"] == "X方向"
     assert saved["diameter_manual"] is True
     assert window._job_payload(row, tmp_path)["load_direction"] == "1"
+    window.close()
+
+
+def test_unrecognized_direction_requires_manual_selection(tmp_path: Path) -> None:
+    application()
+    window = MainWindow()
+    window.state_path = tmp_path / "project_state.json"
+    folder = tmp_path / "odb"
+    folder.mkdir()
+    item = make_scan(folder / "unknown-model.odb")
+    window._load_folder_state(str(folder))
+    window._populate([item])
+    row = window.rows_by_path[str(item.path.resolve())]
+    assert row["direction"].currentText() == "（未识别）"
+    with pytest.raises(ValueError, match="加载方向未识别"):
+        window._job_payload(row, tmp_path)
+    row["direction"].setCurrentText("Z方向")
+    assert window._job_payload(row, tmp_path)["load_direction"] == "3"
+    window.close()
+
+
+def test_window_title_shows_only_valid_odb_root(tmp_path: Path) -> None:
+    application()
+    window = MainWindow()
+    window.folder_edit.setText(str(tmp_path))
+    assert str(tmp_path.resolve()) in window.windowTitle()
+    assert "0.8" in window.windowTitle()
+    window.folder_edit.setText(str(tmp_path / "missing"))
+    assert str(tmp_path.resolve()) not in window.windowTitle()
     window.close()

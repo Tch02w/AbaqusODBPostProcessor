@@ -33,7 +33,8 @@ def test_odb_selection_dialog(tmp_path: Path) -> None:
     paths = [tmp_path / "A.odb", tmp_path / "B.odb"]
     for path in paths:
         path.write_bytes(b"placeholder")
-    dialog = OdbSelectionDialog(tmp_path, paths)
+    dialog = OdbSelectionDialog(tmp_path, paths, parallel_workers=3)
+    assert dialog.parallel_workers == 3
     assert dialog.selected_paths() == [path.resolve() for path in paths]
     dialog._set_all(Qt.Unchecked)
     assert dialog.selected_paths() == []
@@ -42,6 +43,30 @@ def test_odb_selection_dialog(tmp_path: Path) -> None:
     dialog.search_edit.setText("A.odb")
     assert not dialog.list_widget.item(0).isHidden()
     assert dialog.list_widget.item(1).isHidden()
+    dialog.close()
+
+
+def test_closing_active_upgrade_does_not_cancel_pending_tasks(
+    tmp_path: Path,
+) -> None:
+    application()
+    source = tmp_path / "old.odb"
+    source.write_bytes(b"old")
+    dialog = OdbSelectionDialog(tmp_path, [source])
+
+    class RunningWorker:
+        @staticmethod
+        def isRunning() -> bool:
+            return True
+
+    controller = runner_module.UpgradeBatchController()
+    dialog.compatibility_worker = RunningWorker()
+    dialog.compatibility_controller = controller
+    dialog.compatibility_operation = "upgrade"
+    dialog.reject()
+    assert not controller.stop_requested
+    assert "等待" in dialog.compatibility_status.text()
+    dialog.compatibility_worker = None
     dialog.close()
 
 

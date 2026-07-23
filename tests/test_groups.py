@@ -6,9 +6,10 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from abaqus_odb_postprocessor.app import MainWindow, safe_folder_name
+from abaqus_odb_postprocessor.comparison_groups import GroupNameTable
 from abaqus_odb_postprocessor.models import OdbScan
 
 
@@ -126,7 +127,7 @@ def test_safe_folder_name() -> None:
     assert safe_folder_name('组:A/B*?') == "组_A_B_"
 
 
-def test_group_tabs_reorder_persist_and_fifo_snapshots_are_frozen(
+def test_group_tabs_reorder_persist_and_fifo_snapshots_freeze_on_activation(
     tmp_path: Path, monkeypatch
 ) -> None:
     application()
@@ -134,14 +135,14 @@ def test_group_tabs_reorder_persist_and_fifo_snapshots_are_frozen(
     window.state_path = tmp_path / "project_state.json"
     folder = tmp_path / "odb"
     folder.mkdir()
-    first = scan(folder / "GJA-2.odb")
-    second = scan(folder / "GJA-10.odb")
+    first = scan(folder / "GJA-2_U40D_V20D.odb")
+    second = scan(folder / "GJA-10_U40D_V20D.odb")
     window._load_folder_state(str(folder))
     window._populate([first, second])
     all_root = window.group_tree.topLevelItem(0)
     assert [all_root.child(index).text(0) for index in range(2)] == [
-        "GJA-2.odb",
-        "GJA-10.odb",
+        "GJA-2_U40D_V20D.odb",
+        "GJA-10_U40D_V20D.odb",
     ]
     first_path = str(first.path.resolve())
     second_path = str(second.path.resolve())
@@ -173,21 +174,17 @@ def test_group_tabs_reorder_persist_and_fifo_snapshots_are_frozen(
     assert [item["id"] for item in window.group_queue] == ["b", "a"]
     assert all(item["force_rescan"] for item in window.group_queue)
     assert not window.force_rescan_checkbox.isChecked()
-    assert (
-        window.group_queue[0]["snapshots"][second_path]["load_direction"]
-        == "1+3"
-    )
+    assert set(window.group_queue[0]) == {"id", "force_rescan"}
 
     row = window.rows_by_path[second_path]
     row["direction"].setCurrentText("X方向")
-    window.groups["b"]["name"] = "后来修改"
-    assert (
-        window.group_queue[0]["snapshots"][second_path]["load_direction"]
-        == "1+3"
-    )
-    assert window.group_queue[0]["name"] == "组B"
+    frozen, reason = window._freeze_group_task(window.group_queue.pop(0))
+    assert reason == ""
+    assert frozen is not None
+    assert frozen["snapshots"][second_path]["load_direction"] == "1"
+    assert frozen["name"] == "组B"
 
-    window.active_group_task = window.group_queue.pop(0)
+    window.active_group_task = frozen
     window._refresh_queue_ui()
     assert window.group_tabs.tabText(1) == "组B（运行中）"
     assert window.group_tabs.tabText(2) == "组A（排队 1）"
@@ -203,4 +200,126 @@ def test_group_tabs_reorder_persist_and_fifo_snapshots_are_frozen(
     window._save_state()
     saved = json.loads(window.state_path.read_text(encoding="utf-8"))
     assert saved["folders"][str(folder.resolve())]["group_order"] == ["b", "a"]
+    window.close()
+
+
+def test_group_name_table_grows_for_typing_and_large_paste() -> None:
+    application()
+    table = GroupNameTable()
+    assert table.rowCount() == 10
+    table.paste_names(
+        "\n".join(f"组{index}\t忽略说明" for index in range(15)),
+        start_row=0,
+    )
+    assert table.rowCount() == 16
+    assert table.names() == [f"组{index}" for index in range(15)]
+    table.close()
+
+
+def test_batch_group_creation_ignores_duplicates_after_confirmation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application()
+    window = MainWindow()
+    window.state_path = tmp_path / "project_state.json"
+    window.groups = {
+        "existing": {
+            "name": "已有组",
+            "members": [],
+            "legend_overrides": {},
+        }
+    }
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *_args, **_kwargs: QMessageBox.Yes
+    )
+    created = window._create_groups_from_names(
+        ["  新组1  ", "已有组", "新组2", "新组1", ""]
+    )
+    assert [window.groups[group_id]["name"] for group_id in created] == [
+        "新组1",
+        "新组2",
+    ]
+    assert list(window.groups) == ["existing", *created]
+    assert window.group_tabs.tabData(window.group_tabs.currentIndex()) == created[0]
+    window.close()
+
+
+def test_waiting_group_without_valid_members_is_skipped(
+    tmp_path: Path,
+) -> None:
+    application()
+    window = MainWindow()
+    window.state_path = tmp_path / "project_state.json"
+    folder = tmp_path / "odb"
+    folder.mkdir()
+    item = scan(folder / "GJA-1_U100D.odb")
+    window._load_folder_state(str(folder))
+    window._populate([item])
+    path = str(item.path.resolve())
+    window.groups = {
+        "g": {"name": "待跳过", "members": [path], "legend_overrides": {}}
+    }
+    window.group_queue = [{"id": "g", "force_rescan": False}]
+    window.groups["g"]["members"] = []
+    window._start_next_group()
+    assert window.active_group_task is None
+    assert window.group_queue == []
+    assert "跳过组：待跳过" in window.log.toPlainText()
+    window.close()
+
+
+def test_cancel_all_queued_groups_keeps_active_group(tmp_path: Path) -> None:
+    application()
+    window = MainWindow()
+    window.state_path = tmp_path / "project_state.json"
+    window.groups = {
+        "running": {"name": "运行组", "members": [], "legend_overrides": {}},
+        "a": {"name": "等待A", "members": [], "legend_overrides": {}},
+        "b": {"name": "等待B", "members": [], "legend_overrides": {}},
+    }
+    active = {"id": "running", "name": "运行组"}
+    window.active_group_task = active
+    window.group_queue = [
+        {"id": "a", "force_rescan": False},
+        {"id": "b", "force_rescan": True},
+    ]
+    window._refresh_queue_ui()
+    assert window.cancel_queued_button.isEnabled()
+    window._cancel_queued_groups()
+    assert window.group_queue == []
+    assert window.active_group_task is active
+    assert not window.cancel_queued_button.isEnabled()
+    assert "已取消全部待运行组：等待A、等待B" in window.log.toPlainText()
+    window.active_group_task = None
+    window.close()
+
+
+def test_unrecognized_direction_blocks_group_submission(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application()
+    window = MainWindow()
+    window.state_path = tmp_path / "project_state.json"
+    folder = tmp_path / "odb"
+    folder.mkdir()
+    item = scan(folder / "unknown-model.odb")
+    window._load_folder_state(str(folder))
+    window._populate([item])
+    path = str(item.path.resolve())
+    window.groups = {
+        "g": {"name": "未识别组", "members": [path], "legend_overrides": {}}
+    }
+    window._rebuild_tree("g")
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda _parent, _title, message, *_args, **_kwargs: warnings.append(
+            message
+        ),
+    )
+    window._run_scope("current")
+    assert window.group_queue == []
+    assert warnings
+    assert "unknown-model.odb" in warnings[0]
     window.close()

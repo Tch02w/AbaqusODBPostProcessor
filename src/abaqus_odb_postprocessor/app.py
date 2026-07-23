@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from . import __version__
 from . import batch_window as _base
 from .cache import abaqus_cache_version
 from .config import load_defaults
@@ -35,6 +36,7 @@ from .paths import scan_cache_dir
 from .runner import (
     MultiProcessController,
     ProcessController,
+    UpgradeBatchController,
     check_odb_compatibility,
     scan_folder,
     upgrade_odb_files,
@@ -54,6 +56,7 @@ STATUS_PRESENTATION = {
     "empty": ("空文件", "#b91c1c"),
     "target_exists": ("目标文件已存在", "#b91c1c"),
     "upgrade_failed": ("升级失败", "#b91c1c"),
+    "cancelled": ("已取消", "#64748b"),
 }
 
 
@@ -102,6 +105,7 @@ class OdbSelectionDialog(QDialog):
         abaqus_command: str | None = None,
         local_release: str | None = None,
         force_rescan: bool = False,
+        parallel_workers: int = 1,
     ) -> None:
         super().__init__(parent)
         self.folder = folder.resolve()
@@ -111,6 +115,7 @@ class OdbSelectionDialog(QDialog):
             defaults.get("local_abaqus_release", "2025")
         )
         self.force_rescan = bool(force_rescan)
+        self.parallel_workers = max(1, min(int(parallel_workers), 4))
         self.compatibility_cache_version = abaqus_cache_version(
             {
                 "local_abaqus_release": self.local_release,
@@ -118,7 +123,10 @@ class OdbSelectionDialog(QDialog):
             }
         )
         self.compatibility_worker = None
-        self.compatibility_controller: ProcessController | None = None
+        self.compatibility_controller: (
+            ProcessController | UpgradeBatchController | None
+        ) = None
+        self.compatibility_operation = ""
         self.pending_accept = False
         self.setWindowTitle("选择需要读取的 ODB")
         self.resize(1040, 720)
@@ -308,6 +316,7 @@ class OdbSelectionDialog(QDialog):
 
     def _compatibility_thread_finished(self) -> None:
         self.compatibility_worker = None
+        self.compatibility_operation = ""
         self._update_count()
 
     def _compatibility_log(self, text: str) -> None:
@@ -356,6 +365,7 @@ class OdbSelectionDialog(QDialog):
             QMessageBox.warning(self, "尚未选择 ODB", "请至少勾选一个 ODB 文件。")
             return
         self.pending_accept = accept_when_ready
+        self.compatibility_operation = "check"
         self.compatibility_controller = ProcessController()
         self.compatibility_progress.setRange(0, len(paths))
         self.compatibility_progress.setValue(0)
@@ -431,7 +441,12 @@ class OdbSelectionDialog(QDialog):
 
     def _cancel_compatibility(self) -> None:
         if self.compatibility_controller is not None:
-            self.compatibility_status.setText("正在取消，请稍候…")
+            if self.compatibility_operation == "upgrade":
+                self.compatibility_status.setText(
+                    "已取消后续升级；正在等待已启动的 ODB 安全完成…"
+                )
+            else:
+                self.compatibility_status.setText("正在取消，请稍候…")
             self.compatibility_controller.cancel()
             self.cancel_compatibility_button.setEnabled(False)
 
@@ -462,7 +477,8 @@ class OdbSelectionDialog(QDialog):
             tasks.append(
                 (source, upgrade_target_path(source, self.local_release))
             )
-        self.compatibility_controller = ProcessController()
+        self.compatibility_operation = "upgrade"
+        self.compatibility_controller = UpgradeBatchController()
         self.compatibility_progress.setRange(0, len(tasks))
         self.compatibility_progress.setValue(0)
         self._set_compatibility_busy(True)
@@ -476,6 +492,7 @@ class OdbSelectionDialog(QDialog):
                 self.compatibility_controller,
                 release=self.local_release,
                 abaqus_version=self.compatibility_cache_version,
+                parallel_workers=self.parallel_workers,
             )
         )
         self.compatibility_worker.message.connect(self._compatibility_log)
@@ -493,6 +510,7 @@ class OdbSelectionDialog(QDialog):
         }
         success_count = 0
         failure_count = 0
+        cancelled_count = 0
         for result in payload.get("results", []):
             source_path = str(Path(result["source_path"]).resolve())
             item = items_by_path.get(source_path)
@@ -521,9 +539,21 @@ class OdbSelectionDialog(QDialog):
                     item,
                     "valid",
                     f"已升级到 Abaqus {self.local_release}；"
-                    f"旧版保留为 {backup_path.name}",
+                    f"旧版保留为 {backup_path.name}"
+                    + (
+                        "；缓存失效失败，请强制重新扫描"
+                        if result.get("cache_warning")
+                        else ""
+                    ),
                 )
                 success_count += 1
+            elif status == "cancelled":
+                self._set_item_status(
+                    item,
+                    "upgrade_required",
+                    "本批升级已取消，尚未处理；可再次提交升级。",
+                )
+                cancelled_count += 1
             else:
                 self._set_item_status(
                     item, status, str(result.get("message", "升级失败"))
@@ -531,7 +561,8 @@ class OdbSelectionDialog(QDialog):
                 failure_count += 1
         self._set_compatibility_busy(False)
         self.compatibility_status.setText(
-            f"升级完成：成功 {success_count}，失败 {failure_count}。"
+            f"升级完成：成功 {success_count}，失败 {failure_count}，"
+            f"已取消 {cancelled_count}。"
         )
 
     def _accept_selection(self) -> None:
@@ -573,6 +604,11 @@ class OdbSelectionDialog(QDialog):
             self.compatibility_worker is not None
             and self.compatibility_worker.isRunning()
         ):
+            if self.compatibility_operation == "upgrade":
+                self.compatibility_status.setText(
+                    "ODB 升级尚未结束；请等待已启动任务安全完成。"
+                )
+                return
             self._cancel_compatibility()
             return
         super().reject()
@@ -582,6 +618,12 @@ class OdbSelectionDialog(QDialog):
             self.compatibility_worker is not None
             and self.compatibility_worker.isRunning()
         ):
+            if self.compatibility_operation == "upgrade":
+                self.compatibility_status.setText(
+                    "ODB 升级尚未结束；请等待已启动任务安全完成。"
+                )
+                event.ignore()
+                return
             self._cancel_compatibility()
             event.ignore()
             return
@@ -591,8 +633,16 @@ class OdbSelectionDialog(QDialog):
 class MainWindow(_base.MainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Abaqus ODB PostProcessor 0.8")
+        self.folder_edit.textChanged.connect(self._update_window_title)
+        self._update_window_title(self.folder_edit.text())
         self.scan_button.setText("发现并选择 ODB")
+
+    def _update_window_title(self, folder_text: str = "") -> None:
+        title = f"Abaqus ODB PostProcessor {__version__}"
+        folder = Path(str(folder_text).strip())
+        if folder.is_dir():
+            title += f" — {folder.resolve()}"
+        self.setWindowTitle(title)
 
     def _set_busy(self, busy: bool) -> None:
         super()._set_busy(busy)
@@ -622,6 +672,7 @@ class MainWindow(_base.MainWindow):
             abaqus_command=self.defaults["abaqus_command"],
             local_release=str(self.defaults.get("local_abaqus_release", "2025")),
             force_rescan=bool(self.force_rescan_checkbox.isChecked()),
+            parallel_workers=int(self.parallel_workers.value()),
         )
         if dialog.exec() != QDialog.Accepted:
             return

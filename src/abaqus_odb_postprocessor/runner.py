@@ -5,7 +5,7 @@ import json
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from .cache import (
     CACHE_SCHEMA_VERSION,
@@ -35,6 +35,42 @@ def _load_json_report(path: Path) -> dict:
     if decode_errors:
         raise decode_errors[0]
     raise ValueError(f"无法读取 Abaqus JSON 报告：{path}")
+
+
+class UpgradeBatchController:
+    """Stop scheduling upgrades without terminating an active ODB upgrade."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._processes: set[Any] = set()
+        self._stop_requested = False
+
+    @property
+    def stop_requested(self) -> bool:
+        with self._lock:
+            return self._stop_requested
+
+    @property
+    def cancel_requested(self) -> bool:
+        # ``run_process`` must never treat a safely finishing upgrade as killed.
+        return False
+
+    @property
+    def active_count(self) -> int:
+        with self._lock:
+            return sum(process.poll() is None for process in self._processes)
+
+    def attach(self, process) -> None:
+        with self._lock:
+            self._processes.add(process)
+
+    def detach(self, process) -> None:
+        with self._lock:
+            self._processes.discard(process)
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._stop_requested = True
 
 
 def scan_folder(
@@ -489,11 +525,12 @@ def upgrade_odb_files(
     tasks: Iterable[tuple[Path | str, Path | str]],
     cache_dir: Path,
     log: LogCallback | None = None,
-    controller: ProcessController | None = None,
+    controller: UpgradeBatchController | None = None,
     release: str = "2025",
     abaqus_version: str = "",
+    parallel_workers: int = 1,
 ) -> dict:
-    """Upgrade ODBs in place after validation, retaining ``name-old.odb``."""
+    """Upgrade independent ODBs concurrently while retaining ``name-old.odb``."""
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     serialized_tasks = [
@@ -508,85 +545,211 @@ def upgrade_odb_files(
         for source, backup in tasks
     ]
     if not serialized_tasks:
-        return {"mode": "upgrade", "results": []}
-    for task in serialized_tasks:
-        if not Path(task["source_path"]).is_file():
-            raise FileNotFoundError(f"升级源文件不存在：{task['source_path']}")
-        if Path(task["backup_path"]).exists():
-            raise FileExistsError(
-                f"旧版 ODB 备份已存在，拒绝覆盖：{task['backup_path']}"
-            )
-        if Path(task["temporary_path"]).exists():
-            raise FileExistsError(
-                f"升级临时文件已存在，拒绝覆盖：{task['temporary_path']}"
-            )
-    old_fingerprints = {
-        task["source_path"]: quick_odb_fingerprint(Path(task["source_path"]))
-        for task in serialized_tasks
-    }
-    request_path = cache_dir / "odb_compatibility_upgrade_request.json"
+        return {
+            "mode": "upgrade",
+            "results": [],
+            "completed_count": 0,
+            "cancelled_count": 0,
+        }
+
+    workers = max(1, min(int(parallel_workers), 4, len(serialized_tasks)))
+    work_root = cache_dir / "upgrade_work"
+    work_root.mkdir(parents=True, exist_ok=True)
     output_path = cache_dir / "odb_compatibility_upgrade_report.json"
-    request_path.write_text(
-        json.dumps({"tasks": serialized_tasks}, ensure_ascii=True, indent=2),
-        encoding="utf-8",
-    )
     output_path.unlink(missing_ok=True)
-    run_process(
-        [
-            abaqus_command,
-            "python",
-            str(abaqus_script("odb_compatibility.py")),
-            "--mode",
-            "upgrade",
-            "--request",
-            str(request_path),
-            "--output",
-            str(output_path),
-        ],
-        cache_dir,
-        log,
-        controller,
-    )
-    payload = _load_json_report(output_path)
     version = str(abaqus_version or f"{release}|{abaqus_command}")
     snapshot = {
         "checker": "odb_compatibility",
         "schema_version": CACHE_SCHEMA_VERSION,
     }
     config_hash = stable_config_hash(snapshot)
-    for result in payload.get("results", []):
+    cache_lock = threading.Lock()
+    start_lock = threading.Lock()
+    started_count = 0
+
+    def cancelled_result(task: dict[str, str]) -> dict[str, Any]:
+        return {
+            "source_path": task["source_path"],
+            "upgraded_path": task["upgraded_path"],
+            "backup_path": task["backup_path"],
+            "status": "cancelled",
+            "message": "本批升级已取消，尚未处理",
+        }
+
+    def process_one(
+        task_index: int, task: dict[str, str]
+    ) -> tuple[int, dict[str, Any]]:
+        nonlocal started_count
+        if controller is not None and controller.stop_requested:
+            return task_index, cancelled_result(task)
+
+        with start_lock:
+            started_count += 1
+            start_number = started_count
+        source = Path(task["source_path"])
+        if log:
+            log(
+                f"ODB_UPGRADE_START|{start_number}|{len(serialized_tasks)}|"
+                f"{source.name}"
+            )
+        base_result: dict[str, Any] = {
+            "source_path": task["source_path"],
+            "upgraded_path": task["upgraded_path"],
+            "backup_path": task["backup_path"],
+        }
+        if not source.is_file():
+            return task_index, {
+                **base_result,
+                "status": "missing",
+                "message": "源文件不存在",
+            }
+        if Path(task["backup_path"]).exists():
+            return task_index, {
+                **base_result,
+                "status": "target_exists",
+                "message": "旧版 ODB 备份已存在，拒绝覆盖",
+            }
+        if Path(task["temporary_path"]).exists():
+            return task_index, {
+                **base_result,
+                "status": "target_exists",
+                "message": "升级临时文件已存在，拒绝覆盖",
+            }
+
+        try:
+            old_fingerprint = quick_odb_fingerprint(source)
+            task_key = hashlib.sha256(
+                task["source_path"].encode("utf-8")
+            ).hexdigest()[:12]
+            task_dir = work_root / f"{task_index + 1:04d}_{task_key}"
+            task_dir.mkdir(parents=True, exist_ok=True)
+            request_path = task_dir / "request.json"
+            task_output_path = task_dir / "report.json"
+            request_path.write_text(
+                json.dumps({"tasks": [task]}, ensure_ascii=True, indent=2),
+                encoding="utf-8",
+            )
+            task_output_path.unlink(missing_ok=True)
+
+            def child_log(message: str) -> None:
+                if log and not message.startswith("ODB_UPGRADE_"):
+                    log(f"[{source.name}] {message}")
+
+            run_process(
+                [
+                    abaqus_command,
+                    "python",
+                    str(abaqus_script("odb_compatibility.py")),
+                    "--mode",
+                    "upgrade",
+                    "--request",
+                    str(request_path),
+                    "--output",
+                    str(task_output_path),
+                ],
+                task_dir,
+                child_log,
+                controller,
+            )
+            task_payload = _load_json_report(task_output_path)
+            raw_results = task_payload.get("results", [])
+            if len(raw_results) != 1:
+                raise RuntimeError(f"ODB 升级未返回唯一结果：{source}")
+            result = dict(raw_results[0])
+        except Exception as error:
+            return task_index, {
+                **base_result,
+                "status": "upgrade_failed",
+                "message": str(error),
+            }
+
         if result.get("status") != "upgraded":
-            continue
-        source_key = str(Path(result["source_path"]).resolve())
-        old_fingerprint = old_fingerprints.get(source_key)
-        if old_fingerprint:
-            removed = invalidate_content_fingerprint(cache_dir, old_fingerprint)
+            return task_index, result
+        try:
+            upgraded_path = Path(result["upgraded_path"]).resolve()
+            new_fingerprint = quick_odb_fingerprint(upgraded_path)
+            with cache_lock:
+                removed = invalidate_content_fingerprint(
+                    cache_dir, old_fingerprint
+                )
+                compatibility_result = {
+                    "path": str(upgraded_path),
+                    "status": "valid",
+                    "message": f"已升级到 Abaqus {release}，并通过读取验证",
+                    "size_bytes": upgraded_path.stat().st_size,
+                    "content_fingerprint": new_fingerprint,
+                    **odb_file_metadata(upgraded_path),
+                }
+                save_json_cache(
+                    cache_dir,
+                    "compatibility",
+                    upgraded_path,
+                    new_fingerprint,
+                    version,
+                    compatibility_result,
+                    config_hash=config_hash,
+                    config_snapshot=snapshot,
+                )
             if log:
                 log(
-                    f"CACHE_INVALIDATED|upgrade|{Path(source_key).name}|"
+                    f"CACHE_INVALIDATED|upgrade|{source.name}|"
                     f"{old_fingerprint[:12]}|{len(removed)}"
                 )
-        upgraded_path = Path(result["upgraded_path"]).resolve()
-        new_fingerprint = quick_odb_fingerprint(upgraded_path)
-        compatibility_result = {
-            "path": str(upgraded_path),
-            "status": "valid",
-            "message": f"已升级到 Abaqus {release}，并通过读取验证",
-            "size_bytes": upgraded_path.stat().st_size,
-            "content_fingerprint": new_fingerprint,
-            **odb_file_metadata(upgraded_path),
+            result["old_content_fingerprint"] = old_fingerprint
+            result["content_fingerprint"] = new_fingerprint
+        except Exception as error:
+            result["cache_warning"] = str(error)
+            result["message"] = (
+                f"{result.get('message', '升级完成')}；"
+                "缓存失效失败，请对该 ODB 执行一次强制重新扫描"
+            )
+            if log:
+                log(f"CACHE_INVALIDATE_FAILED|{source.name}|{error}")
+        return task_index, result
+
+    results_by_index: dict[int, dict[str, Any]] = {}
+    with ThreadPoolExecutor(
+        max_workers=workers, thread_name_prefix="odb-upgrade"
+    ) as pool:
+        futures = {
+            pool.submit(process_one, index, task): (index, task)
+            for index, task in enumerate(serialized_tasks)
         }
-        save_json_cache(
-            cache_dir,
-            "compatibility",
-            upgraded_path,
-            new_fingerprint,
-            version,
-            compatibility_result,
-            config_hash=config_hash,
-            config_snapshot=snapshot,
-        )
-        result["old_content_fingerprint"] = old_fingerprint
-        result["content_fingerprint"] = new_fingerprint
+        for completed, future in enumerate(as_completed(futures), 1):
+            index, task = futures[future]
+            try:
+                result_index, result = future.result()
+            except Exception as error:
+                result_index = index
+                result = {
+                    "source_path": task["source_path"],
+                    "upgraded_path": task["upgraded_path"],
+                    "backup_path": task["backup_path"],
+                    "status": "upgrade_failed",
+                    "message": str(error),
+                }
+            results_by_index[result_index] = result
+            if log:
+                log(
+                    f"ODB_UPGRADE_DONE|{completed}|{len(serialized_tasks)}|"
+                    f"{result.get('status', 'upgrade_failed')}|"
+                    f"{Path(task['source_path']).name}"
+                )
+
+    ordered = [
+        results_by_index.get(index, cancelled_result(task))
+        for index, task in enumerate(serialized_tasks)
+    ]
+    payload = {
+        "mode": "upgrade",
+        "results": ordered,
+        "parallel_workers": workers,
+        "completed_count": sum(
+            result.get("status") != "cancelled" for result in ordered
+        ),
+        "cancelled_count": sum(
+            result.get("status") == "cancelled" for result in ordered
+        ),
+    }
     save_json(output_path, payload)
     return payload

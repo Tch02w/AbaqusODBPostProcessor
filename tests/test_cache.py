@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from abaqus_odb_postprocessor import runner as runner_module
@@ -317,6 +318,83 @@ def test_upgrade_invalidates_old_initial_cache_and_caches_new_compatibility(
     )
     assert cached is not None
     assert cached["status"] == "valid"
+
+
+def test_parallel_upgrade_cancel_stops_pending_but_finishes_active(
+    tmp_path: Path, monkeypatch
+) -> None:
+    sources = [tmp_path / f"model-{index}.odb" for index in range(5)]
+    for index, source in enumerate(sources):
+        source.write_bytes(f"old-{index}".encode("ascii"))
+    controller = runner_module.UpgradeBatchController()
+    started = 0
+    started_lock = threading.Lock()
+    two_started = threading.Event()
+    release_active = threading.Event()
+
+    def fake_run_process(arguments, _cwd, log=None, controller=None):
+        nonlocal started
+        request_path = Path(arguments[arguments.index("--request") + 1])
+        output_path = Path(arguments[arguments.index("--output") + 1])
+        task = runner_module._load_json_report(request_path)["tasks"][0]
+        with started_lock:
+            started += 1
+            if started == 2:
+                two_started.set()
+        assert release_active.wait(timeout=5)
+        source = Path(task["source_path"])
+        source.write_bytes(source.read_bytes() + b"-upgraded")
+        runner_module.save_json(
+            output_path,
+            {
+                "mode": "upgrade",
+                "results": [
+                    {
+                        "source_path": task["source_path"],
+                        "upgraded_path": task["upgraded_path"],
+                        "backup_path": task["backup_path"],
+                        "status": "upgraded",
+                        "message": "ok",
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setattr(runner_module, "run_process", fake_run_process)
+    holder: dict[str, dict] = {}
+
+    def run_upgrade() -> None:
+        holder["payload"] = runner_module.upgrade_odb_files(
+            "abaqus",
+            [
+                (source, source.with_name(f"{source.stem}-old.odb"))
+                for source in sources
+            ],
+            tmp_path / "cache",
+            controller=controller,
+            parallel_workers=2,
+            abaqus_version="2025|abaqus",
+        )
+
+    thread = threading.Thread(target=run_upgrade)
+    thread.start()
+    assert two_started.wait(timeout=5)
+    controller.cancel()
+    release_active.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+
+    payload = holder["payload"]
+    assert started == 2
+    assert payload["parallel_workers"] == 2
+    assert payload["completed_count"] == 2
+    assert payload["cancelled_count"] == 3
+    assert [result["status"] for result in payload["results"]].count(
+        "upgraded"
+    ) == 2
+    assert [result["status"] for result in payload["results"]].count(
+        "cancelled"
+    ) == 3
 
 
 def test_numeric_cache_hash_excludes_render_only_settings() -> None:

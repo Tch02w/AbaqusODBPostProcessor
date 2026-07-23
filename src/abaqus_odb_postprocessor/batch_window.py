@@ -44,7 +44,7 @@ from .legends import (
     aggregate_group_ranges,
     choose_sequences,
 )
-from .naming import OdbNameInfo, parse_odb_name
+from .naming import OdbNameInfo, natural_sort_key, parse_odb_name
 from .postprocess import finalize_output
 from .paths import batch_temp_dir, result_root_for_odb, scan_cache_dir
 from .result_browser import ResultBrowserDialog, RESULT_ROOT_NAME
@@ -58,6 +58,7 @@ from .runner_parallel import (
 
 
 AUTO_DIRECTION = "自动"
+UNRECOGNIZED_DIRECTION = "（未识别）"
 DIRECTION_LABEL_TO_ABAQUS = {
     "X方向": "1",
     "Z方向": "3",
@@ -66,6 +67,13 @@ DIRECTION_LABEL_TO_ABAQUS = {
 DIRECTION_ABAQUS_TO_LABEL = {
     value: label for label, value in DIRECTION_LABEL_TO_ABAQUS.items()
 }
+
+
+def automatic_direction_label(info: OdbNameInfo) -> str:
+    detected = DIRECTION_ABAQUS_TO_LABEL.get(str(info.load_direction or ""))
+    if detected:
+        return f"自动（{detected}）"
+    return UNRECOGNIZED_DIRECTION
 
 
 class MainWindow(_base.MainWindow):
@@ -135,6 +143,16 @@ class MainWindow(_base.MainWindow):
         self.cancel_run_button.setEnabled(False)
         self.cancel_run_button.clicked.connect(self._cancel_run)
         option_layout.insertWidget(option_layout.count() - 2, self.cancel_run_button)
+        self.cancel_queued_button = QPushButton("取消全部排队")
+        self.cancel_queued_button.setProperty("danger", True)
+        self.cancel_queued_button.setEnabled(False)
+        self.cancel_queued_button.setToolTip(
+            "清空所有尚未开始的对比组；当前运行组继续执行。"
+        )
+        self.cancel_queued_button.clicked.connect(self._cancel_queued_groups)
+        option_layout.insertWidget(
+            option_layout.count() - 2, self.cancel_queued_button
+        )
         self.result_browser_button = QPushButton("结果浏览器")
         self.result_browser_button.setObjectName("resultBrowserButton")
         self.result_browser_button.setAccessibleName("打开结果浏览器")
@@ -350,17 +368,23 @@ class MainWindow(_base.MainWindow):
 
     def _restore_row(self, row: dict[str, Any], values: dict[str, Any]) -> None:
         info = self._name_info(row)
+        automatic_label = automatic_direction_label(info)
         direction = row["direction"]
         direction.blockSignals(True)
         direction.clear()
         direction.addItems(
-            ["X方向", "Z方向", "XZ方向", AUTO_DIRECTION]
+            ["X方向", "Z方向", "XZ方向", automatic_label]
         )
-        direction.setCurrentText(AUTO_DIRECTION)
+        direction.setCurrentText(automatic_label)
         direction.blockSignals(False)
-        detected = info.load_direction or "未识别"
+        detected = (
+            DIRECTION_ABAQUS_TO_LABEL.get(info.load_direction, "未识别")
+            if info.load_direction
+            else "未识别"
+        )
         direction.setToolTip(
-            f"文件名识别：工况={info.condition or '未识别'}；Abaqus 加载方向={detected}。可手动覆盖。"
+            f"文件名识别：工况={info.condition or '未识别'}；"
+            f"加载方向={detected}。可手动覆盖。"
         )
         if info.rebar_diameter_mm is not None:
             row["diameter"].setValue(info.rebar_diameter_mm)
@@ -372,8 +396,8 @@ class MainWindow(_base.MainWindow):
         saved_direction = str(adjusted.get("direction", ""))
         if saved_direction in DIRECTION_ABAQUS_TO_LABEL:
             adjusted["direction"] = DIRECTION_ABAQUS_TO_LABEL[saved_direction]
-        elif saved_direction == "自动（文件名）":
-            adjusted["direction"] = AUTO_DIRECTION
+        elif saved_direction == AUTO_DIRECTION or saved_direction.startswith("自动（"):
+            adjusted["direction"] = automatic_label
         if not bool(adjusted.get("direction_manual", False)):
             adjusted.pop("direction", None)
         if not bool(adjusted.get("diameter_manual", False)):
@@ -385,7 +409,9 @@ class MainWindow(_base.MainWindow):
         info = self._name_info(row)
         payload.update(
             {
-                "direction_manual": row["direction"].currentText() != AUTO_DIRECTION,
+                "direction_manual": (
+                    row["direction"].currentText() in DIRECTION_LABEL_TO_ABAQUS
+                ),
                 "diameter_manual": (
                     info.rebar_diameter_mm is None
                     or abs(row["diameter"].value() - info.rebar_diameter_mm) > 1.0e-9
@@ -406,17 +432,21 @@ class MainWindow(_base.MainWindow):
         settings["image_height"] = int(self.image_height_input.value())
         payload["settings"] = settings
         info = self._name_info(row)
-        automatic = row["direction"].currentText() == AUTO_DIRECTION
-        payload["load_direction"] = (
-            info.load_direction
-            if automatic and info.load_direction
-            else DIRECTION_LABEL_TO_ABAQUS.get(
-                row["direction"].currentText(), "1+3"
+        selected_direction = row["direction"].currentText()
+        automatic = selected_direction == automatic_direction_label(info)
+        if automatic and info.load_direction:
+            payload["load_direction"] = info.load_direction
+        elif selected_direction in DIRECTION_LABEL_TO_ABAQUS:
+            payload["load_direction"] = DIRECTION_LABEL_TO_ABAQUS[
+                selected_direction
+            ]
+        else:
+            raise ValueError(
+                f"{row['scan'].path.name} 的加载方向未识别，请手动选择。"
             )
-        )
         payload.update(
             {
-                "load_direction_source": "filename" if automatic and info.load_direction else "manual",
+                "load_direction_source": "filename" if automatic else "manual",
                 "name_metadata": {
                     "sample_id": info.sample_id,
                     "family": info.family,
@@ -481,6 +511,19 @@ class MainWindow(_base.MainWindow):
         )
         self.batch_controller.cancel()
 
+    def _cancel_queued_groups(self) -> None:
+        if not self.group_queue:
+            return
+        names = [
+            self._queued_task_name(item) for item in self.group_queue
+        ]
+        self.group_queue.clear()
+        self._append_log(
+            f"[{self._timestamp()}] 已取消全部待运行组："
+            f"{'、'.join(names)}"
+        )
+        self._refresh_queue_ui()
+
     def _append_log(self, text: str) -> None:
         if text.startswith("BATCH_PROGRESS|"):
             _, phase, done, total, name = text.split("|", 4)
@@ -494,7 +537,7 @@ class MainWindow(_base.MainWindow):
                 else "无"
             )
             queued = "、".join(
-                str(item["name"]) for item in self.group_queue
+                self._queued_task_name(item) for item in self.group_queue
             ) or "无"
             self.scan_status.setText(
                 f"正在运行：{running}（{phase_label} {done}/{total}：{name}）"
@@ -509,6 +552,15 @@ class MainWindow(_base.MainWindow):
 
     def _has_group_work(self) -> bool:
         return self.active_group_task is not None or bool(self.group_queue)
+
+    def _queued_task_name(self, item: dict[str, Any]) -> str:
+        if item.get("name"):
+            return str(item["name"])
+        group_id = str(item.get("id", ""))
+        if group_id.startswith("standalone::"):
+            return Path(group_id.split("::", 1)[1]).stem
+        group = self.groups.get(group_id)
+        return str(group["name"]) if group else group_id
 
     def _group_is_locked(self, group_id: str) -> bool:
         if (
@@ -529,7 +581,8 @@ class MainWindow(_base.MainWindow):
             for index, item in enumerate(self.group_queue, 1)
         }
         queued_names = {
-            str(item["id"]): str(item["name"]) for item in self.group_queue
+            str(item["id"]): self._queued_task_name(item)
+            for item in self.group_queue
         }
         for index in range(1, self.group_tabs.count()):
             group_id = str(self.group_tabs.tabData(index) or "")
@@ -552,12 +605,15 @@ class MainWindow(_base.MainWindow):
                 index, f"{name}\n{len(group.get('members', []))} 个 ODB"
             )
 
-        queued = "、".join(str(item["name"]) for item in self.group_queue)
+        queued = "、".join(
+            self._queued_task_name(item) for item in self.group_queue
+        )
         if running or queued:
             self.scan_status.setText(
                 f"正在运行：{running or '无'}｜排队：{queued or '无'}"
             )
         self.cancel_run_button.setEnabled(self.active_group_task is not None)
+        self.cancel_queued_button.setEnabled(bool(self.group_queue))
         self.scan_button.setEnabled(
             not self.scan_active and not self._has_group_work()
         )
@@ -587,6 +643,21 @@ class MainWindow(_base.MainWindow):
         super()._activate_standalone(path)
         self._refresh_queue_ui()
 
+    def _unrecognized_directions(
+        self, group_specs: list[dict[str, Any]]
+    ) -> list[str]:
+        problems: list[str] = []
+        for group in group_specs:
+            for path in group["members"]:
+                row = self.rows_by_path.get(path)
+                if (
+                    row is not None
+                    and row["direction"].currentText()
+                    == UNRECOGNIZED_DIRECTION
+                ):
+                    problems.append(f"{group['name']}：{Path(path).name}")
+        return problems
+
     def _run_scope(self, scope: str) -> None:
         self._save_state()
         group_specs = [item for item in self._scope_groups(scope) if item["members"]]
@@ -598,7 +669,7 @@ class MainWindow(_base.MainWindow):
             )
             return
         new_specs = [
-            copy.deepcopy(group)
+            group
             for group in group_specs
             if not self._group_is_locked(str(group["id"]))
         ]
@@ -607,35 +678,100 @@ class MainWindow(_base.MainWindow):
                 self, "已在队列中", "目标组正在运行或已经排队，未重复提交。"
             )
             return
+        unresolved = self._unrecognized_directions(new_specs)
+        if unresolved:
+            shown = "\n".join(unresolved[:12])
+            if len(unresolved) > 12:
+                shown += f"\n……另有 {len(unresolved) - 12} 项"
+            QMessageBox.warning(
+                self,
+                "加载方向未识别",
+                "以下 ODB 无法从文件名识别加载方向，请先手动选择"
+                " X方向、Z方向或 XZ方向：\n\n"
+                f"{shown}\n\n本次未加入运行队列。",
+            )
+            return
         force_rescan = self._consume_force_rescan()
         for group in new_specs:
-            members = [
-                path for path in group["members"] if path in self.rows_by_path
-            ]
+            item = {
+                "id": str(group["id"]),
+                "force_rescan": force_rescan,
+            }
+            self.group_queue.append(item)
+            self._append_log(
+                f"[{self._timestamp()}] 已入队：{group['name']}；"
+                f"ODB={len(group['members'])}；"
+                f"快照=开始运行时冻结；"
+                f"强制预扫描={'是' if force_rescan else '否'}"
+            )
+        self._refresh_queue_ui()
+        self._start_next_group()
+
+    def _freeze_group_task(
+        self, queued_item: dict[str, Any]
+    ) -> tuple[dict[str, Any] | None, str]:
+        group_id = str(queued_item["id"])
+        enabled = {
+            path
+            for path, row in self.rows_by_path.items()
+            if row["enabled"].isChecked()
+        }
+        if group_id.startswith("standalone::"):
+            path = group_id.split("::", 1)[1]
+            members = [path] if path in enabled and path in self.rows_by_path else []
+            plan = {
+                "id": group_id,
+                "name": Path(path).stem,
+                "members": members,
+                "overrides": {},
+                "standalone": True,
+            }
+        else:
+            group = self.groups.get(group_id)
+            if group is None:
+                return None, "对比组已不存在"
+            members = sorted(
+                (
+                    path
+                    for path in group.get("members", [])
+                    if path in enabled and path in self.rows_by_path
+                ),
+                key=lambda value: natural_sort_key(Path(value).name),
+            )
+            plan = {
+                "id": group_id,
+                "name": str(group["name"]),
+                "members": members,
+                "overrides": copy.deepcopy(
+                    group.get("legend_overrides", {})
+                ),
+                "standalone": False,
+            }
+        if not members:
+            return None, "开始运行时没有有效且已启用的 ODB"
+        unresolved = self._unrecognized_directions([plan])
+        if unresolved:
+            names = "、".join(Path(value.split("：", 1)[1]).name for value in unresolved)
+            return None, f"加载方向未识别：{names}"
+        try:
             snapshots = {
                 path: copy.deepcopy(
                     self._job_payload(self.rows_by_path[path], Path("."))
                 )
                 for path in members
             }
-            batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            item = {
-                "id": str(group["id"]),
-                "name": str(group["name"]),
-                "plan": copy.deepcopy(group),
-                "members": list(members),
-                "snapshots": snapshots,
-                "force_rescan": force_rescan,
-                "batch_id": batch_id,
-                "folder_root": str(Path(self.folder_key).resolve()),
-            }
-            self.group_queue.append(item)
-            self._append_log(
-                f"[{self._timestamp()}] 已入队：{item['name']}；"
-                f"ODB={len(members)}；强制预扫描={'是' if force_rescan else '否'}"
-            )
-        self._refresh_queue_ui()
-        self._start_next_group()
+        except ValueError as error:
+            return None, str(error)
+        item = {
+            **queued_item,
+            "name": str(plan["name"]),
+            "plan": plan,
+            "members": list(members),
+            "snapshots": snapshots,
+            "batch_id": datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+            "folder_root": str(Path(self.folder_key).resolve()),
+        }
+        return item, ""
 
     def _start_next_group(self) -> None:
         if (
@@ -644,11 +780,24 @@ class MainWindow(_base.MainWindow):
                 self.group_worker is not None
                 and self.group_worker.isRunning()
             )
-            or not self.group_queue
         ):
             self._refresh_queue_ui()
             return
-        item = self.group_queue.pop(0)
+        item = None
+        while self.group_queue and item is None:
+            queued_item = self.group_queue.pop(0)
+            candidate, reason = self._freeze_group_task(queued_item)
+            if candidate is None:
+                name = self._queued_task_name(queued_item)
+                self._append_log(
+                    f"[{self._timestamp()}] 跳过组：{name}；{reason}"
+                )
+                self.scan_status.setText(f"已跳过：{name}；{reason}")
+                continue
+            item = candidate
+        if item is None:
+            self._refresh_queue_ui()
+            return
         self.active_group_task = item
         self.batch_active = True
         self.batch_total = len(item["members"])
@@ -662,6 +811,7 @@ class MainWindow(_base.MainWindow):
         self.batch_controller = controller
         self._append_log(
             f"[{self._timestamp()}] 开始运行组：{item['name']}；"
+            f"已冻结最新快照；ODB={len(item['members'])}；"
             f"组内并行 worker={workers}"
         )
         self._refresh_queue_ui()
@@ -987,7 +1137,7 @@ class MainWindow(_base.MainWindow):
         )
         self.scan_status.setText(
             f"组完成：{item['name']}｜排队："
-            f"{'、'.join(str(task['name']) for task in self.group_queue) or '无'}"
+            f"{'、'.join(self._queued_task_name(task) for task in self.group_queue) or '无'}"
         )
         self._refresh_queue_ui()
         self._pending_queue_advance = not self._exit_after_cancel
@@ -1008,7 +1158,7 @@ class MainWindow(_base.MainWindow):
             self._append_log(details)
         self.scan_status.setText(
             f"组{state}：{item['name']}｜排队："
-            f"{'、'.join(str(task['name']) for task in self.group_queue) or '无'}"
+            f"{'、'.join(self._queued_task_name(task) for task in self.group_queue) or '无'}"
         )
         self._refresh_queue_ui()
         self._pending_queue_advance = not self._exit_after_cancel

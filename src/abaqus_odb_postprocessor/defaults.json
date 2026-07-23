@@ -1,5 +1,6 @@
 {
   "abaqus_command": "D:\\SIMULIA\\Commands\\abaqus.bat",
+  "local_abaqus_release": "2025",
   "default_odb_folder": "G:\\Job\\GJA_ODB",
   "default_load_set": "SET-LOAD",
   "default_pile_set": "SET-PILE",
@@ -13,6 +14,9 @@
   "default_cf_steel_set": "SETPILESTEEL",
   "animation_fps": 5,
   "parallel_odb_workers": 2,
+  "image_size_unit": "px",
+  "image_width": 1500,
+  "image_height": 1000,
   "axial_cut_count": 100,
   "pile_head_above_ground_mm": 500.0,
   "longitudinal_orientation_threshold": 0.95,

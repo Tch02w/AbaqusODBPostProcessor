@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .postprocess_core import *  # noqa: F401,F403
 from .postprocess_core import (
-    build_gifs, build_xlsx, normalize_white_backgrounds, plot_pile_axial,
+    build_gifs, build_transparent_backgrounds, build_xlsx, plot_pile_axial,
     plot_pile_bending, read_csv, write_csv, interpolate_components,
 )
 
@@ -91,7 +91,8 @@ def build_pile_force_moment(output_dir: Path) -> tuple[Path | None, Path | None]
 
 def finalize_output(output_dir: Path, fps: int = 5) -> dict:
     moment_csv, maxima_csv = build_pile_force_moment(output_dir)
-    manifest = {"normalized_png_count": normalize_white_backgrounds(output_dir),
+    manifest = {"transparent_png_count": build_transparent_backgrounds(output_dir),
+        "original_pngs_preserved": True,
         "animations": build_gifs(output_dir, fps), "pile_axial_plot": str(plot_pile_axial(output_dir) or ""),
         "pile_bending_plots": [str(path) for path in plot_pile_bending(output_dir)],
         "pile_force_moment_csv": str(moment_csv or ""), "pile_bending_maxima_csv": str(maxima_csv or ""),

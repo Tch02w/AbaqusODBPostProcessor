@@ -18,19 +18,32 @@ with open(v5_path, "r", encoding="utf-8") as stream:
 
 loader = loader.replace("extract_job_compatibility.py", "extract_job_frame_compatibility.py")
 injection = r'''
-# Preserve canonical indices, then reduce every extracted dataset and cloud to
-# the increments selected in the GUI.
+# Preserve the complete time history.  GUI frame selection only limits
+# expensive section/FreeBody and longitudinal-rebar numeric processing.
+# Load-point history and every contour animation retain all canonical frames.
 source = source.replace(
     'timeline_headers = [\n',
     'full_timeline = list(timeline)\n'
     'frame_mode = str(config.get("frame_mode", "all"))\n'
     'requested_sequences = config.get("selected_sequence_indices")\n'
+    'selected_timeline = list(full_timeline)\n'
     'if requested_sequences is not None:\n'
     '    requested_sequences = set(int(value) for value in requested_sequences)\n'
-    '    timeline = [item for item in timeline if item["SequenceIndex"] in requested_sequences]\n'
-    'if not timeline:\n'
+    '    selected_timeline = [item for item in full_timeline if item["SequenceIndex"] in requested_sequences]\n'
+    'if not selected_timeline:\n'
     '    raise RuntimeError("Frame selection produced no timeline points")\n\n'
     'timeline_headers = [\n',
+)
+
+source = source.replace(
+    'rebar_region = assembly.elementSets[rebar_set_name]\n',
+    'write_csv(\n'
+    '    os.path.join(data_dir, "selected_timeline_alignment.csv"),\n'
+    '    timeline_headers,\n'
+    '    [{name: item[name] for name in timeline_headers} for item in selected_timeline],\n'
+    ')\n'
+    'timeline = selected_timeline\n\n'
+    'rebar_region = assembly.elementSets[rebar_set_name]\n',
 )
 
 source = source.replace(
@@ -53,16 +66,30 @@ source = source.replace(
 )
 
 source = source.replace(
+    '    written = []\n'
+    '    for animation_index, item in enumerate(timeline):\n',
+    '    written = []\n'
+    '    render_timeline = full_timeline\n'
+    '    for animation_index, item in enumerate(render_timeline):\n',
+)
+
+source = source.replace(
     '    "timeline_points": len(timeline),\n',
     '    "timeline_points": len(timeline),\n'
     '    "canonical_timeline_points": len(full_timeline),\n'
+    '    "load_timehistory_points": len(full_timeline),\n'
+    '    "selected_processing_points": len(timeline),\n'
     '    "frame_mode": frame_mode,\n'
     '    "selected_sequence_indices": [item["SequenceIndex"] for item in timeline],\n',
 )
 
 for frame_marker in (
     'full_timeline = list(timeline)',
+    'selected_timeline = [item for item in full_timeline',
+    'selected_timeline_alignment.csv',
     'frame_mode in ("auto", "manual")',
+    'render_timeline = full_timeline',
+    '"load_timehistory_points": len(full_timeline)',
     '"canonical_timeline_points": len(full_timeline)',
 ):
     if frame_marker not in source:

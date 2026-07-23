@@ -7,19 +7,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QThread, Qt, Signal
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
-    QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
+    QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
+    QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QTableWidget,
+    QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from .config import load_defaults, save_json
+from .group_ui import GroupDropTable
 from .paths import result_root_for_odb, scan_cache_dir
 from .legends import aggregate_group_ranges, choose_sequences
 from .models import OdbScan, choose_name
 from .postprocess import finalize_output
 from .runner import run_job, scan_field_ranges, scan_folder
+from .ui_style import configure_main_window
 
 
 FRAME_MODE_LABELS = {
@@ -53,31 +56,67 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.defaults = load_defaults(); self.row_widgets: list[dict[str, Any]] = []; self.worker = None
         self.setWindowTitle("Abaqus ODB PostProcessor 0.2")
-        self.resize(1900, 920); self._build_ui()
+        configure_main_window(self)
+        self._build_ui()
 
     def _build_ui(self) -> None:
         central = QWidget(); self.setCentralWidget(central); layout = QVBoxLayout(central)
-        folder_row = QHBoxLayout(); folder_row.addWidget(QLabel("ODB 文件夹"))
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(10)
+
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(8)
+        folder_label = QLabel("ODB 文件夹")
+        folder_label.setProperty("role", "title")
+        folder_row.addWidget(folder_label)
         self.folder_edit = QLineEdit(self.defaults["default_odb_folder"]); folder_row.addWidget(self.folder_edit, 1)
-        browse = QPushButton("浏览"); browse.clicked.connect(self._browse_folder); folder_row.addWidget(browse)
+        self.folder_edit.setClearButtonEnabled(True)
+        self.folder_edit.setToolTip("包含待处理 .odb 文件的文件夹")
+        browse = QPushButton("浏览…"); browse.clicked.connect(self._browse_folder); folder_row.addWidget(browse)
         self.scan_button = QPushButton("扫描 ODB"); self.scan_button.clicked.connect(self._scan); folder_row.addWidget(self.scan_button)
+        self.scan_button.setProperty("primary", True)
         layout.addLayout(folder_row)
 
         option_row = QHBoxLayout()
-        self.full_timehistory = QCheckBox("全部帧均做 100 个 FreeBodyCut（非常慢）")
+        option_row.setSpacing(8)
+        self.full_timehistory = QCheckBox("全部帧执行 FreeBodyCut（耗时较长）")
         self.full_timehistory.setChecked(bool(self.defaults["full_timehistory_freebody"])); option_row.addWidget(self.full_timehistory)
-        option_row.addWidget(QLabel("自动/手动模式只对选中帧做 FreeBody；全部帧模式默认仍只做末帧与断裂前帧。"))
+        self.full_timehistory.setToolTip(
+            "关闭时只计算选中的关键帧；开启后才对全部时程帧执行 100 个 FreeBodyCut。"
+        )
+        option_hint = QLabel("荷载历程与 GIF 始终使用全部正式加载帧")
+        option_hint.setProperty("role", "hint")
+        option_hint.setToolTip(
+            "帧模式只限制 FreeBodyCut、纵筋数值提取等高开销计算，不截断荷载历程或 GIF。"
+        )
+        option_row.addWidget(option_hint)
         option_row.addStretch(1)
         self.run_button = QPushButton("运行选中项目"); self.run_button.clicked.connect(self._run_selected); option_row.addWidget(self.run_button)
+        self.run_button.setProperty("primary", True)
         layout.addLayout(option_row)
 
-        self.table = QTableWidget(0, len(self.columns)); self.table.setHorizontalHeaderLabels(self.columns)
+        self.table = GroupDropTable(0, len(self.columns)); self.table.setHorizontalHeaderLabels(self.columns)
         self.table.setAlternatingRowColors(True); self.table.setSortingEnabled(False)
-        widths = [50, 240, 95, 105, 105, 115, 130, 80, 120, 70, 125, 125, 115, 120, 120, 90, 105, 125, 135]
+        self.table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.table.setFocusPolicy(Qt.NoFocus)
+        self.table.setWordWrap(False)
+        self.table.verticalHeader().setDefaultSectionSize(32)
+        self.table.verticalHeader().setMinimumSectionSize(30)
+        self.table.horizontalHeader().setMinimumHeight(36)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        widths = [62, 270, 130, 120, 120, 135, 155, 115, 145, 90, 150, 150, 140, 145, 145, 120, 135, 150, 150]
         for index, width in enumerate(widths): self.table.setColumnWidth(index, width)
         layout.addWidget(self.table, 1)
-        layout.addWidget(QLabel("运行日志")); self.log = QPlainTextEdit(); self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(5000); layout.addWidget(self.log, 0)
+        self.log_label = QLabel("运行日志")
+        self.log_label.setProperty("role", "title")
+        layout.addWidget(self.log_label)
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setPlaceholderText("扫描、升级和提取过程会显示在这里。")
+        self.log.setMaximumBlockCount(5000)
+        self.log.setMinimumHeight(105)
+        self.log.setMaximumHeight(170)
+        layout.addWidget(self.log, 0)
 
     def _browse_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "选择 ODB 文件夹", self.folder_edit.text())
@@ -110,6 +149,7 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _combo(values: list[str], selected: str = "", allow_blank: bool = False) -> QComboBox:
         combo = QComboBox()
+        combo.view().setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         if allow_blank: combo.addItem("")
         combo.addItems(values); index = combo.findText(selected)
         if index >= 0: combo.setCurrentIndex(index)
@@ -126,6 +166,9 @@ class MainWindow(QMainWindow):
             start = self._combo(scan.steps, useful[0] if useful else (scan.steps[0] if scan.steps else ""))
             end = self._combo(scan.steps, scan.steps[-1] if scan.steps else "")
             frame_mode = self._combo(list(FRAME_MODE_LABELS), "关键帧（自动）")
+            frame_mode.setToolTip(
+                "仅控制 FreeBodyCut、纵筋数值提取等高开销计算；荷载历程和 GIF 始终使用全部帧。"
+            )
             manual_frames = QLineEdit(); manual_frames.setPlaceholderText("例：0,10,20-25")
             direction = self._combo(["1", "3", "1+3"], "1+3")
             load_set = self._combo(scan.assembly_node_sets, choose_name(scan.assembly_node_sets, self.defaults["default_load_set"]))

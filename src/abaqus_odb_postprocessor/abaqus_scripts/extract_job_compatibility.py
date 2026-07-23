@@ -146,14 +146,14 @@ source = source.replace(
 # White viewport background is printed into PNG (not transparent), which also
 # keeps the GIF background white after Pillow conversion.
 source = source.replace(
-    'session.pngOptions.setValues(imageSize=(800, 600))\n',
+    'session.pngOptions.setValues(imageSize=image_size_setting)\n',
     'session.graphicsOptions.setValues(\n'
     '    backgroundStyle=SOLID,\n'
     '    backgroundColor="#FFFFFF",\n'
     '    backgroundBottomColor="#FFFFFF",\n'
     ')\n'
     'session.printOptions.setValues(rendition=COLOR, vpDecorations=OFF, vpBackground=ON, compass=OFF)\n'
-    'session.pngOptions.setValues(imageSize=(800, 600))\n',
+    'session.pngOptions.setValues(imageSize=image_size_setting)\n',
 )
 
 # User-specified ten-band damage palette.  Colors are ordered from minimum to
@@ -201,6 +201,7 @@ required = [
     "longitudinal_material_name = str(config.get",
     "LeafFromElementLabels(\n                partInstanceName=instance_name",
     "backgroundColor=\"#FFFFFF\"",
+    "session.pngOptions.setValues(imageSize=image_size_setting)",
     "damage_spectrum_name = \"DAMAGE_FIXED_10\"",
     "spec[\"name\"] in legend_ranges",
     "freebody_set_names = (concrete_set_name,)",

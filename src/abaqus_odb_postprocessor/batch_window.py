@@ -3,22 +3,24 @@
 from __future__ import annotations
 
 import copy
+import math
 import threading
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QComboBox,
     QHeaderView,
+    QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QWidget,
 )
 
 from . import comparison_groups as _base
@@ -52,30 +54,211 @@ class MainWindow(_base.MainWindow):
     def _build_ui(self) -> None:
         super()._build_ui()
         self.group_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.group_tree.setColumnCount(2)
+        self.group_tree.setColumnCount(1)
         header = self.group_tree.header()
         header.setSectionResizeMode(0, QHeaderView.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.Fixed)
-        self.group_tree.setColumnWidth(1, 42)
 
         option_layout = self.centralWidget().layout().itemAt(2).layout()
-        option_layout.insertWidget(option_layout.count() - 2, QLabel("并行 ODB 进程数"))
+        self.parallel_label = QLabel("并行任务数")
+        self.parallel_label.setToolTip("同时启动的独立 Abaqus ODB 读取或后处理进程数")
+        option_layout.insertWidget(option_layout.count() - 2, self.parallel_label)
         self.parallel_workers = QSpinBox()
+        self.parallel_workers.setObjectName("parallelWorkers")
         self.parallel_workers.setRange(1, 4)
-        self.parallel_workers.setValue(int(self.defaults.get("parallel_odb_workers", 2)))
-        self.parallel_workers.setToolTip(
-            "每个工作单元启动独立的 Abaqus CAE 进程。受许可证、内存和磁盘速度限制，建议 2。"
+        self.parallel_workers.setSuffix(" 个")
+        self.parallel_workers.setAlignment(Qt.AlignCenter)
+        self.parallel_workers.setAccelerated(True)
+        self.parallel_workers.setKeyboardTracking(False)
+        self.parallel_workers.setMinimumWidth(118)
+        self.parallel_workers.setMaximumWidth(136)
+        self.parallel_workers.setAccessibleName("并行任务数")
+        self.parallel_workers.setAccessibleDescription(
+            "可选择 1 到 4 个并行 Abaqus ODB 读取或后处理进程，建议使用 2 个。"
+        )
+        saved_workers = int(
+            self.state.get(
+                "parallel_odb_workers",
+                self.defaults.get("parallel_odb_workers", 2),
+            )
+        )
+        self.parallel_workers.setValue(max(1, min(saved_workers, 4)))
+        self.parallel_workers.valueChanged.connect(
+            self._parallel_worker_count_changed
         )
         option_layout.insertWidget(option_layout.count() - 2, self.parallel_workers)
+        self.parallel_hint = QLabel("范围 1–4，建议 2")
+        self.parallel_hint.setProperty("role", "hint")
+        option_layout.insertWidget(option_layout.count() - 2, self.parallel_hint)
+        self._update_parallel_worker_tooltip(self.parallel_workers.value())
         self.cancel_run_button = QPushButton("取消当前批次")
+        self.cancel_run_button.setProperty("danger", True)
         self.cancel_run_button.setEnabled(False)
         self.cancel_run_button.clicked.connect(self._cancel_run)
         option_layout.insertWidget(option_layout.count() - 2, self.cancel_run_button)
+
+        output_panel = QWidget()
+        output_panel.setObjectName("outputImageSettings")
+        output_layout = QHBoxLayout(output_panel)
+        output_layout.setContentsMargins(10, 4, 10, 4)
+        output_layout.setSpacing(8)
+        output_title = QLabel("输出图像")
+        output_title.setProperty("role", "title")
+        output_layout.addWidget(output_title)
+        output_layout.addWidget(QLabel("横向"))
+        self.image_width_input = QSpinBox()
+        self.image_width_input.setObjectName("imageWidth")
+        self._configure_image_dimension_input(self.image_width_input)
+        output_layout.addWidget(self.image_width_input)
+        output_layout.addWidget(QLabel("纵向"))
+        self.image_height_input = QSpinBox()
+        self.image_height_input.setObjectName("imageHeight")
+        self._configure_image_dimension_input(self.image_height_input)
+        output_layout.addWidget(self.image_height_input)
+        output_layout.addWidget(QLabel("单位"))
+        self.image_unit_selector = QComboBox()
+        self.image_unit_selector.view().setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff
+        )
+        self.image_unit_selector.setMinimumWidth(92)
+        self.image_unit_selector.addItem("pixel", "px")
+        self.image_unit_selector.addItem("mm", "mm")
+        output_layout.addWidget(self.image_unit_selector)
+        self.image_ratio_label = QLabel()
+        self.image_ratio_label.setProperty("role", "hint")
+        output_layout.addWidget(self.image_ratio_label)
+        output_hint = QLabel("按此比例创建最大 Abaqus Viewport")
+        output_hint.setProperty("role", "hint")
+        output_layout.addWidget(output_hint)
+        output_layout.addStretch(1)
+        saved_unit = str(
+            self.state.get(
+                "image_size_unit",
+                self.defaults.get("image_size_unit", "px"),
+            )
+        )
+        if saved_unit not in ("px", "mm"):
+            saved_unit = "px"
+        saved_width = int(
+            self.state.get(
+                "image_width",
+                self.state.get(
+                    "image_width_px",
+                    self.defaults.get("image_width", 1500),
+                ),
+            )
+        )
+        saved_height = int(
+            self.state.get(
+                "image_height",
+                self.state.get(
+                    "image_height_px",
+                    self.defaults.get("image_height", 1000),
+                ),
+            )
+        )
+        self._current_image_unit = saved_unit
+        self.image_unit_selector.setCurrentIndex(
+            self.image_unit_selector.findData(saved_unit)
+        )
+        self._apply_image_unit(saved_unit, saved_width, saved_height)
+        self.image_width_input.valueChanged.connect(self._image_size_changed)
+        self.image_height_input.valueChanged.connect(self._image_size_changed)
+        self.image_unit_selector.currentIndexChanged.connect(
+            self._image_unit_changed
+        )
+        self._update_image_ratio()
+        self.centralWidget().layout().insertWidget(3, output_panel)
+
+    @staticmethod
+    def _configure_image_dimension_input(control: QSpinBox) -> None:
+        control.setAlignment(Qt.AlignCenter)
+        control.setKeyboardTracking(False)
+        control.setMinimumWidth(132)
+        control.setMaximumWidth(150)
+
+    def _apply_image_unit(self, unit: str, width: int, height: int) -> None:
+        for control in (self.image_width_input, self.image_height_input):
+            control.blockSignals(True)
+            if unit == "mm":
+                control.setRange(30, 500)
+                control.setSingleStep(10)
+                control.setSuffix(" mm")
+                control.setToolTip(
+                    "Abaqus Viewport 的实际毫米尺寸，范围 30–500；"
+                    "最大可用值受当前屏幕限制。"
+                )
+            else:
+                control.setRange(320, 4096)
+                control.setSingleStep(100)
+                control.setSuffix(" px")
+                control.setToolTip(
+                    "最终 PNG 的像素尺寸，范围 320–4096；"
+                    "Viewport 会自动采用相同宽高比。"
+                )
+        self.image_width_input.setValue(width)
+        self.image_height_input.setValue(height)
+        self.image_width_input.blockSignals(False)
+        self.image_height_input.blockSignals(False)
+
+    def _image_unit_changed(self, _index: int) -> None:
+        new_unit = str(self.image_unit_selector.currentData())
+        old_unit = self._current_image_unit
+        width = int(self.image_width_input.value())
+        height = int(self.image_height_input.value())
+        if old_unit == "px" and new_unit == "mm":
+            width = round(width * 25.4 / 96.0)
+            height = round(height * 25.4 / 96.0)
+        elif old_unit == "mm" and new_unit == "px":
+            width = round(width * 96.0 / 25.4)
+            height = round(height * 96.0 / 25.4)
+        self._current_image_unit = new_unit
+        self._apply_image_unit(new_unit, width, height)
+        self._image_size_changed()
+
+    def _update_image_ratio(self) -> None:
+        width = int(self.image_width_input.value())
+        height = int(self.image_height_input.value())
+        divisor = math.gcd(width, height)
+        self.image_ratio_label.setText(
+            f"比例 {width // divisor}:{height // divisor}"
+        )
+
+    def _image_size_changed(self, *_args) -> None:
+        self._update_image_ratio()
+        self.state["image_size_unit"] = self._current_image_unit
+        self.state["image_width"] = int(self.image_width_input.value())
+        self.state["image_height"] = int(self.image_height_input.value())
+        save_json(self.state_path, self.state)
+
+    def _update_parallel_worker_tooltip(self, workers: int) -> None:
+        descriptions = {
+            1: "串行处理，资源占用最低，稳定性最好。",
+            2: "推荐设置，在速度、许可证和内存占用之间较均衡。",
+            3: "较高并发，请确认许可证和内存充足。",
+            4: "最高并发，资源占用较高，仅建议在硬件和许可证充足时使用。",
+        }
+        tooltip = (
+            f"当前最多同时启动 {workers} 个独立 Abaqus ODB 读取或 CAE 后处理进程。\n"
+            f"{descriptions[workers]}\n"
+            "如果待处理 ODB 少于该数值，程序会自动采用实际 ODB 数量。"
+        )
+        self.parallel_label.setToolTip(tooltip)
+        self.parallel_workers.setToolTip(tooltip)
+        self.parallel_hint.setToolTip(tooltip)
+
+    def _parallel_worker_count_changed(self, workers: int) -> None:
+        self._update_parallel_worker_tooltip(int(workers))
+        self.state["parallel_odb_workers"] = int(workers)
+        save_json(self.state_path, self.state)
 
     def _set_busy(self, busy: bool) -> None:
         super()._set_busy(busy)
         if hasattr(self, "parallel_workers"):
             self.parallel_workers.setEnabled(not busy)
+        if hasattr(self, "image_width_input"):
+            self.image_width_input.setEnabled(not busy)
+            self.image_height_input.setEnabled(not busy)
+            self.image_unit_selector.setEnabled(not busy)
         if hasattr(self, "cancel_run_button"):
             self.cancel_run_button.setEnabled(bool(busy and self.batch_active))
 
@@ -126,6 +309,11 @@ class MainWindow(_base.MainWindow):
 
     def _job_payload(self, row: dict[str, Any], output_dir: Path) -> dict[str, Any]:
         payload = super()._job_payload(row, output_dir)
+        settings = dict(payload["settings"])
+        settings["image_size_unit"] = self._current_image_unit
+        settings["image_width"] = int(self.image_width_input.value())
+        settings["image_height"] = int(self.image_height_input.value())
+        payload["settings"] = settings
         info = self._name_info(row)
         automatic = row["direction"].currentText() == AUTO_DIRECTION
         payload["load_direction"] = (
@@ -159,63 +347,34 @@ class MainWindow(_base.MainWindow):
         self._save_state()
 
     def _ensure_initial_condition_groups(self, scans) -> None:
-        if not self.folder_key:
-            return
-        folder_state = self.state.setdefault("folders", {}).setdefault(self.folder_key, {})
-        already_grouped = set(folder_state.setdefault("auto_condition_grouped_paths", []))
-        changed = False
+        """Build browse-only condition categories and migrate old auto-groups."""
+
+        self.condition_categories = {}
+        if self.folder_key:
+            folder_state = self.state.setdefault("folders", {}).setdefault(
+                self.folder_key, {}
+            )
+            folder_state.pop("auto_condition_grouped_paths", None)
+        for group_id in [
+            key for key, group in self.groups.items() if group.get("auto_condition")
+        ]:
+            del self.groups[group_id]
         for scan in scans:
             path = str(scan.path.resolve())
-            if path in already_grouped:
-                continue
             info = parse_odb_name(scan.path.name)
             if not info.condition:
                 continue
-            group_id = next(
+            condition_key = next(
                 (
                     key
-                    for key, group in self.groups.items()
-                    if str(group.get("auto_condition", "")).casefold()
-                    == info.condition.casefold()
+                    for key in self.condition_categories
+                    if key.casefold() == info.condition.casefold()
                 ),
-                "",
+                info.condition,
             )
-            if not group_id:
-                group_id = uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"abaqus-odb-condition|{self.folder_key}|{info.condition.casefold()}",
-                ).hex
-                self.groups[group_id] = {
-                    "name": f"工况-{info.condition}",
-                    "members": [],
-                    "legend_overrides": {},
-                    "auto_condition": info.condition,
-                }
-            members = self.groups[group_id].setdefault("members", [])
+            members = self.condition_categories.setdefault(condition_key, [])
             if path not in members:
                 members.append(path)
-            already_grouped.add(path)
-            changed = True
-        if changed:
-            folder_state["auto_condition_grouped_paths"] = sorted(already_grouped)
-
-    def _new_tree_item(
-        self,
-        parent,
-        text: str,
-        kind: str,
-        path: str = "",
-        group_id: str = "",
-    ):
-        item = super()._new_tree_item(parent, text, kind, path, group_id)
-        if kind == "odb":
-            count = len(self._group_names_for_path(path))
-            item.setText(1, str(count))
-            item.setTextAlignment(1, Qt.AlignCenter)
-            item.setBackground(1, QBrush(QColor("#E5E7EB")))
-            item.setForeground(1, QBrush(QColor("#4B5563")))
-            item.setToolTip(1, f"已加入 {count} 个对比组")
-        return item
 
     def _cancel_run(self) -> None:
         if self.batch_controller is None or not self.batch_active:
@@ -243,7 +402,11 @@ class MainWindow(_base.MainWindow):
         self._save_state()
         group_specs = [item for item in self._scope_groups(scope) if item["members"]]
         if not group_specs:
-            QMessageBox.information(self, "没有作业", "当前范围没有已启用的 ODB。")
+            QMessageBox.information(
+                self,
+                "没有作业",
+                "请选择单个 ODB 或用户创建的对比组；“全部 ODB”和工况分类仅用于浏览。",
+            )
             return
 
         unique_paths: list[str] = []
@@ -437,4 +600,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

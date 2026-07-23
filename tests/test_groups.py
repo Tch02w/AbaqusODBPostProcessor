@@ -46,9 +46,35 @@ def test_multi_group_membership_and_standalone(tmp_path: Path) -> None:
     window._rebuild_tree("a")
     window._update_membership_labels()
     assert window.rows_by_path[first_path]["group"].text() == "组A；组B"
+    assert window.group_tabs.count() == 3
+    assert window.group_tabs.tabText(0) == "全部配置"
+    assert window.group_tabs.tabData(window.group_tabs.currentIndex()) == "a"
+    assert window._scope_groups("current")[0]["standalone"] is False
+    window._activate_standalone(first_path)
+    current_odb_plan = window._scope_groups("current")
+    assert len(current_odb_plan) == 1
+    assert current_odb_plan[0]["standalone"] is True
+    window.group_tabs.setCurrentIndex(0)
+    assert window._scope_groups("current") == []
     plans = window._scope_groups("all")
     assert [item["name"] for item in plans] == ["组A", "组B", "B"]
     assert sum(first_path in item["members"] for item in plans) == 2
+
+    all_root = window.group_tree.topLevelItem(0)
+    first_item = all_root.child(0)
+    second_item = all_root.child(1)
+    window.group_tree.clearSelection()
+    first_item.setSelected(True)
+    second_item.setSelected(True)
+    assert set(window.group_tree.selected_odb_paths()) == {
+        str(first.path.resolve()),
+        str(second.path.resolve()),
+    }
+    window.group_tabs.setCurrentIndex(1)
+    window._drop_paths_into_current_group(window.group_tree.selected_odb_paths())
+    assert str(second.path.resolve()) in window.groups["a"]["members"]
+    assert window.source_header.minimumHeight() == window.tabs_header.minimumHeight()
+    assert window.source_header.maximumHeight() == window.tabs_header.maximumHeight()
     window.close()
 
 

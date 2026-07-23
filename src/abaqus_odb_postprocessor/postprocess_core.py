@@ -34,6 +34,28 @@ def normalize_white_backgrounds(output_dir: Path) -> int:
     return len(paths)
 
 
+def build_transparent_backgrounds(output_dir: Path) -> int:
+    """Create transparent PNG copies while preserving every Abaqus source PNG."""
+
+    count = 0
+    for folder_name in ("frames", "contours"):
+        source_root = output_dir / folder_name
+        if not source_root.exists():
+            continue
+        target_root = output_dir / f"{folder_name}_transparent"
+        for source_path in source_root.rglob("*.png"):
+            target_path = target_root / source_path.relative_to(source_root)
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with Image.open(source_path) as source:
+                rgb = np.asarray(source.convert("RGB")).copy()
+            alpha = np.full(rgb.shape[:2], 255, dtype=np.uint8)
+            alpha[np.all(rgb >= 250, axis=2)] = 0
+            rgba = np.dstack((rgb, alpha))
+            Image.fromarray(rgba, "RGBA").save(target_path)
+            count += 1
+    return count
+
+
 def build_gifs(output_dir: Path, fps: int = 5) -> dict[str, int]:
     frame_root = output_dir / "frames"; animation_dir = output_dir / "animations"
     animation_dir.mkdir(parents=True, exist_ok=True); counts = {}
@@ -194,7 +216,8 @@ def build_xlsx(output_dir: Path) -> Path:
 
 def finalize_output(output_dir: Path, fps: int = 5) -> dict:
     moment_csv, maxima_csv = build_pile_force_moment(output_dir)
-    manifest = {"normalized_png_count": normalize_white_backgrounds(output_dir),
+    manifest = {"transparent_png_count": build_transparent_backgrounds(output_dir),
+        "original_pngs_preserved": True,
         "animations": build_gifs(output_dir, fps), "pile_axial_plot": str(plot_pile_axial(output_dir) or ""),
         "pile_bending_plots": [str(path) for path in plot_pile_bending(output_dir)],
         "pile_force_moment_csv": str(moment_csv or ""), "pile_bending_maxima_csv": str(maxima_csv or ""),

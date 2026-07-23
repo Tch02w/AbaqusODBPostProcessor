@@ -98,8 +98,87 @@ orientation_threshold = float(settings["longitudinal_orientation_threshold"])
 cut_count = int(settings["axial_cut_count"])
 prefracture_index = int(config.get("prefracture_sequence_index", -1))
 full_freebody = bool(config.get("full_timehistory_freebody", False))
+image_size_unit = str(settings.get("image_size_unit", "px")).lower()
+image_width = int(settings.get("image_width", 1500))
+image_height = int(settings.get("image_height", 1000))
+if image_size_unit not in ("px", "mm"):
+    raise RuntimeError("image_size_unit must be px or mm")
+if image_size_unit == "px":
+    if not 320 <= image_width <= 4096 or not 320 <= image_height <= 4096:
+        raise RuntimeError("Pixel image dimensions must be between 320 and 4096")
+    image_size_setting = (image_width, image_height)
+else:
+    if not 30 <= image_width <= 500 or not 30 <= image_height <= 500:
+        raise RuntimeError("Viewport dimensions must be between 30 and 500 mm")
+    image_size_setting = SIZE_ON_SCREEN
 
-viewport = session.Viewport(name="ODB PostProcessor", origin=(0, 0), width=180, height=120)
+
+def create_large_render_viewport(name, unit, requested_width, requested_height):
+    """Use a real large canvas so fixed-size annotations stay proportional."""
+
+    if unit == "mm":
+        try:
+            viewport = session.Viewport(
+                name=name,
+                origin=(0, 0),
+                width=float(requested_width),
+                height=float(requested_height),
+                border=OFF,
+                titleBar=OFF,
+            )
+            return viewport, (float(requested_width), float(requested_height))
+        except Exception as error:
+            raise RuntimeError(
+                "The requested {0}x{1} mm viewport does not fit the current "
+                "screen; reduce the dimensions: {2}".format(
+                    requested_width, requested_height, error
+                )
+            )
+
+    aspect_ratio = float(requested_width) / float(requested_height)
+    attempts = []
+    for maximum_width, maximum_height in (
+        (396.0, 264.0),
+        (360.0, 240.0),
+        (330.0, 220.0),
+        (300.0, 200.0),
+        (270.0, 180.0),
+        (240.0, 160.0),
+        (180.0, 120.0),
+    ):
+        if maximum_width / maximum_height >= aspect_ratio:
+            height = maximum_height
+            width = height * aspect_ratio
+        else:
+            width = maximum_width
+            height = width / aspect_ratio
+        if width < 30.0 or height < 30.0:
+            continue
+        try:
+            viewport = session.Viewport(
+                name=name,
+                origin=(0, 0),
+                width=width,
+                height=height,
+                border=OFF,
+                titleBar=OFF,
+            )
+            return viewport, (width, height)
+        except Exception as error:
+            attempts.append("{0:g}x{1:g}: {2}".format(width, height, error))
+    raise RuntimeError(
+        "Unable to create a large render viewport: {0}".format(
+            " | ".join(attempts)
+        )
+    )
+
+
+viewport, render_viewport_mm = create_large_render_viewport(
+    "ODB PostProcessor",
+    image_size_unit,
+    image_width,
+    image_height,
+)
 viewport.makeCurrent()
 odb = session.openOdb(name=odb_path, readOnly=True)
 viewport.setValues(displayedObject=odb)
@@ -534,7 +613,7 @@ for item in timeline:
     damage_rows.append(row)
 write_csv(os.path.join(data_dir, "damage_scan.csv"), list(damage_rows[0].keys()), damage_rows)
 
-session.pngOptions.setValues(imageSize=(800, 600))
+session.pngOptions.setValues(imageSize=image_size_setting)
 viewport.viewportAnnotationOptions.setValues(
     triad=ON, legend=ON, title=OFF, state=ON, annotations=OFF, compass=OFF
 )
@@ -643,9 +722,11 @@ metadata = {
     "freebody_targets": [label for label, _item in targets],
     "freebody_append": False,
     "contour_sequences": [spec["name"] for spec in specs],
+    "render_viewport_mm": list(render_viewport_mm),
+    "image_size_unit": image_size_unit,
+    "requested_image_size": [image_width, image_height],
 }
 with open(os.path.join(output_dir, "metadata.json"), "w", encoding="utf-8") as stream:
     json.dump(metadata, stream, ensure_ascii=False, indent=2)
 log(json.dumps(metadata, ensure_ascii=False))
 odb.close()
-

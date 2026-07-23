@@ -29,10 +29,6 @@ source = source.replace(
     '    folder =',
 )
 source = source.replace(
-    'session.pngOptions.setValues(imageSize=(800, 600))',
-    'session.pngOptions.setValues(imageSize=(1600, 1200))',
-)
-source = source.replace(
     'viewport.viewportAnnotationOptions.setValues(\n'
     '    triad=ON, legend=ON, title=OFF, state=ON, annotations=OFF, compass=OFF\n'
     ')',
@@ -71,7 +67,7 @@ if old_damage not in source:
 source = source.replace(old_damage, new_damage)
 for display_marker in (
     'viewport.view.setProjection(projection=PARALLEL)',
-    'session.pngOptions.setValues(imageSize=(1600, 1200))',
+    'session.pngOptions.setValues(imageSize=image_size_setting)',
     'triad=OFF, legend=ON, title=OFF, state=OFF, annotations=OFF, compass=OFF',
     'damage_spectrum_name = "DAMAGE_DYNAMIC_10"',
     'maxAutoCompute=OFF, maxValue=damage_max',

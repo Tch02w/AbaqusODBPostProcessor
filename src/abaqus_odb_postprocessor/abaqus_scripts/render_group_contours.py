@@ -1,4 +1,4 @@
-"""Compatibility entry for selected-frame group contour rendering."""
+"""Compatibility entry for full-history and selected-frame contour rendering."""
 
 from __future__ import print_function
 
@@ -19,20 +19,13 @@ with open(base_path, "r", encoding="utf-8") as stream:
     source = stream.read()
 
 source = source.replace(
-    'timeline = read_rows(os.path.join(source_output_dir, "data", "timeline_alignment.csv"))\n'
-    'if not timeline:\n',
-    'timeline = read_rows(os.path.join(source_output_dir, "data", "timeline_alignment.csv"))\n'
-    'requested_sequences = set(int(value) for value in config.get("selected_sequence_indices", []))\n'
-    'if requested_sequences:\n'
-    '    timeline = [row for row in timeline if int(row["SequenceIndex"]) in requested_sequences]\n'
-    'if not timeline:\n',
-)
-source = source.replace(
     'frame = list(odb.steps.values())[step_index].frames[frame_index]',
     'frame = odb.steps[list(odb.steps.keys())[step_index]].frames[frame_index]',
 )
 for marker in (
-    'requested_sequences = set(int(value)',
+    'full_timeline = read_rows(',
+    'selected_timeline_path = os.path.join(',
+    'render_timeline = full_timeline',
     'odb.steps[list(odb.steps.keys())[step_index]].frames[frame_index]',
 ):
     if marker not in source:

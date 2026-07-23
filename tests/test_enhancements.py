@@ -5,12 +5,27 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QAbstractItemView
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtWidgets import (
+    QApplication,
+    QAbstractItemView,
+    QComboBox,
+    QLabel,
+    QLineEdit,
+    QPlainTextEdit,
+    QPushButton,
+    QSpinBox,
+    QTableWidget,
+    QTreeWidget,
+)
 
 from abaqus_odb_postprocessor.app import MainWindow
 from abaqus_odb_postprocessor.naming import parse_odb_name
 from abaqus_odb_postprocessor.models import OdbScan
+from abaqus_odb_postprocessor.ui_style import (
+    AccidentalWheelGuard,
+    apply_application_style,
+)
 
 
 def application() -> QApplication:
@@ -57,7 +72,9 @@ def test_d_series_diameters() -> None:
     assert parse_odb_name("D1400_17-R_U40D_V20D.odb").rebar_diameter_mm == 32.0
 
 
-def test_initial_condition_groups_auto_defaults_and_badges(tmp_path: Path) -> None:
+def test_condition_categories_are_browse_only_and_real_groups_are_preserved(
+    tmp_path: Path,
+) -> None:
     application()
     window = MainWindow()
     window.state_path = tmp_path / "project_state.json"
@@ -67,17 +84,49 @@ def test_initial_condition_groups_auto_defaults_and_badges(tmp_path: Path) -> No
     second = make_scan(folder / "GJA-2-R_U40D_V20D_miu03.odb")
     third = make_scan(folder / "GJA-4-R_U100D.odb")
     window._load_folder_state(str(folder))
+    first_path = str(first.path.resolve())
+    window.groups = {
+        "legacy": {
+            "name": "工况-U40D_V20D",
+            "members": [first_path],
+            "legend_overrides": {},
+            "auto_condition": "U40D_V20D",
+        },
+        "manual": {
+            "name": "人工对比组",
+            "members": [first_path],
+            "legend_overrides": {},
+        },
+    }
     window._populate([first, second, third])
 
-    conditions = {group.get("auto_condition"): group for group in window.groups.values()}
-    assert set(conditions) == {"U40D_V20D", "U100D"}
-    assert len(conditions["U40D_V20D"]["members"]) == 2
+    assert set(window.groups) == {"manual"}
+    assert set(window.condition_categories) == {"U40D_V20D", "U100D"}
+    assert len(window.condition_categories["U40D_V20D"]) == 2
     assert window.group_tree.selectionMode() == QAbstractItemView.ExtendedSelection
     all_root = window.group_tree.topLevelItem(0)
-    counts = {all_root.child(i).text(0): all_root.child(i).text(1) for i in range(all_root.childCount())}
-    assert counts[first.path.name] == "1"
+    categories_root = window.group_tree.topLevelItem(1)
+    assert window.group_tree.topLevelItemCount() == 2
+    assert all_root.text(0) == "全部 ODB"
+    assert categories_root.text(0) == "按工况分类（仅浏览）"
+    assert window.group_tabs.count() == 2
+    assert window.group_tabs.tabText(0) == "全部配置"
+    assert window.group_tabs.tabText(1) == "人工对比组"
+    assert window.group_tabs.tabData(1) == "manual"
+    assert categories_root.childCount() == 2
+    assert window.group_tree.columnCount() == 1
+    assert all_root.child(0).data(0, Qt.UserRole + 3) is None
 
-    first_row = window.rows_by_path[str(first.path.resolve())]
+    window.group_tree.setCurrentItem(categories_root.child(0))
+    assert window._scope_groups("current") == []
+    category_odb = categories_root.child(0).child(0)
+    window._source_tree_item_activated(category_odb)
+    category_plan = window._scope_groups("current")
+    assert len(category_plan) == 1
+    assert category_plan[0]["standalone"] is True
+    assert category_plan[0]["members"] == [window.group_tree.odb_path(category_odb)]
+
+    first_row = window.rows_by_path[first_path]
     third_row = window.rows_by_path[str(third.path.resolve())]
     assert first_row["direction"].currentText().startswith("自动")
     assert window._job_payload(first_row, tmp_path)["load_direction"] == "1+3"
@@ -85,6 +134,37 @@ def test_initial_condition_groups_auto_defaults_and_badges(tmp_path: Path) -> No
     assert window._job_payload(third_row, tmp_path)["load_direction"] == "3"
     assert third_row["diameter"].value() == 28.0
     window.close()
+
+
+def test_wheel_guard_blocks_closed_selectors() -> None:
+    guard = AccidentalWheelGuard()
+    event = QEvent(QEvent.Wheel)
+    assert guard.eventFilter(QComboBox(), event) is True
+    assert guard.eventFilter(QSpinBox(), QEvent(QEvent.Wheel)) is True
+
+
+def test_application_uses_one_font_size_and_native_control_shapes() -> None:
+    app = application()
+    apply_application_style(app)
+    widgets = [
+        QLabel("正文"),
+        QLabel("标题"),
+        QLabel("提示"),
+        QPushButton("按钮"),
+        QLineEdit(),
+        QComboBox(),
+        QSpinBox(),
+        QTableWidget(),
+        QTreeWidget(),
+        QPlainTextEdit(),
+    ]
+    widgets[1].setProperty("role", "title")
+    widgets[2].setProperty("role", "hint")
+    for widget in widgets:
+        widget.ensurePolished()
+    assert {widget.font().pointSize() for widget in widgets} == {11}
+    assert app.styleSheet() == ""
+    assert app.style().objectName().casefold() == "fusion"
 
 
 def test_manual_direction_and_diameter_are_persisted(tmp_path: Path) -> None:
@@ -104,4 +184,3 @@ def test_manual_direction_and_diameter_are_persisted(tmp_path: Path) -> None:
     assert saved["diameter_manual"] is True
     assert window._job_payload(row, tmp_path)["load_direction"] == "1"
     window.close()
-

@@ -11,6 +11,33 @@ from .config import abaqus_script
 LogCallback = Callable[[str], None]
 
 
+def is_process_startup_noise(line: str) -> bool:
+    """Return True for compiler-environment banners unrelated to ODB work."""
+
+    text = line.strip()
+    lowered = text.casefold()
+    if len(text) >= 20 and set(text) == {"*"}:
+        return True
+    if lowered.startswith("** visual studio") and "developer command prompt" in lowered:
+        return True
+    if (
+        lowered.startswith("** copyright (c)")
+        and "microsoft corporation" in lowered
+    ):
+        return True
+    if lowered.startswith("[debug:ext\\vcvars.bat]"):
+        return True
+    if lowered.startswith("[vcvarsall.bat] environment initialized for:"):
+        return True
+    if (
+        "warning: vars.bat does not set up dependencies when invoked directly"
+        in lowered
+        and "dpc++" in lowered
+    ):
+        return True
+    return False
+
+
 class ProcessCancelled(RuntimeError):
     pass
 
@@ -79,8 +106,9 @@ def run_process(
     try:
         assert process.stdout is not None
         for line in process.stdout:
-            if log:
-                log(line.rstrip())
+            message = line.rstrip()
+            if log and not is_process_startup_noise(message):
+                log(message)
         code = process.wait()
     finally:
         if controller is not None:

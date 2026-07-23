@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
+    QTabBar,
     QVBoxLayout,
     QWidget,
 )
@@ -56,6 +57,7 @@ class MainWindow(_previous.MainWindow):
         self.state = self._read_state()
         self.folder_key = ""
         self.groups: dict[str, dict[str, Any]] = {}
+        self.condition_categories: dict[str, list[str]] = {}
         self.odb_configs: dict[str, dict[str, Any]] = {}
         self.rows_by_path: dict[str, dict[str, Any]] = {}
         self.scans_by_path: dict[str, OdbScan] = {}
@@ -64,6 +66,9 @@ class MainWindow(_previous.MainWindow):
         self.scan_started_at = 0.0
         self.scan_total = 0
         self.scan_completed = 0
+        self._current_scope_kind = "browse"
+        self._current_scope_path = ""
+        self._current_scope_group_id = ""
         super().__init__()
         self.setWindowTitle("Abaqus ODB PostProcessor 0.3")
         self.state_timer = QTimer(self)
@@ -88,9 +93,12 @@ class MainWindow(_previous.MainWindow):
         layout: QVBoxLayout = self.centralWidget().layout()
 
         progress_widget = QWidget()
+        progress_widget.setObjectName("progressPanel")
         progress_layout = QHBoxLayout(progress_widget)
         progress_layout.setContentsMargins(0, 0, 0, 0)
+        progress_layout.setSpacing(8)
         self.scan_status = QLabel("尚未扫描")
+        self.scan_status.setMinimumWidth(280)
         self.scan_progress = QProgressBar()
         self.scan_progress.setRange(0, 1)
         self.scan_progress.setValue(0)
@@ -107,25 +115,65 @@ class MainWindow(_previous.MainWindow):
 
         layout.removeWidget(self.table)
         splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter = splitter
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(7)
         group_panel = QWidget()
+        group_panel.setMinimumWidth(290)
         group_layout = QVBoxLayout(group_panel)
         group_layout.setContentsMargins(0, 0, 0, 0)
-        group_layout.addWidget(QLabel("ODB 与对比组（拖动 ODB 到组中）"))
+        group_layout.setSpacing(4)
+        self.source_header = QWidget()
+        self.source_header.setFixedHeight(38)
+        source_header_layout = QHBoxLayout(self.source_header)
+        source_header_layout.setContentsMargins(0, 0, 0, 0)
+        source_header_layout.addWidget(
+            QLabel("ODB 来源（Ctrl/Shift 多选，拖到右侧）")
+        )
+        source_header_layout.addStretch(1)
+        group_layout.addWidget(self.source_header)
         self.group_tree = ComparisonTree()
         self.group_tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.group_tree.customContextMenuRequested.connect(self._tree_context_menu)
-        self.group_tree.membershipDropped.connect(self._add_membership)
-        self.group_tree.currentItemChanged.connect(self._tree_selection_changed)
+        self.group_tree.itemSelectionChanged.connect(self._tree_selection_changed)
+        self.group_tree.itemDoubleClicked.connect(self._source_tree_item_activated)
         group_layout.addWidget(self.group_tree, 1)
+
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(4)
+        self.tabs_header = QWidget()
+        self.tabs_header.setFixedHeight(38)
+        tabs_layout = QHBoxLayout(self.tabs_header)
+        tabs_layout.setContentsMargins(0, 0, 0, 0)
+        self.group_tabs = QTabBar()
+        self.group_tabs.setExpanding(False)
+        self.group_tabs.setUsesScrollButtons(True)
+        self.group_tabs.setElideMode(Qt.ElideRight)
+        self.group_tabs.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.group_tabs.currentChanged.connect(self._group_tab_changed)
+        self.group_tabs.customContextMenuRequested.connect(
+            self._group_tab_context_menu
+        )
+        self.group_tabs.tabBarDoubleClicked.connect(self._group_tab_double_clicked)
+        tabs_layout.addWidget(self.group_tabs, 1)
+        self.create_group_button = QPushButton("新建对比组")
+        self.create_group_button.clicked.connect(self._create_group)
+        tabs_layout.addWidget(self.create_group_button)
+        right_layout.addWidget(self.tabs_header)
+        self.table.odbPathsDropped.connect(self._drop_paths_into_current_group)
+        right_layout.addWidget(self.table, 1)
+
         splitter.addWidget(group_panel)
-        splitter.addWidget(self.table)
-        splitter.setSizes([310, 1550])
+        splitter.addWidget(right_panel)
+        splitter.setSizes([350, 1250])
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         layout.insertWidget(3, splitter, 1)
 
-        self.run_button.setText("运行当前组")
-        self.run_all_button = QPushButton("运行全部组")
+        self.run_button.setText("运行当前项目")
+        self.run_all_button = QPushButton("运行全部项目")
         self.run_all_button.clicked.connect(lambda: self._run_scope("all"))
         option_layout = layout.itemAt(2).layout()
         option_layout.addWidget(self.run_all_button)
@@ -245,7 +293,7 @@ class MainWindow(_previous.MainWindow):
             path = str(row["scan"].path.resolve())
             self.rows_by_path[path] = row
             row["group"].setReadOnly(True)
-            row["group"].setToolTip("对比组由左侧目录树管理；同一 ODB 可属于多个组。")
+            row["group"].setToolTip("对比组由右侧标签页和拖放管理；同一 ODB 可属于多个组。")
             self._restore_row(row, self.odb_configs.get(path, {}))
             self._connect_row_state(row)
         self._rebuild_tree()
@@ -327,36 +375,67 @@ class MainWindow(_previous.MainWindow):
         flags = Qt.ItemIsEnabled | Qt.ItemIsSelectable
         if kind == "odb":
             flags |= Qt.ItemIsDragEnabled
-        if kind == "group":
-            flags |= Qt.ItemIsDropEnabled
         item.setFlags(flags)
         return item
 
     def _rebuild_tree(self, selected_group_id: str = "") -> None:
+        selected_paths = set(self.group_tree.selected_odb_paths())
+        self.group_tree.blockSignals(True)
         self.group_tree.clear()
         all_root = self._new_tree_item(self.group_tree, "全部 ODB", "all_root")
-        groups_root = self._new_tree_item(self.group_tree, "对比组", "groups_root")
+        categories_root = self._new_tree_item(
+            self.group_tree, "按工况分类（仅浏览）", "categories_root"
+        )
         for path in sorted(self.scans_by_path, key=lambda value: Path(value).name.lower()):
-            self._new_tree_item(all_root, Path(path).name, "odb", path)
-        selected_item = None
-        for group_id, group in self.groups.items():
-            group_item = self._new_tree_item(
-                groups_root, str(group["name"]), "group", group_id=group_id
+            item = self._new_tree_item(all_root, Path(path).name, "odb", path)
+            item.setSelected(path in selected_paths)
+        for condition, members in sorted(
+            self.condition_categories.items(), key=lambda item: item[0].casefold()
+        ):
+            category_item = self._new_tree_item(
+                categories_root, f"工况-{condition}", "category", condition
             )
-            if group_id == selected_group_id:
-                selected_item = group_item
-            for path in sorted(set(group.get("members", [])), key=lambda value: Path(value).name.lower()):
+            for path in sorted(
+                set(members), key=lambda value: Path(value).name.lower()
+            ):
                 label = Path(path).name
                 if path not in self.scans_by_path:
                     label += "（缺失）"
-                self._new_tree_item(group_item, label, "odb", path, group_id)
+                self._new_tree_item(category_item, label, "odb", path)
         all_root.setExpanded(True)
-        groups_root.setExpanded(True)
-        if selected_item is not None:
-            self.group_tree.setCurrentItem(selected_item)
-            selected_item.setExpanded(True)
-        else:
+        categories_root.setExpanded(True)
+        if not selected_paths:
             self.group_tree.setCurrentItem(all_root)
+        self.group_tree.blockSignals(False)
+        self._rebuild_group_tabs(selected_group_id)
+
+    def _rebuild_group_tabs(self, selected_group_id: str = "") -> None:
+        current_group_id = (
+            selected_group_id
+            or self._current_scope_group_id
+            or (
+                str(self.group_tabs.tabData(self.group_tabs.currentIndex()) or "")
+                if self.group_tabs.currentIndex() >= 0
+                else ""
+            )
+        )
+        self.group_tabs.blockSignals(True)
+        while self.group_tabs.count():
+            self.group_tabs.removeTab(0)
+        self.group_tabs.addTab("全部配置")
+        self.group_tabs.setTabData(0, "")
+        selected_index = 0
+        for group_id, group in self.groups.items():
+            index = self.group_tabs.addTab(str(group["name"]))
+            self.group_tabs.setTabData(index, group_id)
+            self.group_tabs.setTabToolTip(
+                index, f"{len(group.get('members', []))} 个 ODB"
+            )
+            if group_id == current_group_id:
+                selected_index = index
+        self.group_tabs.setCurrentIndex(selected_index)
+        self.group_tabs.blockSignals(False)
+        self._group_tab_changed(selected_index)
 
     def _group_names_for_path(self, path: str) -> list[str]:
         return [
@@ -370,59 +449,142 @@ class MainWindow(_previous.MainWindow):
             names = self._group_names_for_path(path)
             row["group"].setText("；".join(names) if names else "未分组")
 
-    def _tree_selection_changed(self, current, _previous_item) -> None:
-        kind = self.group_tree.kind(current)
-        visible: set[str] | None = None
-        if kind == "group":
-            group = self.groups.get(self.group_tree.group_id(current), {})
-            visible = set(group.get("members", []))
-        elif kind == "odb":
-            visible = {self.group_tree.odb_path(current)}
+    def _set_visible_paths(self, visible: set[str] | None) -> None:
         for index, row in enumerate(self.row_widgets):
             path = str(row["scan"].path.resolve())
             self.table.setRowHidden(index, visible is not None and path not in visible)
+
+    def _tree_selection_changed(self) -> None:
+        # Source selection is intentionally independent of the active group tab.
+        # This preserves Ctrl/Shift selections while the user drags them right.
+        return
+
+    def _group_tab_changed(self, index: int) -> None:
+        group_id = (
+            str(self.group_tabs.tabData(index) or "")
+            if index >= 0
+            else ""
+        )
+        if group_id and group_id in self.groups:
+            self._current_scope_kind = "group"
+            self._current_scope_group_id = group_id
+            self._current_scope_path = ""
+            self._set_visible_paths(set(self.groups[group_id].get("members", [])))
+        elif index >= 0:
+            self._current_scope_kind = "browse"
+            self._current_scope_group_id = ""
+            self._current_scope_path = ""
+            self._set_visible_paths(None)
+
+    def _activate_standalone(self, path: str) -> None:
+        if path not in self.rows_by_path:
+            return
+        self.group_tabs.blockSignals(True)
+        self.group_tabs.setCurrentIndex(-1)
+        self.group_tabs.blockSignals(False)
+        self._current_scope_kind = "odb"
+        self._current_scope_group_id = ""
+        self._current_scope_path = path
+        self._set_visible_paths({path})
+
+    def _source_tree_item_activated(self, item, _column: int = 0) -> None:
+        if self.group_tree.kind(item) == "odb":
+            self._activate_standalone(self.group_tree.odb_path(item))
+
+    def _selected_or_item_paths(self, item) -> list[str]:
+        paths = self.group_tree.selected_odb_paths()
+        item_path = (
+            self.group_tree.odb_path(item)
+            if self.group_tree.kind(item) == "odb"
+            else ""
+        )
+        if item_path and item_path not in paths:
+            paths = [item_path]
+        return paths
 
     def _tree_context_menu(self, position) -> None:
         item = self.group_tree.itemAt(position)
         kind = self.group_tree.kind(item)
         menu = QMenu(self)
-        create_action = None
-        rename_action = delete_action = legend_action = remove_action = None
-        if kind in ("", "groups_root", "group"):
-            create_action = menu.addAction("新建对比组")
-        if kind == "group":
-            menu.addSeparator()
-            rename_action = menu.addAction("重命名")
-            legend_action = menu.addAction("图例范围设置…")
-            delete_action = menu.addAction("删除对比组")
-        if kind == "odb" and self.group_tree.group_id(item):
-            remove_action = menu.addAction("从本组移除")
-        if kind == "odb" and not self.group_tree.group_id(item) and self.groups:
-            add_menu = menu.addMenu("加入对比组")
-            add_actions = {}
-            for group_id, group in self.groups.items():
-                add_actions[add_menu.addAction(str(group["name"]))] = group_id
-        else:
-            add_actions = {}
+        standalone_action = None
+        add_actions = {}
+        remove_actions = {}
+        paths = self._selected_or_item_paths(item)
+        if kind == "odb" and paths:
+            standalone_action = menu.addAction("作为单个 ODB 显示")
+            if self.groups:
+                add_menu = menu.addMenu("加入对比组")
+                remove_menu = menu.addMenu("从对比组移除")
+                for group_id, group in self.groups.items():
+                    members = set(group.get("members", []))
+                    if any(path not in members for path in paths):
+                        add_actions[
+                            add_menu.addAction(str(group["name"]))
+                        ] = group_id
+                    if any(path in members for path in paths):
+                        remove_actions[
+                            remove_menu.addAction(str(group["name"]))
+                        ] = group_id
+                add_menu.setEnabled(bool(add_actions))
+                remove_menu.setEnabled(bool(remove_actions))
         if not menu.actions():
             return
         chosen = menu.exec(self.group_tree.viewport().mapToGlobal(position))
         if chosen is None:
             return
+        if chosen is standalone_action and len(paths) == 1:
+            self._activate_standalone(paths[0])
+        elif chosen in add_actions:
+            self._add_memberships(paths, add_actions[chosen])
+        elif chosen in remove_actions:
+            for path in paths:
+                self._remove_membership(path, remove_actions[chosen], rebuild=False)
+            self._rebuild_tree(remove_actions[chosen])
+            self._update_membership_labels()
+            self._save_state()
+
+    def _group_tab_context_menu(self, position) -> None:
+        index = self.group_tabs.tabAt(position)
+        group_id = (
+            str(self.group_tabs.tabData(index) or "") if index >= 0 else ""
+        )
+        menu = QMenu(self)
+        create_action = menu.addAction("新建对比组")
+        rename_action = legend_action = delete_action = None
+        if group_id in self.groups:
+            menu.addSeparator()
+            rename_action = menu.addAction("重命名")
+            legend_action = menu.addAction("图例范围设置…")
+            delete_action = menu.addAction("删除对比组")
+        chosen = menu.exec(self.group_tabs.mapToGlobal(position))
         if chosen is create_action:
             self._create_group()
         elif chosen is rename_action:
-            self._rename_group(self.group_tree.group_id(item))
-        elif chosen is delete_action:
-            self._delete_group(self.group_tree.group_id(item))
+            self._rename_group(group_id)
         elif chosen is legend_action:
-            self._edit_group_legend(self.group_tree.group_id(item))
-        elif chosen is remove_action:
-            self._remove_membership(
-                self.group_tree.odb_path(item), self.group_tree.group_id(item)
+            self._edit_group_legend(group_id)
+        elif chosen is delete_action:
+            self._delete_group(group_id)
+
+    def _group_tab_double_clicked(self, index: int) -> None:
+        if index >= 0:
+            group_id = str(self.group_tabs.tabData(index) or "")
+            if group_id:
+                self._rename_group(group_id)
+
+    def _drop_paths_into_current_group(self, paths: list[str]) -> None:
+        index = self.group_tabs.currentIndex()
+        group_id = (
+            str(self.group_tabs.tabData(index) or "") if index >= 0 else ""
+        )
+        if group_id not in self.groups:
+            QMessageBox.information(
+                self,
+                "请选择对比组",
+                "请先在右侧选择一个对比组标签，再将 ODB 拖入表格。",
             )
-        elif chosen in add_actions:
-            self._add_membership(self.group_tree.odb_path(item), add_actions[chosen])
+            return
+        self._add_memberships(paths, group_id)
 
     def _unique_group_name(self, name: str, exclude_id: str = "") -> bool:
         target = name.strip().casefold()
@@ -490,24 +652,31 @@ class MainWindow(_previous.MainWindow):
             self._save_state()
 
     def _add_membership(self, path: str, group_id: str) -> None:
+        self._add_memberships([path], group_id)
+
+    def _add_memberships(self, paths: list[str], group_id: str) -> None:
         group = self.groups.get(group_id)
         if not group:
             return
         members = group.setdefault("members", [])
-        if path not in members:
-            members.append(path)
+        for path in paths:
+            if path in self.rows_by_path and path not in members:
+                members.append(path)
         self._rebuild_tree(group_id)
         self._update_membership_labels()
         self._save_state()
 
-    def _remove_membership(self, path: str, group_id: str) -> None:
+    def _remove_membership(
+        self, path: str, group_id: str, *, rebuild: bool = True
+    ) -> None:
         group = self.groups.get(group_id)
         if not group:
             return
         group["members"] = [value for value in group.get("members", []) if value != path]
-        self._rebuild_tree(group_id)
-        self._update_membership_labels()
-        self._save_state()
+        if rebuild:
+            self._rebuild_tree(group_id)
+            self._update_membership_labels()
+            self._save_state()
 
     def _run_selected(self) -> None:
         self._run_scope("current")
@@ -519,25 +688,28 @@ class MainWindow(_previous.MainWindow):
         if not enabled:
             return []
         if scope == "current":
-            item = self.group_tree.currentItem()
-            kind = self.group_tree.kind(item)
-            if kind == "odb" and self.group_tree.group_id(item):
-                group_id = self.group_tree.group_id(item)
-                kind = "group"
-            else:
-                group_id = self.group_tree.group_id(item)
-            if kind == "group" and group_id in self.groups:
+            if (
+                self._current_scope_kind == "group"
+                and self._current_scope_group_id in self.groups
+            ):
+                group_id = self._current_scope_group_id
                 group = self.groups[group_id]
                 members = [path for path in group.get("members", []) if path in enabled]
                 return [{"id": group_id, "name": group["name"], "members": members,
                          "overrides": group.get("legend_overrides", {}), "standalone": False}]
-            if kind == "odb":
-                enabled &= {self.group_tree.odb_path(item)}
-            return [
-                {"id": "standalone::" + path, "name": Path(path).stem,
-                 "members": [path], "overrides": {}, "standalone": True}
-                for path in sorted(enabled)
-            ]
+            if (
+                self._current_scope_kind == "odb"
+                and self._current_scope_path in enabled
+            ):
+                path = self._current_scope_path
+                return [{
+                    "id": "standalone::" + path,
+                    "name": Path(path).stem,
+                    "members": [path],
+                    "overrides": {},
+                    "standalone": True,
+                }]
+            return []
 
         plans = []
         grouped_members = set()
@@ -581,7 +753,11 @@ class MainWindow(_previous.MainWindow):
         group_specs = self._scope_groups(scope)
         group_specs = [item for item in group_specs if item["members"]]
         if not group_specs:
-            QMessageBox.information(self, "没有作业", "当前范围没有已启用的 ODB。")
+            QMessageBox.information(
+                self,
+                "没有作业",
+                "请选择单个 ODB 或用户创建的对比组；“全部 ODB”和工况分类仅用于浏览。",
+            )
             return
         unique_paths = []
         for group in group_specs:

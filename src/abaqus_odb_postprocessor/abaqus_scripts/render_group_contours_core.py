@@ -48,9 +48,27 @@ def read_rows(path):
         return list(csv.DictReader(stream))
 
 
-timeline = read_rows(os.path.join(source_output_dir, "data", "timeline_alignment.csv"))
-if not timeline:
+full_timeline = read_rows(os.path.join(source_output_dir, "data", "timeline_alignment.csv"))
+if not full_timeline:
     raise RuntimeError("Numeric cache has no timeline rows: {0}".format(source_output_dir))
+selected_timeline_path = os.path.join(
+    source_output_dir, "data", "selected_timeline_alignment.csv"
+)
+if os.path.isfile(selected_timeline_path):
+    selected_timeline = read_rows(selected_timeline_path)
+else:
+    requested_sequences = set(
+        int(value) for value in config.get("selected_sequence_indices", [])
+    )
+    selected_timeline = [
+        row
+        for row in full_timeline
+        if not requested_sequences
+        or int(row["SequenceIndex"]) in requested_sequences
+    ]
+if not selected_timeline:
+    raise RuntimeError("Numeric cache has no selected timeline rows: {0}".format(source_output_dir))
+timeline = selected_timeline
 
 rebar_rows = read_rows(
     os.path.join(source_output_dir, "rebar", "rebar_element_stress_force_timehistory.csv")
@@ -60,7 +78,88 @@ for row in rebar_rows:
     key = (row["InstanceName"], int(row["ElementLabel"]))
     longitudinal[key] = True
 
-viewport = session.Viewport(name="Group contour renderer", origin=(0, 0), width=180, height=120)
+settings = config["settings"]
+image_size_unit = str(settings.get("image_size_unit", "px")).lower()
+image_width = int(settings.get("image_width", 1500))
+image_height = int(settings.get("image_height", 1000))
+if image_size_unit not in ("px", "mm"):
+    raise RuntimeError("image_size_unit must be px or mm")
+if image_size_unit == "px":
+    if not 320 <= image_width <= 4096 or not 320 <= image_height <= 4096:
+        raise RuntimeError("Pixel image dimensions must be between 320 and 4096")
+    image_size_setting = (image_width, image_height)
+else:
+    if not 30 <= image_width <= 500 or not 30 <= image_height <= 500:
+        raise RuntimeError("Viewport dimensions must be between 30 and 500 mm")
+    image_size_setting = SIZE_ON_SCREEN
+
+
+def create_large_render_viewport(name, unit, requested_width, requested_height):
+    """Use a real large canvas so fixed-size annotations stay proportional."""
+
+    if unit == "mm":
+        try:
+            viewport = session.Viewport(
+                name=name,
+                origin=(0, 0),
+                width=float(requested_width),
+                height=float(requested_height),
+                border=OFF,
+                titleBar=OFF,
+            )
+            return viewport, (float(requested_width), float(requested_height))
+        except Exception as error:
+            raise RuntimeError(
+                "The requested {0}x{1} mm viewport does not fit the current "
+                "screen; reduce the dimensions: {2}".format(
+                    requested_width, requested_height, error
+                )
+            )
+
+    aspect_ratio = float(requested_width) / float(requested_height)
+    attempts = []
+    for maximum_width, maximum_height in (
+        (396.0, 264.0),
+        (360.0, 240.0),
+        (330.0, 220.0),
+        (300.0, 200.0),
+        (270.0, 180.0),
+        (240.0, 160.0),
+        (180.0, 120.0),
+    ):
+        if maximum_width / maximum_height >= aspect_ratio:
+            height = maximum_height
+            width = height * aspect_ratio
+        else:
+            width = maximum_width
+            height = width / aspect_ratio
+        if width < 30.0 or height < 30.0:
+            continue
+        try:
+            viewport = session.Viewport(
+                name=name,
+                origin=(0, 0),
+                width=width,
+                height=height,
+                border=OFF,
+                titleBar=OFF,
+            )
+            return viewport, (width, height)
+        except Exception as error:
+            attempts.append("{0:g}x{1:g}: {2}".format(width, height, error))
+    raise RuntimeError(
+        "Unable to create a large render viewport: {0}".format(
+            " | ".join(attempts)
+        )
+    )
+
+
+viewport, render_viewport_mm = create_large_render_viewport(
+    "Group contour renderer",
+    image_size_unit,
+    image_width,
+    image_height,
+)
 viewport.makeCurrent()
 odb = session.openOdb(name=odb_path, readOnly=True)
 viewport.setValues(displayedObject=odb)
@@ -68,7 +167,6 @@ viewport.odbDisplay.setFrame(
     step=int(timeline[0]["StepIndex"]), frame=int(timeline[0]["FrameIndex"])
 )
 
-settings = config["settings"]
 legend_ranges = config.get("legend_ranges", {})
 damage_spectrum_name = "DAMAGE_DYNAMIC_10"
 damage_colors = (
@@ -86,7 +184,7 @@ session.graphicsOptions.setValues(
 session.printOptions.setValues(
     rendition=COLOR, vpDecorations=OFF, vpBackground=ON, compass=OFF
 )
-session.pngOptions.setValues(imageSize=(1600, 1200))
+session.pngOptions.setValues(imageSize=image_size_setting)
 viewport.viewportAnnotationOptions.setValues(
     triad=OFF, legend=ON, title=OFF, state=OFF, annotations=OFF, compass=OFF
 )
@@ -250,7 +348,8 @@ def render(spec):
     set_limits(spec)
     viewport.view.fitView()
     written = []
-    for animation_index, item in enumerate(timeline):
+    render_timeline = full_timeline
+    for animation_index, item in enumerate(render_timeline):
         step_index = int(item["StepIndex"])
         frame_index = int(item["FrameIndex"])
         frame = list(odb.steps.values())[step_index].frames[frame_index]
@@ -292,6 +391,9 @@ metadata.update(
         "soil_view_vector": [0.0, 1.0, 0.0],
         "soil_camera_up_vector": [0.0, 0.0, 1.0],
         "numeric_cache_source": source_output_dir,
+        "render_viewport_mm": list(render_viewport_mm),
+        "image_size_unit": image_size_unit,
+        "requested_image_size": [image_width, image_height],
     }
 )
 with open(metadata_path, "w", encoding="utf-8") as stream:

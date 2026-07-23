@@ -39,15 +39,14 @@ FIELD_NAMES = (
 
 
 class ComparisonTree(QTreeWidget):
-    membershipDropped = Signal(str, str)
-
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setHeaderHidden(True)
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setDragDropMode(QAbstractItemView.DragOnly)
         self.setDragEnabled(True)
-        self.setAcceptDrops(True)
-        self.setDropIndicatorShown(True)
+        self.setAcceptDrops(False)
+        self.setDropIndicatorShown(False)
         self.setDefaultDropAction(Qt.CopyAction)
 
     @staticmethod
@@ -62,13 +61,17 @@ class ComparisonTree(QTreeWidget):
     def group_id(item: QTreeWidgetItem | None) -> str:
         return "" if item is None else str(item.data(0, Qt.UserRole + 2) or "")
 
-    def startDrag(self, supported_actions: Qt.DropActions) -> None:
+    def selected_odb_paths(self) -> list[str]:
         paths = []
         for item in self.selectedItems():
             if self.kind(item) == "odb":
                 path = self.odb_path(item)
                 if path and path not in paths:
                     paths.append(path)
+        return paths
+
+    def startDrag(self, supported_actions: Qt.DropActions) -> None:
+        paths = self.selected_odb_paths()
         if not paths:
             return
         mime = QMimeData()
@@ -77,6 +80,27 @@ class ComparisonTree(QTreeWidget):
         drag.setMimeData(mime)
         drag.exec(Qt.CopyAction)
 
+
+def odb_paths_from_mime(mime_data) -> list[str]:
+    if not mime_data.hasFormat(MIME_ODB_PATHS):
+        return []
+    try:
+        values = json.loads(bytes(mime_data.data(MIME_ODB_PATHS)).decode("utf-8"))
+    except Exception:
+        return []
+    return [str(value) for value in values if str(value)]
+
+
+class GroupDropTable(QTableWidget):
+    odbPathsDropped = Signal(list)
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DropOnly)
+        self.setDropIndicatorShown(True)
+
     def dragEnterEvent(self, event) -> None:
         if event.mimeData().hasFormat(MIME_ODB_PATHS):
             event.acceptProposedAction()
@@ -84,25 +108,17 @@ class ComparisonTree(QTreeWidget):
             event.ignore()
 
     def dragMoveEvent(self, event) -> None:
-        target = self.itemAt(event.position().toPoint())
-        if self.kind(target) == "group":
+        if event.mimeData().hasFormat(MIME_ODB_PATHS):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event) -> None:
-        target = self.itemAt(event.position().toPoint())
-        if self.kind(target) != "group":
+        paths = odb_paths_from_mime(event.mimeData())
+        if not paths:
             event.ignore()
             return
-        try:
-            paths = json.loads(bytes(event.mimeData().data(MIME_ODB_PATHS)).decode("utf-8"))
-        except Exception:
-            event.ignore()
-            return
-        group_id = self.group_id(target)
-        for path in paths:
-            self.membershipDropped.emit(str(path), group_id)
+        self.odbPathsDropped.emit(paths)
         event.acceptProposedAction()
 
 

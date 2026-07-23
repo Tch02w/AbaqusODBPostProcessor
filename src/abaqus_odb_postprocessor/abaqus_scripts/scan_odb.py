@@ -42,11 +42,18 @@ if args.selection:
     with open(os.path.abspath(args.selection), "r", encoding="utf-8") as stream:
         requested = json.load(stream).get("paths", [])
     paths = []
-    folder_key = os.path.normcase(os.path.normpath(folder))
     for value in requested:
         path = os.path.abspath(value)
+        try:
+            relative = os.path.relpath(path, folder)
+            inside_folder = (
+                relative != os.pardir
+                and not relative.startswith(os.pardir + os.sep)
+            )
+        except ValueError:
+            inside_folder = False
         if (
-            os.path.normcase(os.path.normpath(os.path.dirname(path))) == folder_key
+            inside_folder
             and path.lower().endswith(".odb")
             and os.path.isfile(path)
             and path not in paths

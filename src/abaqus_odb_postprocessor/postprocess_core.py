@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import csv, json, math
+import csv, json, math, re
 from collections import defaultdict
 from pathlib import Path
 
@@ -178,6 +178,345 @@ def plot_pile_bending(output_dir: Path) -> list[Path]:
     return targets
 
 
+def _load_components(load_direction: str) -> list[int]:
+    components = []
+    for value in re.findall(r"[123]", str(load_direction)):
+        component = int(value)
+        if component not in components:
+            components.append(component)
+    return components or [3]
+
+
+def _float_or_none(value) -> float | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _component_history_value(
+    row: dict[str, str],
+    prefix: str,
+    components: list[int],
+    magnitude_column: str = "",
+) -> float | None:
+    values = [
+        value
+        for component in components
+        if (
+            value := _float_or_none(row.get(f"{prefix}{component}_N"))
+        ) is not None
+    ]
+    if len(components) == 1 and values:
+        return values[0]
+    if values:
+        return math.sqrt(sum(value * value for value in values))
+    return _float_or_none(row.get(magnitude_column)) if magnitude_column else None
+
+
+def build_load_resistance_table(output_dir: Path) -> Path | None:
+    """Build an engineering-ready pile/root-key load-sharing history."""
+
+    load_path = output_dir / "data" / "load_point_raw.csv"
+    history_output_dir = output_dir / "History_Output"
+    contact_path = history_output_dir / "contact_history_raw.csv"
+    if not load_path.exists() or not contact_path.exists():
+        return None
+    load_rows = read_csv(load_path)
+    contact_rows = read_csv(contact_path)
+    if not load_rows or not contact_rows:
+        return None
+
+    metadata_path = output_dir / "metadata.json"
+    metadata = (
+        json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata_path.exists()
+        else {}
+    )
+    config_path = output_dir / "job_config.json"
+    config = (
+        json.loads(config_path.read_text(encoding="utf-8"))
+        if config_path.exists()
+        else {}
+    )
+    load_direction = str(
+        metadata.get("load_direction")
+        or config.get("load_direction")
+        or "3"
+    )
+    components = _load_components(load_direction)
+    contact_by_sequence = {
+        int(float(row["SequenceIndex"])): row
+        for row in contact_rows
+    }
+    key_ids = sorted(
+        {
+            match.group(1)
+            for column in contact_rows[0]
+            if (
+                match := re.match(
+                    r"(KEY(?:_\d+)+)_CFN(?:[123]|M)_N$",
+                    column,
+                )
+            )
+        },
+        key=lambda value: tuple(
+            int(part) for part in value.split("_")[1:]
+        ),
+    )
+    key_groups = sorted(
+        {
+            "_".join(key_id.split("_")[:-1])
+            for key_id in key_ids
+            if len(key_id.split("_")) > 2
+        },
+        key=lambda value: tuple(
+            int(part) for part in value.split("_")[1:]
+        ),
+    )
+    timeline_columns = {
+        "SequenceIndex",
+        "StepIndex",
+        "StepName",
+        "FrameIndex",
+        "IncrementNumber",
+        "StepTime",
+        "TotalTime",
+    }
+    recognized_history_pattern = re.compile(
+        r"(?:KEY(?:_\d+)+_CFN(?:[123]|M)_N|"
+        r"PILE_(?:CFN[123M]|CFS[123M])_N)$"
+    )
+    passthrough_history_columns = [
+        column
+        for column in contact_rows[0]
+        if column not in timeline_columns
+        and not recognized_history_pattern.fullmatch(column)
+    ]
+    processed_rows = []
+    for load_row in load_rows:
+        sequence = int(float(load_row["SequenceIndex"]))
+        contact_row = contact_by_sequence.get(sequence, {})
+        displacement_components = [
+            _float_or_none(load_row.get(f"U{component}_mm")) or 0.0
+            for component in components
+        ]
+        reaction_components = [
+            _float_or_none(load_row.get(f"RF{component}_N")) or 0.0
+            for component in components
+        ]
+        if len(components) == 1:
+            displacement = displacement_components[0]
+            reaction_signed_kn = reaction_components[0] / 1000.0
+        else:
+            displacement = math.sqrt(
+                sum(value * value for value in displacement_components)
+            )
+            reaction_signed_kn = None
+        reaction_kn = math.sqrt(
+            sum(value * value for value in reaction_components)
+        ) / 1000.0
+        row = {
+            key: load_row[key]
+            for key in (
+                "SequenceIndex",
+                "StepIndex",
+                "StepName",
+                "FrameIndex",
+                "IncrementNumber",
+                "StepTime",
+                "TotalTime",
+            )
+            if key in load_row
+        }
+        row.update(
+            {
+                "LoadDirection": load_direction,
+                "PileTopDisplacement_mm": displacement,
+                "PileTopDisplacementAbs_mm": abs(displacement),
+                "PileTopReactionSigned_kN": (
+                    reaction_signed_kn
+                    if reaction_signed_kn is not None
+                    else ""
+                ),
+                "PileTopReaction_kN": reaction_kn,
+            }
+        )
+        key_resistances = []
+        key_signed_forces = []
+        key_bearing_by_id = {}
+        for key_id in key_ids:
+            signed_force = _component_history_value(
+                contact_row,
+                f"{key_id}_CFN",
+                components,
+                f"{key_id}_CFNM_N",
+            )
+            bearing_kn = (
+                abs(signed_force) / 1000.0
+                if signed_force is not None
+                else 0.0
+            )
+            signed_kn = (
+                signed_force / 1000.0
+                if signed_force is not None and len(components) == 1
+                else ""
+            )
+            row[f"{key_id}_HistorySigned_kN"] = signed_kn
+            row[f"{key_id}_Bearing_kN"] = bearing_kn
+            key_resistances.append(bearing_kn)
+            key_bearing_by_id[key_id] = bearing_kn
+            if signed_force is not None:
+                key_signed_forces.append(signed_force / 1000.0)
+
+        root_key_total = sum(key_resistances)
+        for key_group in key_groups:
+            group_values = [
+                bearing
+                for key_id, bearing in key_bearing_by_id.items()
+                if key_id.startswith(key_group + "_")
+            ]
+            row[f"{key_group}_GroupCount"] = len(group_values)
+            row[f"{key_group}_GroupTotalBearing_kN"] = sum(group_values)
+            row[f"{key_group}_GroupAverageBearing_kN"] = (
+                sum(group_values) / len(group_values)
+                if group_values
+                else 0.0
+            )
+        shaft_signed = _component_history_value(
+            contact_row,
+            "PILE_CFS",
+            components,
+            "PILE_CFSM_N",
+        )
+        shaft_friction = (
+            abs(shaft_signed) / 1000.0
+            if shaft_signed is not None
+            else 0.0
+        )
+        unresolved = reaction_kn - root_key_total - shaft_friction
+        denominator = reaction_kn if reaction_kn > 1.0e-12 else None
+        row.update(
+            {
+                "RootKeyCount": len(key_ids),
+                "RootKeyHistorySignedSum_kN": (
+                    sum(key_signed_forces)
+                    if len(components) == 1
+                    else ""
+                ),
+                "RootKeyTotalBearing_kN": root_key_total,
+                "RootKeyAverageBearing_kN": (
+                    root_key_total / len(key_ids)
+                    if key_ids
+                    else 0.0
+                ),
+                "PileShaftFrictionSigned_kN": (
+                    shaft_signed / 1000.0
+                    if shaft_signed is not None and len(components) == 1
+                    else ""
+                ),
+                "PileShaftFriction_kN": shaft_friction,
+                "UnresolvedResistance_kN": unresolved,
+                "RootKeyShare_percent": (
+                    100.0 * root_key_total / denominator
+                    if denominator
+                    else 0.0
+                ),
+                "PileShaftShare_percent": (
+                    100.0 * shaft_friction / denominator
+                    if denominator
+                    else 0.0
+                ),
+                "UnresolvedShare_percent": (
+                    100.0 * unresolved / denominator
+                    if denominator
+                    else 0.0
+                ),
+                "ContactHistoryStatus": (
+                    "aligned"
+                    if contact_row
+                    else "missing_for_sequence"
+                ),
+            }
+        )
+        for column in passthrough_history_columns:
+            row[column] = contact_row.get(column, "")
+        processed_rows.append(row)
+
+    target = history_output_dir / "load_resistance_processed.csv"
+    write_csv(target, processed_rows)
+    notes = {
+        "result_file": target.name,
+        "purpose": "桩顶荷载在根键、桩侧摩阻及尚未单独解析部分之间的初步分担结果",
+        "units": {
+            "displacement": "mm",
+            "force": "kN",
+            "share": "%",
+        },
+        "sign_convention": {
+            "HistorySigned": "保留 Abaqus History Output 原始方向；当前竖向根键与桩侧接触通常为负值",
+            "Bearing_or_Friction": "用于承载分担的正值大小，取相应历史力的绝对值或多方向合力",
+            "PileTopReaction": "桩顶反力大小；PileTopReactionSigned_kN 保留单方向符号",
+        },
+        "formulas": {
+            "RootKeyTotalBearing_kN": "各 Key*Bearing_kN 之和",
+            "RootKeyAverageBearing_kN": "RootKeyTotalBearing_kN / RootKeyCount",
+            "UnresolvedResistance_kN": "PileTopReaction_kN - RootKeyTotalBearing_kN - PileShaftFriction_kN",
+        },
+        "warning": "UnresolvedResistance_kN 是力平衡余量，可能包含桩端阻力、未提取接触分量及数值误差，不能未经核查直接等同为桩端阻力。",
+        "load_direction": load_direction,
+        "root_key_count": len(key_ids),
+        "root_key_ids": key_ids,
+        "root_key_groups": key_groups,
+        "unprocessed_history_columns": passthrough_history_columns,
+        "unprocessed_history_rule": "保留 Abaqus 原始 History Output 名称和值；不换算单位，不参加根键合力或分担比例计算。",
+    }
+    (history_output_dir / "load_resistance_notes.json").write_text(
+        json.dumps(notes, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return target
+
+
+def plot_load_resistance(output_dir: Path) -> Path | None:
+    history_output_dir = output_dir / "History_Output"
+    source = history_output_dir / "load_resistance_processed.csv"
+    if not source.exists():
+        return None
+    rows = read_csv(source)
+    if not rows:
+        return None
+    displacement = [
+        float(row["PileTopDisplacementAbs_mm"])
+        for row in rows
+    ]
+    history_output_dir.mkdir(parents=True, exist_ok=True)
+    target = history_output_dir / "load_resistance_sharing.png"
+    fig, ax = plt.subplots(figsize=(8.6, 6.2), constrained_layout=True)
+    for column, label in (
+        ("PileTopReaction_kN", "Pile-top reaction"),
+        ("RootKeyTotalBearing_kN", "Root-key total"),
+        ("PileShaftFriction_kN", "Pile-shaft friction"),
+        ("UnresolvedResistance_kN", "Unresolved / other"),
+    ):
+        ax.plot(
+            displacement,
+            [float(row[column]) for row in rows],
+            label=label,
+            linewidth=2.2 if column == "PileTopReaction_kN" else 1.7,
+        )
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    ax.grid(True, alpha=0.25)
+    ax.set_xlabel("Pile-top displacement magnitude (mm)")
+    ax.set_ylabel("Resistance (kN)")
+    ax.legend()
+    fig.savefig(target, dpi=180)
+    plt.close(fig)
+    return target
+
+
 def build_xlsx(output_dir: Path) -> Path:
     target = output_dir/"summary.xlsx"; workbook = xlsxwriter.Workbook(target)
     title = workbook.add_format({"bold": True, "font_color": "white", "bg_color": "#134E4A", "font_size": 16})
@@ -187,6 +526,7 @@ def build_xlsx(output_dir: Path) -> Path:
     summary.write_row("A3", ["Item", "Value"], header)
     metadata_path = output_dir/"metadata.json"; metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
     entries = [("ODB", metadata.get("odb_path", "")), ("Timeline", "Selected SequenceIndex + StepName + FrameIndex + TotalTime"),
+        ("Load sharing", "Pile-top reaction, individual root keys, root-key total/average, shaft friction, and unresolved balance; kN"),
         ("Rebar", "HRB400 + near-Z T3D2; per-element S11 × area"),
         ("Pile axial", "Concrete/pipe FreeBody + Z-interpolated rebar; compression positive"),
         ("Pile bending", "Global-1 lateral loading uses total My; rebar My = Σ(-xN)"),
@@ -194,6 +534,8 @@ def build_xlsx(output_dir: Path) -> Path:
     for index, values in enumerate(entries, 3): summary.write_row(index, 0, values, cell)
     summary.set_column("A:A", 24); summary.set_column("B:B", 90)
     sheets = [("Timeline", output_dir/"data"/"timeline_alignment.csv"),
+        ("Load_Sharing", output_dir/"History_Output"/"load_resistance_processed.csv"),
+        ("Contact_Raw", output_dir/"History_Output"/"contact_history_raw.csv"),
         ("Load_Raw", output_dir/"data"/"load_point_raw.csv"),
         ("Pile_Axial", output_dir/"freebody"/"pile_total_axial_force_time_aligned.csv"),
         ("Pile_Moment", output_dir/"freebody"/"pile_total_force_moment_time_aligned.csv"),
@@ -215,10 +557,13 @@ def build_xlsx(output_dir: Path) -> Path:
 
 
 def finalize_output(output_dir: Path, fps: int = 5) -> dict:
+    load_resistance_csv = build_load_resistance_table(output_dir)
     moment_csv, maxima_csv = build_pile_force_moment(output_dir)
     manifest = {"transparent_png_count": build_transparent_backgrounds(output_dir),
         "original_pngs_preserved": True,
         "animations": build_gifs(output_dir, fps), "pile_axial_plot": str(plot_pile_axial(output_dir) or ""),
+        "load_resistance_csv": str(load_resistance_csv or ""),
+        "load_resistance_plot": str(plot_load_resistance(output_dir) or ""),
         "pile_bending_plots": [str(path) for path in plot_pile_bending(output_dir)],
         "pile_force_moment_csv": str(moment_csv or ""), "pile_bending_maxima_csv": str(maxima_csv or ""),
         "xlsx": str(build_xlsx(output_dir))}

@@ -94,3 +94,35 @@ def aggregate_group_ranges(jobs: list[dict[str, Any]]) -> dict[str, dict[str, di
             }
         plans[group] = plan
     return plans
+
+
+def aggregate_animation_ranges(
+    range_scan: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Fix one ODB animation to its observed range across every rendered frame."""
+
+    observed: dict[str, list[float]] = {}
+    for frame in range_scan.get("frame_catalog", []):
+        for spec, limits in frame.get("ranges", {}).items():
+            current = observed.setdefault(
+                str(spec), [float("inf"), float("-inf")]
+            )
+            current[0] = min(current[0], float(limits["min"]))
+            current[1] = max(current[1], float(limits["max"]))
+
+    result: dict[str, dict[str, Any]] = {}
+    for spec, (minimum, maximum) in observed.items():
+        observed_min = minimum
+        observed_max = maximum
+        if minimum == maximum:
+            padding = max(abs(minimum), 1.0) * 1.0e-9
+            minimum -= padding
+            maximum += padding
+        result[spec] = {
+            "min": minimum,
+            "max": maximum,
+            "observed_min": observed_min,
+            "observed_max": observed_max,
+            "source": "odb_full_animation_timeline",
+        }
+    return result

@@ -19,6 +19,16 @@ _REBAR_RE = re.compile(r"(?:^|[-_])R(?=$|[-_])", re.IGNORECASE)
 _PARAMETER_RE = re.compile(r"(?:^|[-_])(?P<name>miu\d+)(?=$|[-_])", re.IGNORECASE)
 
 
+def natural_sort_key(value: str) -> tuple[tuple[int, object], ...]:
+    """Sort embedded decimal numbers numerically instead of lexicographically."""
+
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r"(\d+)", str(value))
+        if part
+    )
+
+
 @dataclass(frozen=True)
 class OdbNameInfo:
     stem: str
@@ -104,4 +114,3 @@ def parse_odb_name(value: str | Path) -> OdbNameInfo:
         lateral_displacement_mm=lateral,
         rebar_diameter_mm=_diameter(sample_id, gja_index),
     )
-

@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from abaqus_odb_postprocessor.app import MainWindow
-from abaqus_odb_postprocessor.naming import parse_odb_name
+from abaqus_odb_postprocessor.naming import natural_sort_key, parse_odb_name
 from abaqus_odb_postprocessor.models import OdbScan
 from abaqus_odb_postprocessor.ui_style import (
     AccidentalWheelGuard,
@@ -30,6 +30,16 @@ from abaqus_odb_postprocessor.ui_style import (
 
 def application() -> QApplication:
     return QApplication.instance() or QApplication([])
+
+
+def test_main_window_has_a_result_browser_launch_button() -> None:
+    application()
+    window = MainWindow()
+    button = window.findChild(QPushButton, "resultBrowserButton")
+    assert button is window.result_browser_button
+    assert button.text() == "结果浏览器"
+    assert button.parentWidget() is window.centralWidget()
+    window.close()
 
 
 def make_scan(path: Path) -> OdbScan:
@@ -70,6 +80,21 @@ def test_d_series_diameters() -> None:
     assert parse_odb_name("D800-R_U100D.odb").rebar_diameter_mm == 22.0
     assert parse_odb_name("D1000-R_U100D.odb").rebar_diameter_mm == 28.0
     assert parse_odb_name("D1400_17-R_U40D_V20D.odb").rebar_diameter_mm == 32.0
+
+
+def test_odb_names_use_natural_numeric_order() -> None:
+    names = [
+        "GJA-19-R_U100D.odb",
+        "GJA-2-R_U100D.odb",
+        "GJA-10-R_U100D.odb",
+        "GJA-1-R_U100D.odb",
+    ]
+    assert sorted(names, key=natural_sort_key) == [
+        "GJA-1-R_U100D.odb",
+        "GJA-2-R_U100D.odb",
+        "GJA-10-R_U100D.odb",
+        "GJA-19-R_U100D.odb",
+    ]
 
 
 def test_condition_categories_are_browse_only_and_real_groups_are_preserved(
@@ -133,6 +158,10 @@ def test_condition_categories_are_browse_only_and_real_groups_are_preserved(
     assert first_row["diameter"].value() == 22.0
     assert window._job_payload(third_row, tmp_path)["load_direction"] == "3"
     assert third_row["diameter"].value() == 28.0
+    assert [
+        first_row["direction"].itemText(index)
+        for index in range(first_row["direction"].count())
+    ] == ["X方向", "Z方向", "XZ方向", "自动"]
     window.close()
 
 
@@ -177,10 +206,11 @@ def test_manual_direction_and_diameter_are_persisted(tmp_path: Path) -> None:
     window._load_folder_state(str(folder))
     window._populate([item])
     row = window.rows_by_path[str(item.path.resolve())]
-    row["direction"].setCurrentText("1")
+    row["direction"].setCurrentText("X方向")
     row["diameter"].setValue(25.0)
     saved = window._serialize_row(row)
     assert saved["direction_manual"] is True
+    assert saved["direction"] == "X方向"
     assert saved["diameter_manual"] is True
     assert window._job_payload(row, tmp_path)["load_direction"] == "1"
     window.close()

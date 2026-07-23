@@ -41,10 +41,41 @@ def inspect_odb(path):
         step_names = list(odb.steps.keys())
         field_outputs = set()
         step_details = []
+        history_output_details = []
         for step_name in step_names:
             step = odb.steps[step_name]
             for frame in step.frames:
                 field_outputs.update(frame.fieldOutputs.keys())
+            history_regions = []
+            for region_name, region in step.historyRegions.items():
+                output_names = sorted(region.historyOutputs.keys())
+                if not output_names:
+                    continue
+                output_previews = {}
+                for output_name in output_names:
+                    data = region.historyOutputs[output_name].data
+                    if data is None:
+                        data = ()
+                    output_previews[output_name] = {
+                        "point_count": len(data),
+                        "first": list(data[0]) if data else None,
+                        "last": list(data[-1]) if data else None,
+                    }
+                history_regions.append(
+                    {
+                        "name": region_name,
+                        "description": str(getattr(region, "description", "")),
+                        "position": str(getattr(region, "position", "")),
+                        "outputs": output_names,
+                        "output_previews": output_previews,
+                    }
+                )
+            history_output_details.append(
+                {
+                    "step": step_name,
+                    "regions": history_regions,
+                }
+            )
             step_details.append(
                 {
                     "name": step_name,
@@ -80,6 +111,7 @@ def inspect_odb(path):
             {
                 "steps": step_names,
                 "step_details": step_details,
+                "history_output_details": history_output_details,
                 "field_outputs": sorted(field_outputs),
                 "assembly_node_sets": node_names,
                 "assembly_element_sets": element_names,
@@ -130,4 +162,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

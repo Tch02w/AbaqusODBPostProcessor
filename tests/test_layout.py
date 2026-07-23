@@ -22,9 +22,9 @@ def test_runtime_scripts_are_single_current_entries() -> None:
         assert abaqus_script(name).is_file()
 
 
-def test_cache_is_in_system_temp() -> None:
-    cache = scan_cache_dir().resolve()
-    assert cache.is_relative_to(Path(tempfile.gettempdir()).resolve())
+def test_cache_is_persistent_under_selected_odb_root(tmp_path: Path) -> None:
+    cache = scan_cache_dir(tmp_path).resolve()
+    assert cache == tmp_path.resolve() / "cache"
 
 
 def test_batch_scratch_is_in_system_temp() -> None:
@@ -99,6 +99,72 @@ def test_frame_selection_preserves_history_and_full_gif_timeline() -> None:
     assert 'os.path.join(data_dir, "load_point_raw.csv")' in patched
     assert 'os.path.join(data_dir, "selected_timeline_alignment.csv")' in patched
     assert "render_timeline = full_timeline" in patched
+
+
+def test_animation_and_static_contours_use_fixed_scoped_legends() -> None:
+    script_root = Path(__file__).parents[1] / "src" / "abaqus_odb_postprocessor"
+    extractor = (
+        script_root / "abaqus_scripts" / "extract_job.py"
+    ).read_text(encoding="utf-8")
+    group_renderer = (
+        script_root / "abaqus_scripts" / "render_group_contours_core.py"
+    ).read_text(encoding="utf-8")
+
+    for source in (extractor, group_renderer):
+        assert "def set_animation_limits(spec):" in source
+        assert "def set_static_limits(spec):" in source
+        assert "maxAutoCompute=ON" in source
+        assert "set_animation_limits(spec)" in source
+        assert "set_static_limits(spec)" in source
+        assert 'static_base = os.path.join(contour_dir, spec["name"] + "_LAST")' in source
+        assert '"animation_legend_mode": "odb_full_timeline_fixed"' in source
+        assert "animation_legend_ranges" in source
+        assert (
+            '"static_contour_legend_mode": '
+            '"comparison_group_fixed_selected_frames"'
+        ) in source
+        assert "shutil.copyfile(written[-1]" not in source
+
+    animation_call = group_renderer.index(
+        "set_animation_limits(spec)",
+        group_renderer.index("for animation_index, item in enumerate(render_timeline):"),
+    )
+    frame_call = group_renderer.index(
+        "viewport.odbDisplay.setFrame(step=step_index, frame=frame_index)",
+        group_renderer.index("for animation_index, item in enumerate(render_timeline):"),
+    )
+    print_call = group_renderer.index(
+        "session.printToFile(fileName=base",
+        group_renderer.index("for animation_index, item in enumerate(render_timeline):"),
+    )
+    assert frame_call < animation_call < print_call
+
+
+def test_worker_extracts_root_key_and_pile_contact_histories() -> None:
+    worker = (
+        Path(__file__).parents[1]
+        / "src"
+        / "abaqus_odb_postprocessor"
+        / "abaqus_scripts"
+        / "extract_job.py"
+    ).read_text(encoding="utf-8")
+    scanner = (
+        Path(__file__).parents[1]
+        / "src"
+        / "abaqus_odb_postprocessor"
+        / "abaqus_scripts"
+        / "scan_odb_core.py"
+    ).read_text(encoding="utf-8")
+
+    assert 're.search(r"KEY(?:[_\\- ]+\\d+)+", upper)' in worker
+    assert '"CFN1", "CFN2", "CFN3", "CFNM"' in worker
+    assert '"CFS1", "CFS2", "CFS3", "CFSM"' in worker
+    assert '"contact_history_raw.csv"' in worker
+    assert '"contact_history_sources.json"' in worker
+    assert 'if "KEY" in upper:' in worker
+    assert "history_output_details" in scanner
+    assert "output_previews" in scanner
+    assert "if data is None:" in scanner
 
 
 def test_scan_worker_accepts_nested_selected_odb_paths() -> None:

@@ -8,7 +8,7 @@ import csv
 import json
 import math
 import os
-import shutil
+import re
 import sys
 import traceback
 import visualization
@@ -65,11 +65,20 @@ with open(config_path, "r", encoding="utf-8") as stream:
 odb_path = os.path.abspath(config["odb_path"])
 output_dir = os.path.abspath(config["output_dir"])
 data_dir = os.path.join(output_dir, "data")
+history_output_dir = os.path.join(output_dir, "History_Output")
 rebar_dir = os.path.join(output_dir, "rebar")
 freebody_dir = os.path.join(output_dir, "freebody")
 frame_root = os.path.join(output_dir, "frames")
 contour_dir = os.path.join(output_dir, "contours")
-for directory in (output_dir, data_dir, rebar_dir, freebody_dir, frame_root, contour_dir):
+for directory in (
+    output_dir,
+    data_dir,
+    history_output_dir,
+    rebar_dir,
+    freebody_dir,
+    frame_root,
+    contour_dir,
+):
     os.makedirs(directory, exist_ok=True)
 log_path = os.path.join(output_dir, "abaqus_worker.log")
 
@@ -85,6 +94,7 @@ with open(log_path, "w", encoding="utf-8") as stream:
     stream.write("Abaqus ODB worker started\n")
 
 settings = config["settings"]
+animation_legend_ranges = config.get("animation_legend_ranges", {})
 start_step_name = config["start_step"]
 end_step_name = config["end_step"]
 load_set_name = config["load_set"]
@@ -259,6 +269,122 @@ for item in timeline:
     )
     load_rows.append(row)
 write_csv(os.path.join(data_dir, "load_point_raw.csv"), list(load_rows[0].keys()), load_rows)
+
+
+def history_value_at(data, target_time):
+    """Linearly align one History Output series to a field-output frame time."""
+
+    if not data:
+        return None
+    times = [float(point[0]) for point in data]
+    position = bisect.bisect_left(times, float(target_time))
+    if position <= 0:
+        return float(data[0][1])
+    if position >= len(data):
+        return float(data[-1][1])
+    right_time, right_value = data[position]
+    left_time, left_value = data[position - 1]
+    right_time = float(right_time)
+    left_time = float(left_time)
+    if abs(right_time - float(target_time)) <= 1.0e-10:
+        return float(right_value)
+    if abs(right_time - left_time) <= 1.0e-14:
+        return float(right_value)
+    ratio = (float(target_time) - left_time) / (right_time - left_time)
+    return float(left_value) + ratio * (float(right_value) - float(left_value))
+
+
+def contact_history_column(output_name):
+    """Return a stable column for root-key or pile-soil contact histories."""
+
+    upper = str(output_name).upper()
+    variable = upper.strip().split()[0] if upper.strip() else ""
+    key_match = re.search(r"KEY(?:[_\- ]+\d+)+", upper)
+    if key_match and variable in ("CFN1", "CFN2", "CFN3", "CFNM"):
+        key_name = re.sub(r"[_\- ]+", "_", key_match.group(0))
+        return "{0}_{1}_N".format(key_name, variable)
+    if (
+        not key_match
+        and "PILE" in upper
+        and variable in (
+            "CFN1", "CFN2", "CFN3", "CFNM",
+            "CFS1", "CFS2", "CFS3", "CFSM",
+        )
+    ):
+        return "PILE_{0}_N".format(variable)
+    if "KEY" in upper:
+        return str(output_name).strip()
+    return ""
+
+
+history_sources_by_step = {}
+history_source_metadata = []
+all_history_columns = set()
+for step_index in range(start_step_index, end_step_index + 1):
+    step_name = step_names[step_index]
+    step = odb.steps[step_name]
+    step_sources = {}
+    for region_name, region in step.historyRegions.items():
+        for output_name, history_output in region.historyOutputs.items():
+            column = contact_history_column(output_name)
+            if not column:
+                continue
+            series = [
+                (float(point[0]), float(point[1]))
+                for point in history_output.data
+            ]
+            if not series:
+                continue
+            step_sources.setdefault(column, []).append(series)
+            all_history_columns.add(column)
+            history_source_metadata.append(
+                {
+                    "step": step_name,
+                    "column": column,
+                    "region": str(region_name),
+                    "region_description": str(
+                        getattr(region, "description", "")
+                    ),
+                    "history_output": str(output_name),
+                    "point_count": len(series),
+                }
+            )
+    history_sources_by_step[step_name] = step_sources
+
+contact_history_rows = []
+history_columns = sorted(all_history_columns)
+if history_columns:
+    for item in timeline:
+        row = dict((name, item[name]) for name in timeline_headers)
+        step_sources = history_sources_by_step.get(item["StepName"], {})
+        for column in history_columns:
+            values = []
+            for series in step_sources.get(column, []):
+                value = history_value_at(series, item["StepTime"])
+                if value is not None:
+                    values.append(value)
+            row[column] = sum(values) if values else ""
+        contact_history_rows.append(row)
+    write_csv(
+        os.path.join(history_output_dir, "contact_history_raw.csv"),
+        timeline_headers + history_columns,
+        contact_history_rows,
+    )
+with open(
+    os.path.join(history_output_dir, "contact_history_sources.json"),
+    "w",
+    encoding="utf-8",
+) as stream:
+    json.dump(
+        {
+            "load_direction": str(config.get("load_direction", "")),
+            "columns": history_columns,
+            "sources": history_source_metadata,
+        },
+        stream,
+        ensure_ascii=False,
+        indent=2,
+    )
 
 
 def region_elements(region):
@@ -630,6 +756,37 @@ def primary_variable(variable, refinement):
         )
 
 
+def set_animation_limits(spec):
+    """Use one observed min/max range for this ODB's complete animation."""
+
+    limits = animation_legend_ranges.get(spec["name"], {})
+    if spec["variable"] in ("DAMAGET", "DAMAGEC") and limits:
+        viewport.odbDisplay.contourOptions.setValues(
+            minAutoCompute=OFF,
+            minValue=float(limits["min"]),
+            maxAutoCompute=OFF,
+            maxValue=float(limits["max"]),
+        )
+    elif limits:
+        viewport.odbDisplay.contourOptions.setValues(
+            minAutoCompute=OFF,
+            minValue=float(limits["min"]),
+            maxAutoCompute=OFF,
+            maxValue=float(limits["max"]),
+        )
+    else:
+        viewport.odbDisplay.contourOptions.setValues(
+            minAutoCompute=ON,
+            maxAutoCompute=ON,
+        )
+
+
+def set_static_limits(spec):
+    """Configure the separately rendered static comparison contour."""
+
+    viewport.odbDisplay.contourOptions.setValues(minAutoCompute=ON, maxAutoCompute=ON)
+
+
 def render(spec):
     folder = os.path.join(frame_root, spec["name"])
     os.makedirs(folder, exist_ok=True)
@@ -665,13 +822,15 @@ def render(spec):
     primary_variable(spec["variable"], spec.get("refinement"))
     state = (CONTOURS_ON_UNDEF,) if spec.get("undeformed") else (CONTOURS_ON_DEF,)
     viewport.odbDisplay.display.setValues(plotState=state)
-    viewport.odbDisplay.contourOptions.setValues(minAutoCompute=ON, maxAutoCompute=ON)
+    set_static_limits(spec)
     viewport.view.fitView()
     written = []
+    last_rendered_item = None
     for animation_index, item in enumerate(timeline):
         if spec["variable"] not in item["frame"].fieldOutputs:
             continue
         viewport.odbDisplay.setFrame(step=item["StepIndex"], frame=item["FrameIndex"])
+        set_animation_limits(spec)
         base = os.path.join(
             folder,
             "{0:04d}_{1}_F{2:04d}".format(animation_index, safe_name(item["StepName"]), item["FrameIndex"]),
@@ -679,10 +838,24 @@ def render(spec):
         try:
             session.printToFile(fileName=base, format=PNG, canvasObjects=(viewport,))
             written.append(base + ".png")
+            last_rendered_item = item
         except Exception:
             log("RENDER FAILED {0} {1}\n{2}".format(spec["name"], animation_index, traceback.format_exc()))
-    if written:
-        shutil.copyfile(written[-1], os.path.join(contour_dir, spec["name"] + "_LAST.png"))
+    if last_rendered_item is not None:
+        viewport.odbDisplay.setFrame(
+            step=last_rendered_item["StepIndex"],
+            frame=last_rendered_item["FrameIndex"],
+        )
+        set_static_limits(spec)
+        static_base = os.path.join(contour_dir, spec["name"] + "_LAST")
+        try:
+            session.printToFile(
+                fileName=static_base,
+                format=PNG,
+                canvasObjects=(viewport,),
+            )
+        except Exception:
+            log("STATIC RENDER FAILED {0}\n{1}".format(spec["name"], traceback.format_exc()))
     log("RENDER {0}: {1} frames".format(spec["name"], len(written)))
 
 
@@ -708,6 +881,7 @@ metadata = {
     "timeline_points": len(timeline),
     "alignment_key": ["SequenceIndex", "StepName", "FrameIndex", "TotalTime"],
     "load_set": load_set_name,
+    "load_direction": str(config.get("load_direction", "")),
     "pile_type": config["pile_type"],
     "pile_display_set": pile_display_set_name,
     "pile_concrete_set": concrete_set_name,
@@ -725,6 +899,11 @@ metadata = {
     "render_viewport_mm": list(render_viewport_mm),
     "image_size_unit": image_size_unit,
     "requested_image_size": [image_width, image_height],
+    "contact_history_columns": history_columns,
+    "contact_history_source_count": len(history_source_metadata),
+    "animation_legend_mode": "odb_full_timeline_fixed",
+    "animation_legend_ranges": animation_legend_ranges,
+    "static_contour_legend_mode": "comparison_group_fixed_selected_frames",
 }
 with open(os.path.join(output_dir, "metadata.json"), "w", encoding="utf-8") as stream:
     json.dump(metadata, stream, ensure_ascii=False, indent=2)

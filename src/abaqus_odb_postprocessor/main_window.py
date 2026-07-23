@@ -139,7 +139,7 @@ class MainWindow(QMainWindow):
     def _scan(self) -> None:
         folder = Path(self.folder_edit.text().strip())
         if not folder.is_dir(): QMessageBox.warning(self, "路径无效", "请选择存在的 ODB 文件夹。"); return
-        cache = scan_cache_dir(); self._append_log(f"扫描：{folder}")
+        cache = scan_cache_dir(folder); self._append_log(f"扫描：{folder}")
         self._start_thread(lambda log: scan_folder(self.defaults["abaqus_command"], folder, cache, log), self._scan_finished)
 
     def _scan_finished(self, payload: dict) -> None:

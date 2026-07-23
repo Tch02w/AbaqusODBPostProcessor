@@ -25,6 +25,10 @@ class OdbScan:
     assembly_element_sets: list[str]
     field_outputs: list[str]
     set_details: dict[str, Any] = field(default_factory=dict)
+    history_output_details: list[dict[str, Any]] = field(default_factory=list)
+    content_fingerprint: str = ""
+    file_size: int = 0
+    mtime_ns: int = 0
     error: str = ""
 
     @property
@@ -40,6 +44,11 @@ class OdbScan:
             assembly_element_sets=list(payload.get("assembly_element_sets", [])),
             field_outputs=list(payload.get("field_outputs", [])),
             set_details=dict(payload.get("set_details", {})),
+            history_output_details=list(
+                payload.get("history_output_details", [])
+            ),
+            content_fingerprint=str(payload.get("content_fingerprint", "")),
+            file_size=int(payload.get("file_size", 0)),
+            mtime_ns=int(payload.get("mtime_ns", 0)),
             error=str(payload.get("error", "")),
         )
-

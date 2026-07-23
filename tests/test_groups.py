@@ -124,3 +124,83 @@ def test_scan_progress_and_state_persistence(tmp_path: Path) -> None:
 
 def test_safe_folder_name() -> None:
     assert safe_folder_name('组:A/B*?') == "组_A_B_"
+
+
+def test_group_tabs_reorder_persist_and_fifo_snapshots_are_frozen(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application()
+    window = MainWindow()
+    window.state_path = tmp_path / "project_state.json"
+    folder = tmp_path / "odb"
+    folder.mkdir()
+    first = scan(folder / "GJA-2.odb")
+    second = scan(folder / "GJA-10.odb")
+    window._load_folder_state(str(folder))
+    window._populate([first, second])
+    all_root = window.group_tree.topLevelItem(0)
+    assert [all_root.child(index).text(0) for index in range(2)] == [
+        "GJA-2.odb",
+        "GJA-10.odb",
+    ]
+    first_path = str(first.path.resolve())
+    second_path = str(second.path.resolve())
+    window.groups = {
+        "a": {
+            "name": "组A",
+            "members": [first_path],
+            "legend_overrides": {},
+        },
+        "b": {
+            "name": "组B",
+            "members": [second_path],
+            "legend_overrides": {},
+        },
+    }
+    window._rebuild_tree("a")
+    assert window.group_tabs.isMovable()
+    assert window.group_tabs.usesScrollButtons()
+
+    window.group_tabs.moveTab(2, 1)
+    assert list(window.groups) == ["b", "a"]
+    window.group_tabs.moveTab(0, 2)
+    assert window.group_tabs.tabText(0) == "全部配置"
+    assert list(window.groups) == ["b", "a"]
+
+    monkeypatch.setattr(window, "_start_next_group", lambda: None)
+    window.force_rescan_checkbox.setChecked(True)
+    window._run_scope("all")
+    assert [item["id"] for item in window.group_queue] == ["b", "a"]
+    assert all(item["force_rescan"] for item in window.group_queue)
+    assert not window.force_rescan_checkbox.isChecked()
+    assert (
+        window.group_queue[0]["snapshots"][second_path]["load_direction"]
+        == "1+3"
+    )
+
+    row = window.rows_by_path[second_path]
+    row["direction"].setCurrentText("X方向")
+    window.groups["b"]["name"] = "后来修改"
+    assert (
+        window.group_queue[0]["snapshots"][second_path]["load_direction"]
+        == "1+3"
+    )
+    assert window.group_queue[0]["name"] == "组B"
+
+    window.active_group_task = window.group_queue.pop(0)
+    window._refresh_queue_ui()
+    assert window.group_tabs.tabText(1) == "组B（运行中）"
+    assert window.group_tabs.tabText(2) == "组A（排队 1）"
+    assert "正在运行：组B" in window.scan_status.text()
+    window._append_log("BATCH_PROGRESS|scan|1|2|GJA-10.odb")
+    assert "正在运行：组B（预扫描 1/2：GJA-10.odb）" in window.scan_status.text()
+    assert "排队：组A" in window.scan_status.text()
+    assert window._group_is_locked("b")
+    assert window._group_is_locked("a")
+
+    window.active_group_task = None
+    window.group_queue.clear()
+    window._save_state()
+    saved = json.loads(window.state_path.read_text(encoding="utf-8"))
+    assert saved["folders"][str(folder.resolve())]["group_order"] == ["b", "a"]
+    window.close()

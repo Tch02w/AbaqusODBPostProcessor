@@ -1,4 +1,4 @@
-"""Filesystem locations for code, user state, temporary cache, and results."""
+"""Filesystem locations for code, user state, persistent cache, and results."""
 
 from __future__ import annotations
 
@@ -16,8 +16,10 @@ def temp_root() -> Path:
     return root
 
 
-def scan_cache_dir() -> Path:
-    path = temp_root() / "scan_cache"
+def scan_cache_dir(odb_root: Path | str) -> Path:
+    """Return the single persistent cache directory for an ODB project root."""
+
+    path = Path(odb_root).resolve() / "cache"
     path.mkdir(parents=True, exist_ok=True)
     return path
 

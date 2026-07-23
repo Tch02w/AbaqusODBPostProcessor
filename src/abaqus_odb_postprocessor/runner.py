@@ -7,6 +7,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
 
+from .cache import (
+    CACHE_SCHEMA_VERSION,
+    invalidate_content_fingerprint,
+    load_json_cache,
+    odb_file_metadata,
+    quick_odb_fingerprint,
+    save_json_cache,
+    stable_config_hash,
+)
 from .config import abaqus_script, save_json
 from .process_runner import *
 from .process_runner import ProcessCancelled, ProcessController, run_process
@@ -36,6 +45,8 @@ def scan_folder(
     controller: ProcessController | MultiProcessController | None = None,
     selected_paths: Iterable[Path | str] | None = None,
     parallel_workers: int = 1,
+    force_rescan: bool = False,
+    abaqus_version: str = "",
 ) -> dict:
     cache_dir.mkdir(parents=True, exist_ok=True)
     output = cache_dir / "scan_report.json"
@@ -45,17 +56,107 @@ def scan_folder(
         else [Path(value).resolve() for value in selected_paths]
     )
     workers = max(1, min(int(parallel_workers), 4))
-    if selected is not None and len(selected) > 1 and workers > 1:
-        return _scan_selected_paths_parallel(
-            abaqus_command,
-            odb_folder.resolve(),
-            cache_dir,
-            output,
-            selected,
-            min(workers, len(selected)),
-            log,
-            controller,
-        )
+    if selected is not None:
+        version = str(abaqus_version or abaqus_command)
+        scan_snapshot = {
+            "scanner": "scan_odb",
+            "schema_version": CACHE_SCHEMA_VERSION,
+        }
+        config_hash = stable_config_hash(scan_snapshot)
+        fingerprints: dict[str, str] = {}
+        results: dict[str, dict] = {}
+        misses: list[Path] = []
+        for path in selected:
+            fingerprint = quick_odb_fingerprint(path)
+            fingerprints[str(path)] = fingerprint
+            cached = None if force_rescan else load_json_cache(
+                cache_dir,
+                "initial",
+                fingerprint,
+                version,
+                config_hash,
+            )
+            if cached is None:
+                misses.append(path)
+                if log:
+                    log(f"CACHE_MISS|initial|{path.name}")
+                continue
+            item = dict(cached)
+            item.update(
+                {
+                    "path": str(path),
+                    "content_fingerprint": fingerprint,
+                    **odb_file_metadata(path),
+                }
+            )
+            results[str(path)] = item
+            if log:
+                log(f"CACHE_HIT|initial|{path.name}|{fingerprint[:12]}")
+
+        if log:
+            log(f"SCAN_DISCOVERED|{len(selected)}")
+            for completed, path in enumerate(
+                (path for path in selected if str(path) in results), 1
+            ):
+                log(f"SCAN_DONE|{completed}|{len(selected)}|{path.name}")
+
+        scanned_payload = {"odbs": [], "cancelled": False}
+        if misses:
+            cached_count = len(results)
+            scanned_payload = _scan_selected_paths_parallel(
+                abaqus_command,
+                odb_folder.resolve(),
+                cache_dir,
+                output,
+                misses,
+                min(workers, len(misses)),
+                log,
+                controller,
+                progress_start=cached_count,
+                progress_total=len(selected),
+                emit_discovered=False,
+            )
+            for item in scanned_payload.get("odbs", []):
+                path = Path(item["path"]).resolve()
+                fingerprint = fingerprints[str(path)]
+                enriched = dict(item)
+                enriched.update(
+                    {
+                        "path": str(path),
+                        "content_fingerprint": fingerprint,
+                        **odb_file_metadata(path),
+                    }
+                )
+                results[str(path)] = enriched
+                if not enriched.get("error"):
+                    save_json_cache(
+                        cache_dir,
+                        "initial",
+                        path,
+                        fingerprint,
+                        version,
+                        enriched,
+                        config_hash=config_hash,
+                        config_snapshot=scan_snapshot,
+                    )
+
+        ordered = [results[str(path)] for path in selected if str(path) in results]
+        payload = {
+            "folder": str(odb_folder.resolve()),
+            "discovered_count": len(selected),
+            "odb_count": len(selected),
+            "completed_count": len(ordered),
+            "cancelled": bool(scanned_payload.get("cancelled", False)),
+            "selected_paths": [str(path) for path in selected],
+            "odbs": ordered,
+            "parallel_workers": min(workers, max(len(misses), 1)),
+            "cache_root": str(cache_dir),
+            "cache_hits": len(selected) - len(misses),
+        }
+        save_json(output, payload)
+        if log:
+            log(f"SCAN_FINISHED|{len(ordered)}|{len(selected)}")
+        return payload
     arguments = [
         abaqus_command,
         "python",
@@ -95,10 +196,15 @@ def _scan_selected_paths_parallel(
     workers: int,
     log: LogCallback | None,
     controller: ProcessController | MultiProcessController | None,
+    *,
+    progress_start: int = 0,
+    progress_total: int | None = None,
+    emit_discovered: bool = True,
 ) -> dict:
     """Scan selected ODBs in independent Abaqus Python processes."""
 
     total = len(selected_paths)
+    displayed_total = progress_total if progress_total is not None else total
     results: dict[str, dict] = {}
     completed = 0
     completion_lock = threading.Lock()
@@ -136,7 +242,10 @@ def _scan_selected_paths_parallel(
         )
         result_path.unlink(missing_ok=True)
         if log:
-            log(f"SCAN_START|{index}|{total}|{path.name}")
+            log(
+                f"SCAN_START|{progress_start + index}|"
+                f"{displayed_total}|{path.name}"
+            )
 
         def child_log(message: str) -> None:
             if log and not message.startswith("SCAN_") and not message.startswith('{"output"'):
@@ -164,8 +273,8 @@ def _scan_selected_paths_parallel(
             raise RuntimeError(f"ODB 扫描未返回唯一结果：{path}")
         return str(path), odbs[0]
 
-    if log:
-        log(f"SCAN_DISCOVERED|{total}")
+    if log and emit_discovered:
+        log(f"SCAN_DISCOVERED|{displayed_total}")
     try:
         with ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="odb-initial-scan"
@@ -186,7 +295,10 @@ def _scan_selected_paths_parallel(
                     done = completed
                 report(False)
                 if log:
-                    log(f"SCAN_DONE|{done}|{total}|{path.name}")
+                    log(
+                        f"SCAN_DONE|{progress_start + done}|"
+                        f"{displayed_total}|{path.name}"
+                    )
     except Exception:
         if controller is not None:
             controller.cancel()
@@ -194,8 +306,11 @@ def _scan_selected_paths_parallel(
 
     cancelled = bool(controller is not None and controller.cancel_requested)
     payload = report(cancelled)
-    if log:
-        log(f"SCAN_FINISHED|{payload['completed_count']}|{total}")
+    if log and emit_discovered:
+        log(
+            f"SCAN_FINISHED|{progress_start + payload['completed_count']}|"
+            f"{displayed_total}"
+        )
     return payload
 
 
@@ -236,38 +351,137 @@ def check_odb_compatibility(
     cache_dir: Path,
     log: LogCallback | None = None,
     controller: ProcessController | None = None,
+    *,
+    force_rescan: bool = False,
+    abaqus_version: str = "",
 ) -> dict:
     """Check whether ODB files are readable by the configured Abaqus release."""
 
     cache_dir.mkdir(parents=True, exist_ok=True)
+    selected = [Path(value).resolve() for value in paths]
+    version = str(abaqus_version or abaqus_command)
+    snapshot = {
+        "checker": "odb_compatibility",
+        "schema_version": CACHE_SCHEMA_VERSION,
+    }
+    config_hash = stable_config_hash(snapshot)
+    fingerprints: dict[str, str] = {}
+    results: dict[str, dict] = {}
+    misses: list[Path] = []
+
+    for path in selected:
+        path_key = str(path)
+        if not path.is_file() or path.stat().st_size <= 0:
+            misses.append(path)
+            if log:
+                log(f"COMPAT_CACHE_MISS|{path.name}")
+            continue
+        fingerprint = quick_odb_fingerprint(path)
+        fingerprints[path_key] = fingerprint
+        cached = None if force_rescan else load_json_cache(
+            cache_dir,
+            "compatibility",
+            fingerprint,
+            version,
+            config_hash,
+        )
+        if cached is None:
+            misses.append(path)
+            if log:
+                log(f"COMPAT_CACHE_MISS|{path.name}|{fingerprint[:12]}")
+            continue
+        item = dict(cached)
+        item.update(
+            {
+                "path": path_key,
+                "size_bytes": path.stat().st_size,
+                "content_fingerprint": fingerprint,
+                **odb_file_metadata(path),
+            }
+        )
+        results[path_key] = item
+        if log:
+            log(f"COMPAT_CACHE_HIT|{path.name}|{fingerprint[:12]}")
+
     request_path = cache_dir / "odb_compatibility_check_request.json"
     output_path = cache_dir / "odb_compatibility_check_report.json"
-    request_path.write_text(
-        json.dumps(
-            {"paths": [str(Path(value).resolve()) for value in paths]},
-            ensure_ascii=True,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    output_path.unlink(missing_ok=True)
-    run_process(
-        [
-            abaqus_command,
-            "python",
-            str(abaqus_script("odb_compatibility.py")),
-            "--mode",
-            "check",
-            "--request",
-            str(request_path),
-            "--output",
-            str(output_path),
-        ],
-        cache_dir,
-        log,
-        controller,
-    )
-    return _load_json_report(output_path)
+    if misses:
+        request_path.write_text(
+            json.dumps(
+                {
+                    "paths": [str(path) for path in misses],
+                    "progress_start": len(results),
+                    "progress_total": len(selected),
+                },
+                ensure_ascii=True,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        output_path.unlink(missing_ok=True)
+        run_process(
+            [
+                abaqus_command,
+                "python",
+                str(abaqus_script("odb_compatibility.py")),
+                "--mode",
+                "check",
+                "--request",
+                str(request_path),
+                "--output",
+                str(output_path),
+            ],
+            cache_dir,
+            log,
+            controller,
+        )
+        checked = _load_json_report(output_path)
+        for raw_item in checked.get("results", []):
+            item = dict(raw_item)
+            path = Path(item["path"]).resolve()
+            path_key = str(path)
+            fingerprint = fingerprints.get(path_key)
+            if fingerprint is not None and path.is_file():
+                current_fingerprint = quick_odb_fingerprint(path)
+                if current_fingerprint != fingerprint:
+                    item.update(
+                        status="invalid",
+                        message="ODB 文件在兼容性检测期间发生变化，请重新检测",
+                    )
+                else:
+                    item.update(
+                        {
+                            "path": path_key,
+                            "content_fingerprint": fingerprint,
+                            **odb_file_metadata(path),
+                        }
+                    )
+                    if item.get("status") in {
+                        "valid",
+                        "upgrade_required",
+                        "newer_release",
+                    }:
+                        save_json_cache(
+                            cache_dir,
+                            "compatibility",
+                            path,
+                            fingerprint,
+                            version,
+                            item,
+                            config_hash=config_hash,
+                            config_snapshot=snapshot,
+                        )
+            results[path_key] = item
+
+    ordered = [results[str(path)] for path in selected if str(path) in results]
+    payload = {
+        "mode": "check",
+        "results": ordered,
+        "cache_hits": len(selected) - len(misses),
+        "cache_misses": len(misses),
+    }
+    save_json(output_path, payload)
+    return payload
 
 
 def upgrade_odb_files(
@@ -277,6 +491,7 @@ def upgrade_odb_files(
     log: LogCallback | None = None,
     controller: ProcessController | None = None,
     release: str = "2025",
+    abaqus_version: str = "",
 ) -> dict:
     """Upgrade ODBs in place after validation, retaining ``name-old.odb``."""
 
@@ -305,6 +520,10 @@ def upgrade_odb_files(
             raise FileExistsError(
                 f"升级临时文件已存在，拒绝覆盖：{task['temporary_path']}"
             )
+    old_fingerprints = {
+        task["source_path"]: quick_odb_fingerprint(Path(task["source_path"]))
+        for task in serialized_tasks
+    }
     request_path = cache_dir / "odb_compatibility_upgrade_request.json"
     output_path = cache_dir / "odb_compatibility_upgrade_report.json"
     request_path.write_text(
@@ -328,4 +547,46 @@ def upgrade_odb_files(
         log,
         controller,
     )
-    return _load_json_report(output_path)
+    payload = _load_json_report(output_path)
+    version = str(abaqus_version or f"{release}|{abaqus_command}")
+    snapshot = {
+        "checker": "odb_compatibility",
+        "schema_version": CACHE_SCHEMA_VERSION,
+    }
+    config_hash = stable_config_hash(snapshot)
+    for result in payload.get("results", []):
+        if result.get("status") != "upgraded":
+            continue
+        source_key = str(Path(result["source_path"]).resolve())
+        old_fingerprint = old_fingerprints.get(source_key)
+        if old_fingerprint:
+            removed = invalidate_content_fingerprint(cache_dir, old_fingerprint)
+            if log:
+                log(
+                    f"CACHE_INVALIDATED|upgrade|{Path(source_key).name}|"
+                    f"{old_fingerprint[:12]}|{len(removed)}"
+                )
+        upgraded_path = Path(result["upgraded_path"]).resolve()
+        new_fingerprint = quick_odb_fingerprint(upgraded_path)
+        compatibility_result = {
+            "path": str(upgraded_path),
+            "status": "valid",
+            "message": f"已升级到 Abaqus {release}，并通过读取验证",
+            "size_bytes": upgraded_path.stat().st_size,
+            "content_fingerprint": new_fingerprint,
+            **odb_file_metadata(upgraded_path),
+        }
+        save_json_cache(
+            cache_dir,
+            "compatibility",
+            upgraded_path,
+            new_fingerprint,
+            version,
+            compatibility_result,
+            config_hash=config_hash,
+            config_snapshot=snapshot,
+        )
+        result["old_content_fingerprint"] = old_fingerprint
+        result["content_fingerprint"] = new_fingerprint
+    save_json(output_path, payload)
+    return payload

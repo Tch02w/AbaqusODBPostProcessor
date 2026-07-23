@@ -36,6 +36,7 @@ from .paths import result_root_for_odb, scan_cache_dir, state_file
 from .group_ui import ComparisonTree, LegendRangeDialog
 from .legends import aggregate_group_ranges, choose_sequences
 from .models import OdbScan
+from .naming import natural_sort_key
 from .postprocess import finalize_output
 from .runner import (
     ProcessController,
@@ -69,6 +70,7 @@ class MainWindow(_previous.MainWindow):
         self._current_scope_kind = "browse"
         self._current_scope_path = ""
         self._current_scope_group_id = ""
+        self._restoring_tab_order = False
         super().__init__()
         self.setWindowTitle("Abaqus ODB PostProcessor 0.3")
         self.state_timer = QTimer(self)
@@ -150,13 +152,16 @@ class MainWindow(_previous.MainWindow):
         self.group_tabs = QTabBar()
         self.group_tabs.setExpanding(False)
         self.group_tabs.setUsesScrollButtons(True)
+        self.group_tabs.setMovable(True)
         self.group_tabs.setElideMode(Qt.ElideRight)
+        self.group_tabs.setStyleSheet("QTabBar::tab { width: 160px; }")
         self.group_tabs.setContextMenuPolicy(Qt.CustomContextMenu)
         self.group_tabs.currentChanged.connect(self._group_tab_changed)
         self.group_tabs.customContextMenuRequested.connect(
             self._group_tab_context_menu
         )
         self.group_tabs.tabBarDoubleClicked.connect(self._group_tab_double_clicked)
+        self.group_tabs.tabMoved.connect(self._group_tab_moved)
         tabs_layout.addWidget(self.group_tabs, 1)
         self.create_group_button = QPushButton("新建对比组")
         self.create_group_button.clicked.connect(self._create_group)
@@ -200,7 +205,7 @@ class MainWindow(_previous.MainWindow):
         self.scan_status.setText(f"正在启动 Abaqus 扫描：{folder}")
         self.scan_progress.setRange(0, 0)
         self.elapsed_timer.start(1000)
-        cache = scan_cache_dir()
+        cache = scan_cache_dir(folder)
         self._append_log(f"扫描：{folder}")
         self._start_thread(
             lambda log: scan_folder(
@@ -280,6 +285,14 @@ class MainWindow(_previous.MainWindow):
         )
         self.groups = folder_state.setdefault("groups", {})
         self.odb_configs = folder_state.setdefault("odb_configs", {})
+        order = [
+            group_id
+            for group_id in folder_state.get("group_order", [])
+            if group_id in self.groups
+        ]
+        order.extend(group_id for group_id in self.groups if group_id not in order)
+        self.groups = {group_id: self.groups[group_id] for group_id in order}
+        folder_state["groups"] = self.groups
         for group in self.groups.values():
             group.setdefault("name", "未命名组")
             group.setdefault("members", [])
@@ -362,6 +375,7 @@ class MainWindow(_previous.MainWindow):
             self.odb_configs[path] = self._serialize_row(row)
         folder_state = self.state.setdefault("folders", {}).setdefault(self.folder_key, {})
         folder_state["groups"] = self.groups
+        folder_state["group_order"] = list(self.groups)
         folder_state["odb_configs"] = self.odb_configs
         save_json(self.state_path, self.state)
 
@@ -386,7 +400,10 @@ class MainWindow(_previous.MainWindow):
         categories_root = self._new_tree_item(
             self.group_tree, "按工况分类（仅浏览）", "categories_root"
         )
-        for path in sorted(self.scans_by_path, key=lambda value: Path(value).name.lower()):
+        for path in sorted(
+            self.scans_by_path,
+            key=lambda value: natural_sort_key(Path(value).name),
+        ):
             item = self._new_tree_item(all_root, Path(path).name, "odb", path)
             item.setSelected(path in selected_paths)
         for condition, members in sorted(
@@ -396,7 +413,8 @@ class MainWindow(_previous.MainWindow):
                 categories_root, f"工况-{condition}", "category", condition
             )
             for path in sorted(
-                set(members), key=lambda value: Path(value).name.lower()
+                set(members),
+                key=lambda value: natural_sort_key(Path(value).name),
             ):
                 label = Path(path).name
                 if path not in self.scans_by_path:
@@ -429,13 +447,41 @@ class MainWindow(_previous.MainWindow):
             index = self.group_tabs.addTab(str(group["name"]))
             self.group_tabs.setTabData(index, group_id)
             self.group_tabs.setTabToolTip(
-                index, f"{len(group.get('members', []))} 个 ODB"
+                index,
+                f"{group['name']}\n{len(group.get('members', []))} 个 ODB",
             )
             if group_id == current_group_id:
                 selected_index = index
         self.group_tabs.setCurrentIndex(selected_index)
         self.group_tabs.blockSignals(False)
         self._group_tab_changed(selected_index)
+
+    def _group_tab_moved(self, _from_index: int, _to_index: int) -> None:
+        if self._restoring_tab_order:
+            return
+        all_index = next(
+            (
+                index
+                for index in range(self.group_tabs.count())
+                if not str(self.group_tabs.tabData(index) or "")
+            ),
+            -1,
+        )
+        if all_index != 0:
+            self._restoring_tab_order = True
+            self.group_tabs.moveTab(all_index, 0)
+            self._restoring_tab_order = False
+        order = [
+            str(self.group_tabs.tabData(index))
+            for index in range(1, self.group_tabs.count())
+            if str(self.group_tabs.tabData(index) or "") in self.groups
+        ]
+        if order:
+            self.groups = {group_id: self.groups[group_id] for group_id in order}
+            self._save_state()
+
+    def _group_is_locked(self, _group_id: str) -> bool:
+        return False
 
     def _group_names_for_path(self, path: str) -> list[str]:
         return [
@@ -610,6 +656,11 @@ class MainWindow(_previous.MainWindow):
         group = self.groups.get(group_id)
         if not group:
             return
+        if self._group_is_locked(group_id):
+            QMessageBox.information(
+                self, "组正在运行", "排队或运行中的对比组不能重命名。"
+            )
+            return
         name, accepted = QInputDialog.getText(
             self, "重命名对比组", "新组名：", text=str(group["name"])
         )
@@ -627,6 +678,11 @@ class MainWindow(_previous.MainWindow):
     def _delete_group(self, group_id: str) -> None:
         group = self.groups.get(group_id)
         if not group:
+            return
+        if self._group_is_locked(group_id):
+            QMessageBox.information(
+                self, "组正在运行", "排队或运行中的对比组不能删除。"
+            )
             return
         answer = QMessageBox.question(
             self,
@@ -694,7 +750,14 @@ class MainWindow(_previous.MainWindow):
             ):
                 group_id = self._current_scope_group_id
                 group = self.groups[group_id]
-                members = [path for path in group.get("members", []) if path in enabled]
+                members = sorted(
+                    (
+                        path
+                        for path in group.get("members", [])
+                        if path in enabled
+                    ),
+                    key=lambda value: natural_sort_key(Path(value).name),
+                )
                 return [{"id": group_id, "name": group["name"], "members": members,
                          "overrides": group.get("legend_overrides", {}), "standalone": False}]
             if (
@@ -714,12 +777,22 @@ class MainWindow(_previous.MainWindow):
         plans = []
         grouped_members = set()
         for group_id, group in self.groups.items():
-            members = [path for path in group.get("members", []) if path in enabled]
+            members = sorted(
+                (
+                    path
+                    for path in group.get("members", [])
+                    if path in enabled
+                ),
+                key=lambda value: natural_sort_key(Path(value).name),
+            )
             if members:
                 plans.append({"id": group_id, "name": group["name"], "members": members,
                               "overrides": group.get("legend_overrides", {}), "standalone": False})
                 grouped_members.update(members)
-        for path in sorted(enabled - grouped_members):
+        for path in sorted(
+            enabled - grouped_members,
+            key=lambda value: natural_sort_key(Path(value).name),
+        ):
             plans.append({"id": "standalone::" + path, "name": Path(path).stem,
                           "members": [path], "overrides": {}, "standalone": True})
         return plans
@@ -740,7 +813,7 @@ class MainWindow(_previous.MainWindow):
     @staticmethod
     def _copy_numeric_cache(source: Path, target: Path) -> None:
         target.mkdir(parents=True, exist_ok=True)
-        for name in ("data", "rebar", "freebody"):
+        for name in ("data", "History_Output", "rebar", "freebody"):
             source_path = source / name
             if source_path.exists():
                 shutil.copytree(source_path, target / name, dirs_exist_ok=True)

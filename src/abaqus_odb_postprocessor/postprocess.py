@@ -90,10 +90,13 @@ def build_pile_force_moment(output_dir: Path) -> tuple[Path | None, Path | None]
 
 
 def finalize_output(output_dir: Path, fps: int = 5) -> dict:
+    load_resistance_csv = build_load_resistance_table(output_dir)
     moment_csv, maxima_csv = build_pile_force_moment(output_dir)
     manifest = {"transparent_png_count": build_transparent_backgrounds(output_dir),
         "original_pngs_preserved": True,
         "animations": build_gifs(output_dir, fps), "pile_axial_plot": str(plot_pile_axial(output_dir) or ""),
+        "load_resistance_csv": str(load_resistance_csv or ""),
+        "load_resistance_plot": str(plot_load_resistance(output_dir) or ""),
         "pile_bending_plots": [str(path) for path in plot_pile_bending(output_dir)],
         "pile_force_moment_csv": str(moment_csv or ""), "pile_bending_maxima_csv": str(maxima_csv or ""),
         "xlsx": str(build_xlsx(output_dir))}

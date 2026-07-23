@@ -64,8 +64,10 @@ def check_one(path):
 def check_mode(request, output_path):
     paths = request.get("paths", [])
     results = []
-    total = len(paths)
-    for index, path in enumerate(paths, 1):
+    progress_start = int(request.get("progress_start", 0))
+    total = int(request.get("progress_total", len(paths)))
+    for relative_index, path in enumerate(paths, 1):
+        index = progress_start + relative_index
         result = check_one(path)
         results.append(result)
         emit(

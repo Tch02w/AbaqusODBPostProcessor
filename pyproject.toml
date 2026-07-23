@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "abaqus-odb-postprocessor"
-version = "0.7.0"
+version = "0.8.0"
 description = "Abaqus 2025 grouped ODB extraction, contour animation, and pile force/moment postprocessing"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,8 +16,9 @@ dependencies = [
   "XlsxWriter>=3.2",
 ]
 
-[project.scripts]
+[project.gui-scripts]
 abaqus-odb-post = "abaqus_odb_postprocessor.app:main"
+abaqus-odb-results = "abaqus_odb_postprocessor.result_browser:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

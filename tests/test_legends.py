@@ -1,10 +1,31 @@
 import pytest
 
 from abaqus_odb_postprocessor.legends import (
+    aggregate_animation_ranges,
     aggregate_group_ranges,
     choose_sequences,
     parse_sequence_expression,
 )
+
+
+def test_animation_ranges_use_every_frame_of_one_odb() -> None:
+    ranges = aggregate_animation_ranges(
+        {
+            "frame_catalog": [
+                {
+                    "SequenceIndex": 0,
+                    "ranges": {"PILE_U_MAG": {"min": 0.0, "max": 2.0}},
+                },
+                {
+                    "SequenceIndex": 1,
+                    "ranges": {"PILE_U_MAG": {"min": -1.0, "max": 5.0}},
+                },
+            ]
+        }
+    )
+    assert ranges["PILE_U_MAG"]["min"] == -1.0
+    assert ranges["PILE_U_MAG"]["max"] == 5.0
+    assert ranges["PILE_U_MAG"]["source"] == "odb_full_animation_timeline"
 
 
 def catalog(indices, ranges=None, prefracture=None):

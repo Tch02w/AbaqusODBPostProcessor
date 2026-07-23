@@ -28,7 +28,9 @@ from PySide6.QtWidgets import (
 )
 
 from . import batch_window as _base
+from .cache import abaqus_cache_version
 from .config import load_defaults
+from .naming import natural_sort_key
 from .paths import scan_cache_dir
 from .runner import (
     MultiProcessController,
@@ -75,7 +77,10 @@ def discover_odb_paths(folder: Path) -> list[Path]:
         if any(part in excluded_directories for part in relative_parts):
             continue
         paths.append(path)
-    return sorted(paths, key=lambda path: str(path.relative_to(folder)).casefold())
+    return sorted(
+        paths,
+        key=lambda path: natural_sort_key(str(path.relative_to(folder))),
+    )
 
 
 class OdbFileList(QTreeWidget):
@@ -96,6 +101,7 @@ class OdbSelectionDialog(QDialog):
         parent=None,
         abaqus_command: str | None = None,
         local_release: str | None = None,
+        force_rescan: bool = False,
     ) -> None:
         super().__init__(parent)
         self.folder = folder.resolve()
@@ -103,6 +109,13 @@ class OdbSelectionDialog(QDialog):
         self.abaqus_command = abaqus_command or str(defaults["abaqus_command"])
         self.local_release = local_release or str(
             defaults.get("local_abaqus_release", "2025")
+        )
+        self.force_rescan = bool(force_rescan)
+        self.compatibility_cache_version = abaqus_cache_version(
+            {
+                "local_abaqus_release": self.local_release,
+                "abaqus_command": self.abaqus_command,
+            }
         )
         self.compatibility_worker = None
         self.compatibility_controller: ProcessController | None = None
@@ -298,7 +311,23 @@ class OdbSelectionDialog(QDialog):
         self._update_count()
 
     def _compatibility_log(self, text: str) -> None:
-        if text.startswith("ODB_CHECK|"):
+        if text.startswith("COMPAT_CACHE_HIT|"):
+            _, name, fingerprint = text.split("|", 2)
+            self.compatibility_progress.setValue(
+                min(
+                    self.compatibility_progress.value() + 1,
+                    self.compatibility_progress.maximum(),
+                )
+            )
+            self.compatibility_status.setText(
+                f"命中兼容性缓存：{name}（{fingerprint}）"
+            )
+        elif text.startswith("COMPAT_CACHE_MISS|"):
+            parts = text.split("|", 2)
+            self.compatibility_status.setText(
+                f"等待 Abaqus 检测：{parts[1]}"
+            )
+        elif text.startswith("ODB_CHECK|"):
             _, index, total, status, name = text.split("|", 4)
             self.compatibility_progress.setRange(0, max(int(total), 1))
             self.compatibility_progress.setValue(int(index))
@@ -334,7 +363,7 @@ class OdbSelectionDialog(QDialog):
             f"正在使用 Abaqus {self.local_release} 检测 {len(paths)} 个 ODB…"
         )
         self._set_compatibility_busy(True)
-        cache = scan_cache_dir()
+        cache = scan_cache_dir(self.folder)
         self.compatibility_worker = _base.FunctionThread(
             lambda log: check_odb_compatibility(
                 self.abaqus_command,
@@ -342,6 +371,8 @@ class OdbSelectionDialog(QDialog):
                 cache,
                 log,
                 self.compatibility_controller,
+                force_rescan=self.force_rescan,
+                abaqus_version=self.compatibility_cache_version,
             )
         )
         self.compatibility_worker.message.connect(self._compatibility_log)
@@ -375,9 +406,10 @@ class OdbSelectionDialog(QDialog):
             self._item_status(item) == "upgrade_required" for item in selected
         )
         invalid_count = len(selected) - valid_count - upgrade_count
+        cache_hits = int(payload.get("cache_hits", 0))
         self.compatibility_status.setText(
             f"检测完成：可读取 {valid_count}，需要升级 {upgrade_count}，"
-            f"不可用 {invalid_count}。"
+            f"不可用 {invalid_count}；缓存命中 {cache_hits}/{len(selected)}。"
         )
         if self.pending_accept:
             self.pending_accept = False
@@ -434,7 +466,7 @@ class OdbSelectionDialog(QDialog):
         self.compatibility_progress.setRange(0, len(tasks))
         self.compatibility_progress.setValue(0)
         self._set_compatibility_busy(True)
-        cache = scan_cache_dir()
+        cache = scan_cache_dir(self.folder)
         self.compatibility_worker = _base.FunctionThread(
             lambda log: upgrade_odb_files(
                 self.abaqus_command,
@@ -443,6 +475,7 @@ class OdbSelectionDialog(QDialog):
                 log,
                 self.compatibility_controller,
                 release=self.local_release,
+                abaqus_version=self.compatibility_cache_version,
             )
         )
         self.compatibility_worker.message.connect(self._compatibility_log)
@@ -558,7 +591,7 @@ class OdbSelectionDialog(QDialog):
 class MainWindow(_base.MainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Abaqus ODB PostProcessor 0.7")
+        self.setWindowTitle("Abaqus ODB PostProcessor 0.8")
         self.scan_button.setText("发现并选择 ODB")
 
     def _set_busy(self, busy: bool) -> None:
@@ -567,6 +600,13 @@ class MainWindow(_base.MainWindow):
             self.scan_button.setText("发现并选择 ODB")
 
     def _scan(self) -> None:
+        if self._has_group_work():
+            QMessageBox.information(
+                self,
+                "后处理正在进行",
+                "请等待当前运行队列结束后再扫描 ODB。",
+            )
+            return
         folder = Path(self.folder_edit.text().strip())
         if not folder.is_dir():
             QMessageBox.warning(self, "路径无效", "请选择存在的 ODB 文件夹。")
@@ -581,10 +621,12 @@ class MainWindow(_base.MainWindow):
             self,
             abaqus_command=self.defaults["abaqus_command"],
             local_release=str(self.defaults.get("local_abaqus_release", "2025")),
+            force_rescan=bool(self.force_rescan_checkbox.isChecked()),
         )
         if dialog.exec() != QDialog.Accepted:
             return
         selected_paths = dialog.selected_paths()
+        force_rescan = self._consume_force_rescan()
 
         self.scan_controller = MultiProcessController()
         self.scan_active = True
@@ -598,9 +640,10 @@ class MainWindow(_base.MainWindow):
         self.scan_progress.setRange(0, max(len(selected_paths), 1))
         self.scan_progress.setValue(0)
         self.elapsed_timer.start(1000)
-        cache = scan_cache_dir()
+        cache = scan_cache_dir(folder)
         self._append_log(
-            f"文件发现完成：共 {len(paths)} 个 ODB；本次选择 {len(selected_paths)} 个"
+            f"文件发现完成：共 {len(paths)} 个 ODB；本次选择 {len(selected_paths)} 个；"
+            f"强制重扫={'是' if force_rescan else '否'}"
         )
         self._start_thread(
             lambda log: scan_folder(
@@ -611,6 +654,8 @@ class MainWindow(_base.MainWindow):
                 self.scan_controller,
                 selected_paths,
                 parallel_workers=int(self.parallel_workers.value()),
+                force_rescan=force_rescan,
+                abaqus_version=abaqus_cache_version(self.defaults),
             ),
             self._scan_finished,
         )

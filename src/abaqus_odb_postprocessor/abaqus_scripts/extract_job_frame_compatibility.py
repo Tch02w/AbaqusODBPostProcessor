@@ -67,8 +67,10 @@ source = source.replace(
 
 source = source.replace(
     '    written = []\n'
+    '    last_rendered_item = None\n'
     '    for animation_index, item in enumerate(timeline):\n',
     '    written = []\n'
+    '    last_rendered_item = None\n'
     '    render_timeline = full_timeline\n'
     '    for animation_index, item in enumerate(render_timeline):\n',
 )

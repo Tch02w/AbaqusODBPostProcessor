@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -10,9 +11,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QHeaderView,
     QHBoxLayout,
@@ -24,11 +26,28 @@ from PySide6.QtWidgets import (
 )
 
 from . import comparison_groups as _base
+from .cache import (
+    abaqus_cache_version,
+    cache_entry_dir,
+    load_json_cache,
+    numeric_cache_is_valid,
+    numeric_config_snapshot,
+    prescan_config_snapshot,
+    quick_odb_fingerprint,
+    save_json_cache,
+    stable_config_hash,
+    write_numeric_cache_metadata,
+)
 from .config import save_json
-from .legends import aggregate_group_ranges, choose_sequences
+from .legends import (
+    aggregate_animation_ranges,
+    aggregate_group_ranges,
+    choose_sequences,
+)
 from .naming import OdbNameInfo, parse_odb_name
 from .postprocess import finalize_output
-from .paths import batch_temp_dir, result_root_for_odb
+from .paths import batch_temp_dir, result_root_for_odb, scan_cache_dir
+from .result_browser import ResultBrowserDialog, RESULT_ROOT_NAME
 from .runner_parallel import (
     MultiProcessController,
     ProcessCancelled,
@@ -38,7 +57,15 @@ from .runner_parallel import (
 )
 
 
-AUTO_DIRECTION = "自动（文件名）"
+AUTO_DIRECTION = "自动"
+DIRECTION_LABEL_TO_ABAQUS = {
+    "X方向": "1",
+    "Z方向": "3",
+    "XZ方向": "1+3",
+}
+DIRECTION_ABAQUS_TO_LABEL = {
+    value: label for label, value in DIRECTION_LABEL_TO_ABAQUS.items()
+}
 
 
 class MainWindow(_base.MainWindow):
@@ -47,6 +74,11 @@ class MainWindow(_base.MainWindow):
         self.batch_active = False
         self.batch_total = 0
         self.batch_completed = 0
+        self.group_queue: list[dict[str, Any]] = []
+        self.active_group_task: dict[str, Any] | None = None
+        self.group_worker = None
+        self._exit_after_cancel = False
+        self._pending_queue_advance = False
         self._finalize_lock = threading.Lock()
         super().__init__()
         self.setWindowTitle("Abaqus ODB PostProcessor 0.5")
@@ -90,11 +122,28 @@ class MainWindow(_base.MainWindow):
         self.parallel_hint.setProperty("role", "hint")
         option_layout.insertWidget(option_layout.count() - 2, self.parallel_hint)
         self._update_parallel_worker_tooltip(self.parallel_workers.value())
-        self.cancel_run_button = QPushButton("取消当前批次")
+        self.force_rescan_checkbox = QCheckBox("本次强制重新扫描")
+        self.force_rescan_checkbox.setToolTip(
+            "一次性选项：扫描 ODB 时重建所选 ODB 的基础缓存；"
+            "运行时重建本次新入队组的范围/损伤预扫描缓存。操作提交后自动复位。"
+        )
+        option_layout.insertWidget(
+            option_layout.count() - 2, self.force_rescan_checkbox
+        )
+        self.cancel_run_button = QPushButton("取消当前组")
         self.cancel_run_button.setProperty("danger", True)
         self.cancel_run_button.setEnabled(False)
         self.cancel_run_button.clicked.connect(self._cancel_run)
         option_layout.insertWidget(option_layout.count() - 2, self.cancel_run_button)
+        self.result_browser_button = QPushButton("结果浏览器")
+        self.result_browser_button.setObjectName("resultBrowserButton")
+        self.result_browser_button.setAccessibleName("打开结果浏览器")
+        self.result_browser_button.setToolTip(
+            "按荷载—位移、桩轴力、桩弯矩、钢筋、云图和动画等用途查找结果"
+        )
+        self.result_browser_button.clicked.connect(self._open_result_browser)
+        folder_layout = self.centralWidget().layout().itemAt(0).layout()
+        folder_layout.addWidget(self.result_browser_button)
 
         output_panel = QWidget()
         output_panel.setObjectName("outputImageSettings")
@@ -168,6 +217,37 @@ class MainWindow(_base.MainWindow):
         )
         self._update_image_ratio()
         self.centralWidget().layout().insertWidget(3, output_panel)
+
+    def _consume_force_rescan(self) -> bool:
+        enabled = bool(self.force_rescan_checkbox.isChecked())
+        if enabled:
+            self.force_rescan_checkbox.setChecked(False)
+        return enabled
+
+    def _open_result_browser(self) -> None:
+        odb_folder = Path(self.folder_edit.text().strip())
+        result_root = (
+            odb_folder / RESULT_ROOT_NAME
+            if odb_folder.is_dir()
+            else Path.cwd() / RESULT_ROOT_NAME
+        )
+        existing = getattr(self, "_result_browser_dialog", None)
+        if existing is not None:
+            existing.set_result_root(result_root)
+            if existing.isMinimized():
+                existing.showNormal()
+            else:
+                existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        dialog = ResultBrowserDialog(result_root, self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose)
+        dialog.destroyed.connect(
+            lambda: setattr(self, "_result_browser_dialog", None)
+        )
+        self._result_browser_dialog = dialog
+        dialog.show()
 
     @staticmethod
     def _configure_image_dimension_input(control: QSpinBox) -> None:
@@ -261,6 +341,8 @@ class MainWindow(_base.MainWindow):
             self.image_unit_selector.setEnabled(not busy)
         if hasattr(self, "cancel_run_button"):
             self.cancel_run_button.setEnabled(bool(busy and self.batch_active))
+        if not busy and hasattr(self, "group_tabs"):
+            self._refresh_queue_ui()
 
     @staticmethod
     def _name_info(row: dict[str, Any]) -> OdbNameInfo:
@@ -269,9 +351,13 @@ class MainWindow(_base.MainWindow):
     def _restore_row(self, row: dict[str, Any], values: dict[str, Any]) -> None:
         info = self._name_info(row)
         direction = row["direction"]
-        if direction.findText(AUTO_DIRECTION) < 0:
-            direction.insertItem(0, AUTO_DIRECTION)
+        direction.blockSignals(True)
+        direction.clear()
+        direction.addItems(
+            ["X方向", "Z方向", "XZ方向", AUTO_DIRECTION]
+        )
         direction.setCurrentText(AUTO_DIRECTION)
+        direction.blockSignals(False)
         detected = info.load_direction or "未识别"
         direction.setToolTip(
             f"文件名识别：工况={info.condition or '未识别'}；Abaqus 加载方向={detected}。可手动覆盖。"
@@ -283,6 +369,11 @@ class MainWindow(_base.MainWindow):
             )
 
         adjusted = dict(values)
+        saved_direction = str(adjusted.get("direction", ""))
+        if saved_direction in DIRECTION_ABAQUS_TO_LABEL:
+            adjusted["direction"] = DIRECTION_ABAQUS_TO_LABEL[saved_direction]
+        elif saved_direction == "自动（文件名）":
+            adjusted["direction"] = AUTO_DIRECTION
         if not bool(adjusted.get("direction_manual", False)):
             adjusted.pop("direction", None)
         if not bool(adjusted.get("diameter_manual", False)):
@@ -317,10 +408,12 @@ class MainWindow(_base.MainWindow):
         info = self._name_info(row)
         automatic = row["direction"].currentText() == AUTO_DIRECTION
         payload["load_direction"] = (
-            info.load_direction if automatic and info.load_direction else row["direction"].currentText()
+            info.load_direction
+            if automatic and info.load_direction
+            else DIRECTION_LABEL_TO_ABAQUS.get(
+                row["direction"].currentText(), "1+3"
+            )
         )
-        if payload["load_direction"] == AUTO_DIRECTION:
-            payload["load_direction"] = "1+3"
         payload.update(
             {
                 "load_direction_source": "filename" if automatic and info.load_direction else "manual",
@@ -377,10 +470,15 @@ class MainWindow(_base.MainWindow):
                 members.append(path)
 
     def _cancel_run(self) -> None:
-        if self.batch_controller is None or not self.batch_active:
+        if self.batch_controller is None or self.active_group_task is None:
             return
-        self.scan_status.setText("正在取消当前后处理批次……")
+        self.scan_status.setText(
+            f"正在取消当前组：{self.active_group_task['name']}…"
+        )
         self.cancel_run_button.setEnabled(False)
+        self._append_log(
+            f"[{self._timestamp()}] 取消当前组：{self.active_group_task['name']}"
+        )
         self.batch_controller.cancel()
 
     def _append_log(self, text: str) -> None:
@@ -390,13 +488,104 @@ class MainWindow(_base.MainWindow):
             self.scan_progress.setRange(0, max(int(total), 1))
             self.scan_progress.setValue(self.batch_completed)
             phase_label = "预扫描" if phase == "scan" else "正式提取"
-            self.scan_status.setText(f"{phase_label} {done}/{total}：{name}")
+            running = (
+                str(self.active_group_task["name"])
+                if self.active_group_task is not None
+                else "无"
+            )
+            queued = "、".join(
+                str(item["name"]) for item in self.group_queue
+            ) or "无"
+            self.scan_status.setText(
+                f"正在运行：{running}（{phase_label} {done}/{total}：{name}）"
+                f"｜排队：{queued}"
+            )
             return
         super()._append_log(text)
 
     @staticmethod
     def _timestamp() -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _has_group_work(self) -> bool:
+        return self.active_group_task is not None or bool(self.group_queue)
+
+    def _group_is_locked(self, group_id: str) -> bool:
+        if (
+            self.active_group_task is not None
+            and self.active_group_task["id"] == group_id
+        ):
+            return True
+        return any(item["id"] == group_id for item in self.group_queue)
+
+    def _refresh_queue_ui(self) -> None:
+        running = (
+            str(self.active_group_task["name"])
+            if self.active_group_task is not None
+            else ""
+        )
+        positions = {
+            str(item["id"]): index
+            for index, item in enumerate(self.group_queue, 1)
+        }
+        queued_names = {
+            str(item["id"]): str(item["name"]) for item in self.group_queue
+        }
+        for index in range(1, self.group_tabs.count()):
+            group_id = str(self.group_tabs.tabData(index) or "")
+            group = self.groups.get(group_id)
+            if group is None:
+                continue
+            name = str(group["name"])
+            if self.active_group_task is not None and (
+                self.active_group_task["id"] == group_id
+            ):
+                label = f"{self.active_group_task['name']}（运行中）"
+            elif group_id in positions:
+                label = (
+                    f"{queued_names[group_id]}（排队 {positions[group_id]}）"
+                )
+            else:
+                label = name
+            self.group_tabs.setTabText(index, label)
+            self.group_tabs.setTabToolTip(
+                index, f"{name}\n{len(group.get('members', []))} 个 ODB"
+            )
+
+        queued = "、".join(str(item["name"]) for item in self.group_queue)
+        if running or queued:
+            self.scan_status.setText(
+                f"正在运行：{running or '无'}｜排队：{queued or '无'}"
+            )
+        self.cancel_run_button.setEnabled(self.active_group_task is not None)
+        self.scan_button.setEnabled(
+            not self.scan_active and not self._has_group_work()
+        )
+        self.run_all_button.setEnabled(not self.scan_active)
+        current_id = (
+            str(self.group_tabs.tabData(self.group_tabs.currentIndex()) or "")
+            if self.group_tabs.currentIndex() >= 0
+            else ""
+        )
+        current_task_id = (
+            "standalone::" + self._current_scope_path
+            if self._current_scope_kind == "odb"
+            else current_id
+        )
+        self.run_button.setEnabled(
+            not self.scan_active
+            and bool(current_task_id)
+            and not self._group_is_locked(current_task_id)
+        )
+
+    def _group_tab_changed(self, index: int) -> None:
+        super()._group_tab_changed(index)
+        if hasattr(self, "group_queue"):
+            self._refresh_queue_ui()
+
+    def _activate_standalone(self, path: str) -> None:
+        super()._activate_standalone(path)
+        self._refresh_queue_ui()
 
     def _run_scope(self, scope: str) -> None:
         self._save_state()
@@ -408,46 +597,152 @@ class MainWindow(_base.MainWindow):
                 "请选择单个 ODB 或用户创建的对比组；“全部 ODB”和工况分类仅用于浏览。",
             )
             return
+        new_specs = [
+            copy.deepcopy(group)
+            for group in group_specs
+            if not self._group_is_locked(str(group["id"]))
+        ]
+        if not new_specs:
+            QMessageBox.information(
+                self, "已在队列中", "目标组正在运行或已经排队，未重复提交。"
+            )
+            return
+        force_rescan = self._consume_force_rescan()
+        for group in new_specs:
+            members = [
+                path for path in group["members"] if path in self.rows_by_path
+            ]
+            snapshots = {
+                path: copy.deepcopy(
+                    self._job_payload(self.rows_by_path[path], Path("."))
+                )
+                for path in members
+            }
+            batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            item = {
+                "id": str(group["id"]),
+                "name": str(group["name"]),
+                "plan": copy.deepcopy(group),
+                "members": list(members),
+                "snapshots": snapshots,
+                "force_rescan": force_rescan,
+                "batch_id": batch_id,
+                "folder_root": str(Path(self.folder_key).resolve()),
+            }
+            self.group_queue.append(item)
+            self._append_log(
+                f"[{self._timestamp()}] 已入队：{item['name']}；"
+                f"ODB={len(members)}；强制预扫描={'是' if force_rescan else '否'}"
+            )
+        self._refresh_queue_ui()
+        self._start_next_group()
 
-        unique_paths: list[str] = []
-        for group in group_specs:
-            for path in group["members"]:
-                if path in self.rows_by_path and path not in unique_paths:
-                    unique_paths.append(path)
-        snapshots = {
-            path: self._job_payload(self.rows_by_path[path], Path("."))
-            for path in unique_paths
-        }
-        batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        scratch_root = batch_temp_dir(batch_id)
-        result_root = result_root_for_odb(Path(unique_paths[0]))
-        workers = min(int(self.parallel_workers.value()), len(unique_paths))
+    def _start_next_group(self) -> None:
+        if (
+            self.active_group_task is not None
+            or (
+                self.group_worker is not None
+                and self.group_worker.isRunning()
+            )
+            or not self.group_queue
+        ):
+            self._refresh_queue_ui()
+            return
+        item = self.group_queue.pop(0)
+        self.active_group_task = item
+        self.batch_active = True
+        self.batch_total = len(item["members"])
+        self.batch_completed = 0
+        self.scan_progress.setRange(0, max(self.batch_total, 1))
+        self.scan_progress.setValue(0)
+        workers = min(
+            int(self.parallel_workers.value()), max(len(item["members"]), 1)
+        )
         controller = MultiProcessController()
         self.batch_controller = controller
-        self.batch_active = True
-        self.batch_total = len(unique_paths)
-        self.batch_completed = 0
-        self.scan_progress.setRange(0, max(len(unique_paths), 1))
-        self.scan_progress.setValue(0)
-        self.scan_status.setText(f"准备并行预扫描：{len(unique_paths)} 个 ODB，{workers} 个进程")
+        self._append_log(
+            f"[{self._timestamp()}] 开始运行组：{item['name']}；"
+            f"组内并行 worker={workers}"
+        )
+        self._refresh_queue_ui()
+        worker = _base.FunctionThread(
+            lambda log: self._execute_group_task(
+                item, workers, controller, log
+            )
+        )
+        self.group_worker = worker
+        worker.message.connect(self._append_log)
+        worker.completed.connect(
+            lambda outputs, current=item: self._group_run_finished(
+                current, outputs
+            )
+        )
+        worker.failed.connect(
+            lambda details, current=item: self._group_run_failed(
+                current, details
+            )
+        )
+        worker.finished.connect(
+            lambda current_worker=worker: self._group_worker_finished(
+                current_worker
+            )
+        )
+        worker.start()
 
-        def task(log: Callable[[str], None]) -> list[str]:
-            def check_cancelled() -> None:
-                if controller.cancel_requested:
-                    raise ProcessCancelled("Process cancelled by user")
+    def _execute_group_task(
+        self,
+        item: dict[str, Any],
+        workers: int,
+        controller: MultiProcessController,
+        log: Callable[[str], None],
+    ) -> list[str]:
+        members = list(item["members"])
+        plan = item["plan"]
+        cache_root = scan_cache_dir(Path(item["folder_root"]))
+        scratch_root = batch_temp_dir(item["batch_id"])
+        result_root = result_root_for_odb(Path(members[0]))
+        abaqus_version = abaqus_cache_version(self.defaults)
 
-            def tagged(path: str, message: str) -> None:
-                log(f"[{self._timestamp()}] [{Path(path).name}] {message}")
+        def check_cancelled() -> None:
+            if controller.cancel_requested:
+                raise ProcessCancelled("Process cancelled by user")
 
-            def prepare_one(path: str) -> tuple[str, dict[str, Any]]:
-                check_cancelled()
-                scan_dir = scratch_root / "prescan" / _base.safe_folder_name(Path(path).stem)
-                payload = copy.deepcopy(snapshots[path])
+        def tagged(path: str, message: str) -> None:
+            log(f"[{self._timestamp()}] [{Path(path).name}] {message}")
+
+        def prepare_one(path: str) -> tuple[str, dict[str, Any]]:
+            check_cancelled()
+            payload = copy.deepcopy(item["snapshots"][path])
+            # Re-sample at execution time so an ODB changed after the initial
+            # GUI scan can never reuse stale prescan or numeric results.
+            fingerprint = quick_odb_fingerprint(Path(path))
+            snapshot = prescan_config_snapshot(payload)
+            config_hash = stable_config_hash(snapshot)
+            range_scan = None
+            if not item["force_rescan"]:
+                range_scan = load_json_cache(
+                    cache_root,
+                    "prescan",
+                    fingerprint,
+                    abaqus_version,
+                    config_hash,
+                )
+            if range_scan is not None:
+                tagged(
+                    path,
+                    f"命中预扫描缓存：{fingerprint[:12]}/{config_hash[:12]}",
+                )
+            else:
+                scan_dir = (
+                    scratch_root
+                    / "prescan"
+                    / _base.safe_folder_name(Path(path).stem)
+                )
                 payload["output_dir"] = str(scan_dir)
                 payload["comparison_group"] = "范围预扫描"
                 config_path = scan_dir / "job_config.json"
                 save_json(config_path, payload)
-                tagged(path, "开始读取场值、帧目录与损伤范围")
+                tagged(path, "重建场值、帧目录与损伤预扫描缓存")
                 range_scan = scan_field_ranges(
                     self.defaults["abaqus_command"],
                     config_path,
@@ -455,136 +750,310 @@ class MainWindow(_base.MainWindow):
                     lambda line: log(f"[{Path(path).name}] {line}"),
                     controller,
                 )
-                indices = choose_sequences(
+                save_json_cache(
+                    cache_root,
+                    "prescan",
+                    Path(path),
+                    fingerprint,
+                    abaqus_version,
                     range_scan,
-                    payload["frame_mode"],
-                    payload["manual_sequence_expression"],
+                    config_hash=config_hash,
+                    config_snapshot=snapshot,
                 )
-                override = int(payload["prefracture_sequence_index"])
-                if payload["frame_mode"] == "auto" and override >= 0:
-                    indices = sorted(set([indices[-1], override]))
-                detected = range_scan.get("auto_detection", {}).get("prefracture_sequence_index")
-                if override < 0:
-                    payload["prefracture_sequence_index"] = -1 if detected is None else int(detected)
-                payload["selected_sequence_indices"] = indices
-                tagged(path, f"帧选择={indices}；自动断裂前帧={detected}")
-                return path, {
-                    "payload": payload,
-                    "range_scan": range_scan,
-                    "selected_sequence_indices": indices,
-                }
-
-            prepared: dict[str, dict[str, Any]] = {}
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="odb-prescan") as pool:
-                futures = {pool.submit(prepare_one, path): path for path in unique_paths}
-                for done, future in enumerate(as_completed(futures), 1):
-                    path, item = future.result()
-                    prepared[path] = item
-                    log(f"BATCH_PROGRESS|scan|{done}|{len(unique_paths)}|{Path(path).name}")
-            check_cancelled()
-
-            group_ranges: dict[str, dict[str, Any]] = {}
-            for group in group_specs:
-                jobs = [
-                    {
-                        "comparison_group": group["name"],
-                        "selected_sequence_indices": prepared[path]["selected_sequence_indices"],
-                        "range_scan": prepared[path]["range_scan"],
-                    }
-                    for path in group["members"]
-                ]
-                plan = aggregate_group_ranges(jobs).get(str(group["name"]), {})
-                self._apply_overrides(plan, group.get("overrides", {}), str(group["name"]))
-                group_ranges[group["id"]] = plan
-            save_json(
-                result_root / "_批次记录" / batch_id / "comparison_group_legends.json",
-                {
-                    group["id"]: {"name": group["name"], "ranges": group_ranges[group["id"]]}
-                    for group in group_specs
-                },
+            indices = choose_sequences(
+                range_scan,
+                payload["frame_mode"],
+                payload["manual_sequence_expression"],
             )
+            override = int(payload["prefracture_sequence_index"])
+            if payload["frame_mode"] == "auto" and override >= 0:
+                indices = sorted(set([indices[-1], override]))
+            detected = range_scan.get("auto_detection", {}).get(
+                "prefracture_sequence_index"
+            )
+            if override < 0:
+                payload["prefracture_sequence_index"] = (
+                    -1 if detected is None else int(detected)
+                )
+            payload["selected_sequence_indices"] = indices
+            payload["animation_legend_ranges"] = aggregate_animation_ranges(
+                range_scan
+            )
+            tagged(path, f"帧选择={indices}；自动断裂前帧={detected}")
+            return path, {
+                "payload": payload,
+                "range_scan": range_scan,
+                "selected_sequence_indices": indices,
+                "content_fingerprint": fingerprint,
+            }
 
-            def extract_one(path: str) -> list[str]:
-                check_cancelled()
-                memberships = [group for group in group_specs if path in group["members"]]
-                primary_output: Path | None = None
-                path_outputs: list[str] = []
-                for membership_index, group in enumerate(memberships):
-                    check_cancelled()
-                    if group["standalone"]:
-                        output_dir = result_root / "未分组" / batch_id / _base.safe_folder_name(Path(path).stem)
-                    else:
-                        output_dir = (
-                            result_root
-                            / _base.safe_folder_name(str(group["name"]))
-                            / batch_id
-                            / _base.safe_folder_name(Path(path).stem)
-                        )
-                    payload = copy.deepcopy(prepared[path]["payload"])
-                    payload["output_dir"] = str(output_dir)
-                    payload["comparison_group"] = str(group["name"])
-                    payload["legend_ranges"] = group_ranges[group["id"]]
-                    config_path = output_dir / "job_config.json"
-                    if membership_index == 0:
-                        save_json(config_path, payload)
-                        tagged(path, f"开始正式提取；首组={group['name']}")
-                        run_job(
-                            self.defaults["abaqus_command"],
-                            config_path,
-                            lambda line: log(f"[{Path(path).name}] {line}"),
-                            controller,
-                        )
-                        with self._finalize_lock:
-                            finalize_output(output_dir, int(self.defaults["animation_fps"]))
-                        primary_output = output_dir
-                    else:
-                        assert primary_output is not None
-                        self._copy_numeric_cache(primary_output, output_dir)
-                        payload["source_output_dir"] = str(primary_output)
-                        save_json(config_path, payload)
-                        tagged(path, f"复用数值并按组重渲染；组={group['name']}")
-                        render_group_contours(
-                            self.defaults["abaqus_command"],
-                            config_path,
-                            lambda line: log(f"[{Path(path).name}] {line}"),
-                            controller,
-                        )
-                        with self._finalize_lock:
-                            finalize_output(output_dir, int(self.defaults["animation_fps"]))
-                    path_outputs.append(str(output_dir))
-                tagged(path, "全部所属组处理完成")
-                return path_outputs
+        prepared: dict[str, dict[str, Any]] = {}
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="odb-prescan"
+        ) as pool:
+            futures = {
+                pool.submit(prepare_one, path): path for path in members
+            }
+            for done, future in enumerate(as_completed(futures), 1):
+                try:
+                    path, prepared_item = future.result()
+                except Exception:
+                    controller.cancel()
+                    raise
+                prepared[path] = prepared_item
+                log(
+                    f"BATCH_PROGRESS|scan|{done}|{len(members)}|"
+                    f"{Path(path).name}"
+                )
+        check_cancelled()
 
-            outputs: list[str] = []
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="odb-extract") as pool:
-                futures = {pool.submit(extract_one, path): path for path in unique_paths}
-                for done, future in enumerate(as_completed(futures), 1):
-                    path = futures[future]
-                    outputs.extend(future.result())
-                    log(f"BATCH_PROGRESS|extract|{done}|{len(unique_paths)}|{Path(path).name}")
+        jobs = [
+            {
+                "comparison_group": item["name"],
+                "selected_sequence_indices": prepared[path][
+                    "selected_sequence_indices"
+                ],
+                "range_scan": prepared[path]["range_scan"],
+            }
+            for path in members
+        ]
+        group_ranges = aggregate_group_ranges(jobs).get(item["name"], {})
+        self._apply_overrides(
+            group_ranges, plan.get("overrides", {}), item["name"]
+        )
+        save_json(
+            result_root
+            / "_批次记录"
+            / item["batch_id"]
+            / "comparison_group_legends.json",
+            {
+                item["id"]: {
+                    "name": item["name"],
+                    "ranges": group_ranges,
+                }
+            },
+        )
+
+        def extract_one(path: str) -> str:
             check_cancelled()
-            return outputs
+            if plan["standalone"]:
+                output_dir = (
+                    result_root
+                    / "未分组"
+                    / item["batch_id"]
+                    / _base.safe_folder_name(Path(path).stem)
+                )
+            else:
+                output_dir = (
+                    result_root
+                    / _base.safe_folder_name(item["name"])
+                    / item["batch_id"]
+                    / _base.safe_folder_name(Path(path).stem)
+                )
+            payload = copy.deepcopy(prepared[path]["payload"])
+            payload["output_dir"] = str(output_dir)
+            payload["comparison_group"] = item["name"]
+            payload["legend_ranges"] = group_ranges
+            numeric_snapshot = numeric_config_snapshot(payload)
+            numeric_hash = stable_config_hash(numeric_snapshot)
+            numeric_entry = cache_entry_dir(
+                cache_root,
+                "numeric",
+                prepared[path]["content_fingerprint"],
+                numeric_hash,
+            )
+            config_path = output_dir / "job_config.json"
+            if numeric_cache_is_valid(
+                numeric_entry,
+                content_fingerprint=prepared[path]["content_fingerprint"],
+                abaqus_version=abaqus_version,
+                config_hash=numeric_hash,
+            ):
+                self._copy_numeric_cache(numeric_entry, output_dir)
+                metadata_path = output_dir / "metadata.json"
+                if metadata_path.is_file():
+                    metadata = json.loads(
+                        metadata_path.read_text(encoding="utf-8")
+                    )
+                    metadata.update(
+                        {
+                            "odb_path": str(Path(path).resolve()),
+                            "numeric_cache_reused": True,
+                            "content_fingerprint": prepared[path][
+                                "content_fingerprint"
+                            ],
+                            "numeric_config_hash": numeric_hash,
+                        }
+                    )
+                    save_json(metadata_path, metadata)
+                payload["source_output_dir"] = str(numeric_entry)
+                save_json(config_path, payload)
+                tagged(
+                    path,
+                    f"复用已提取数值并仅重渲染组输出；组={item['name']}；"
+                    f"配置={numeric_hash[:12]}",
+                )
+                render_group_contours(
+                    self.defaults["abaqus_command"],
+                    config_path,
+                    lambda line: log(f"[{Path(path).name}] {line}"),
+                    controller,
+                )
+            else:
+                save_json(config_path, payload)
+                tagged(
+                    path,
+                    f"数值缓存未命中，执行完整提取；组={item['name']}；"
+                    f"配置={numeric_hash[:12]}",
+                )
+                run_job(
+                    self.defaults["abaqus_command"],
+                    config_path,
+                    lambda line: log(f"[{Path(path).name}] {line}"),
+                    controller,
+                )
+                metadata_path = output_dir / "metadata.json"
+                if metadata_path.is_file():
+                    metadata = json.loads(
+                        metadata_path.read_text(encoding="utf-8")
+                    )
+                    metadata.update(
+                        {
+                            "content_fingerprint": prepared[path][
+                                "content_fingerprint"
+                            ],
+                            "numeric_config_hash": numeric_hash,
+                            "numeric_cache_reused": False,
+                        }
+                    )
+                    save_json(metadata_path, metadata)
+                self._copy_numeric_cache(output_dir, numeric_entry)
+                write_numeric_cache_metadata(
+                    numeric_entry,
+                    odb_path=Path(path),
+                    content_fingerprint=prepared[path][
+                        "content_fingerprint"
+                    ],
+                    abaqus_version=abaqus_version,
+                    config_hash=numeric_hash,
+                    config_snapshot=numeric_snapshot,
+                )
+                tagged(path, "已写入持久数值缓存")
+            with self._finalize_lock:
+                finalize_output(
+                    output_dir,
+                    int(payload["settings"].get("animation_fps", 5)),
+                )
+            tagged(path, f"完成组输出：{output_dir}")
+            return str(output_dir)
 
-        self._start_thread(task, self._run_finished)
+        outputs: list[str] = []
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="odb-extract"
+        ) as pool:
+            futures = {
+                pool.submit(extract_one, path): path for path in members
+            }
+            for done, future in enumerate(as_completed(futures), 1):
+                path = futures[future]
+                try:
+                    outputs.append(future.result())
+                except Exception:
+                    controller.cancel()
+                    raise
+                log(
+                    f"BATCH_PROGRESS|extract|{done}|{len(members)}|"
+                    f"{Path(path).name}"
+                )
+        check_cancelled()
+        return outputs
 
-    def _run_finished(self, outputs: list[str]) -> None:
-        self.batch_active = False
+    def _release_active_group(self, item: dict[str, Any]) -> bool:
+        if self.active_group_task is not item:
+            return False
+        self.active_group_task = None
         self.batch_controller = None
-        self.scan_status.setText(f"后处理完成：{len(outputs)} 个组/ODB 结果")
-        super()._run_finished(outputs)
-
-    def _thread_failed(self, details: str) -> None:
-        was_batch = self.batch_active
-        cancelled = was_batch and "ProcessCancelled" in details
         self.batch_active = False
-        self.batch_controller = None
-        if cancelled:
-            self._set_busy(False)
-            self.scan_status.setText("当前后处理批次已取消")
-            self._append_log(f"[{self._timestamp()}] 当前后处理批次已取消；已完成结果予以保留。")
-            QMessageBox.information(self, "批次已取消", "当前后处理批次已停止，已完成的输出不会删除。")
+        return True
+
+    def _group_run_finished(
+        self, item: dict[str, Any], outputs: list[str]
+    ) -> None:
+        if not self._release_active_group(item):
             return
-        super()._thread_failed(details)
+        self._append_log(
+            f"[{self._timestamp()}] 组完成：{item['name']}；"
+            f"输出={len(outputs)}"
+        )
+        self.scan_status.setText(
+            f"组完成：{item['name']}｜排队："
+            f"{'、'.join(str(task['name']) for task in self.group_queue) or '无'}"
+        )
+        self._refresh_queue_ui()
+        self._pending_queue_advance = not self._exit_after_cancel
+
+    def _group_run_failed(
+        self, item: dict[str, Any], details: str
+    ) -> None:
+        if not self._release_active_group(item):
+            return
+        cancelled = "ProcessCancelled" in details or (
+            "Process cancelled by user" in details
+        )
+        state = "已取消" if cancelled else "失败"
+        self._append_log(
+            f"[{self._timestamp()}] 组{state}：{item['name']}"
+        )
+        if not cancelled:
+            self._append_log(details)
+        self.scan_status.setText(
+            f"组{state}：{item['name']}｜排队："
+            f"{'、'.join(str(task['name']) for task in self.group_queue) or '无'}"
+        )
+        self._refresh_queue_ui()
+        self._pending_queue_advance = not self._exit_after_cancel
+
+    def _group_worker_finished(self, worker) -> None:
+        if self.group_worker is worker:
+            self.group_worker = None
+        if self._exit_after_cancel and self.active_group_task is None:
+            QTimer.singleShot(0, self.close)
+            return
+        if self._pending_queue_advance:
+            self._pending_queue_advance = False
+            QTimer.singleShot(0, self._start_next_group)
+
+    def closeEvent(self, event) -> None:
+        self._save_state()
+        if self._has_group_work() and not self._exit_after_cancel:
+            dialog = QMessageBox(self)
+            dialog.setWindowTitle("仍有后处理任务")
+            dialog.setText("仍有正在运行或排队的组。")
+            dialog.setInformativeText(
+                "请选择返回，或取消全部任务并退出。"
+            )
+            return_button = dialog.addButton(
+                "返回", QMessageBox.RejectRole
+            )
+            cancel_button = dialog.addButton(
+                "取消全部并退出", QMessageBox.DestructiveRole
+            )
+            dialog.setDefaultButton(return_button)
+            dialog.exec()
+            if dialog.clickedButton() is not cancel_button:
+                event.ignore()
+                return
+            self.group_queue.clear()
+            self._exit_after_cancel = True
+            if self.batch_controller is not None:
+                self._append_log(
+                    f"[{self._timestamp()}] 正在取消全部任务并退出"
+                )
+                self.batch_controller.cancel()
+                event.ignore()
+                self._refresh_queue_ui()
+                return
+        super().closeEvent(event)
 
 
 FunctionThread = _base.FunctionThread

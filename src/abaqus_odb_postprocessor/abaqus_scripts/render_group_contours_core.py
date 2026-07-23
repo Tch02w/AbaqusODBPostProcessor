@@ -9,7 +9,6 @@ import displayGroupOdbToolset as dgo
 import csv
 import json
 import os
-import shutil
 import sys
 import traceback
 
@@ -168,6 +167,7 @@ viewport.odbDisplay.setFrame(
 )
 
 legend_ranges = config.get("legend_ranges", {})
+animation_legend_ranges = config.get("animation_legend_ranges", {})
 damage_spectrum_name = "DAMAGE_DYNAMIC_10"
 damage_colors = (
     "#F2F2F2", "#D9E8F5", "#B7D4EA", "#7BC8B8", "#2FBF71",
@@ -225,7 +225,7 @@ def primary_variable(variable, refinement):
         )
 
 
-def set_limits(spec):
+def set_static_limits(spec):
     limits = legend_ranges.get(spec["name"], {})
     if spec["variable"] in ("DAMAGET", "DAMAGEC"):
         maximum = max(float(limits.get("max", 0.0)), 1.0e-12)
@@ -269,6 +269,47 @@ def set_limits(spec):
             minAutoCompute=ON,
             maxAutoCompute=ON,
             outsideLimitsMode=SPECTRUM,
+        )
+
+
+def set_animation_limits(spec):
+    """Use one observed min/max range for this ODB's complete animation."""
+
+    limits = animation_legend_ranges.get(spec["name"], {})
+    if spec["variable"] in ("DAMAGET", "DAMAGEC") and limits:
+        viewport.odbDisplay.contourOptions.setValues(
+            contourType=BANDED,
+            contourStyle=DISCRETE,
+            numIntervals=10,
+            intervalType=UNIFORM,
+            spectrum=damage_spectrum_name,
+            contourEdges=OFF,
+            minAutoCompute=OFF,
+            minValue=float(limits["min"]),
+            maxAutoCompute=OFF,
+            maxValue=float(limits["max"]),
+            outsideLimitsMode=SPECIFY,
+            outsideLimitsBelowColor="#F2F2F2",
+            outsideLimitsAboveColor="#FF0000",
+        )
+    elif limits:
+        viewport.odbDisplay.contourOptions.setValues(
+            contourType=BANDED,
+            contourStyle=CONTINUOUS,
+            numIntervals=12,
+            intervalType=UNIFORM,
+            spectrum="Rainbow",
+            contourEdges=OFF,
+            minAutoCompute=OFF,
+            minValue=float(limits["min"]),
+            maxAutoCompute=OFF,
+            maxValue=float(limits["max"]),
+            outsideLimitsMode=SPECTRUM,
+        )
+    else:
+        viewport.odbDisplay.contourOptions.setValues(
+            minAutoCompute=ON,
+            maxAutoCompute=ON,
         )
 
 
@@ -345,9 +386,10 @@ def render(spec):
     primary_variable(spec["variable"], spec.get("refinement"))
     state = (CONTOURS_ON_UNDEF,) if spec.get("undeformed") else (CONTOURS_ON_DEF,)
     viewport.odbDisplay.display.setValues(plotState=state)
-    set_limits(spec)
+    set_static_limits(spec)
     viewport.view.fitView()
     written = []
+    last_rendered_item = None
     render_timeline = full_timeline
     for animation_index, item in enumerate(render_timeline):
         step_index = int(item["StepIndex"])
@@ -356,6 +398,7 @@ def render(spec):
         if spec["variable"] not in frame.fieldOutputs:
             continue
         viewport.odbDisplay.setFrame(step=step_index, frame=frame_index)
+        set_animation_limits(spec)
         base = os.path.join(
             folder,
             "{0:04d}_{1}_F{2:04d}".format(
@@ -365,12 +408,27 @@ def render(spec):
         try:
             session.printToFile(fileName=base, format=PNG, canvasObjects=(viewport,))
             written.append(base + ".png")
+            last_rendered_item = item
         except Exception:
             log("RENDER FAILED {0} {1}\n{2}".format(
                 spec["name"], animation_index, traceback.format_exc()
             ))
-    if written:
-        shutil.copyfile(written[-1], os.path.join(contour_dir, spec["name"] + "_LAST.png"))
+    if last_rendered_item is not None:
+        step_index = int(last_rendered_item["StepIndex"])
+        frame_index = int(last_rendered_item["FrameIndex"])
+        viewport.odbDisplay.setFrame(step=step_index, frame=frame_index)
+        set_static_limits(spec)
+        static_base = os.path.join(contour_dir, spec["name"] + "_LAST")
+        try:
+            session.printToFile(
+                fileName=static_base,
+                format=PNG,
+                canvasObjects=(viewport,),
+            )
+        except Exception:
+            log("STATIC RENDER FAILED {0}\n{1}".format(
+                spec["name"], traceback.format_exc()
+            ))
     log("RENDER {0}: {1} frames".format(spec["name"], len(written)))
 
 
@@ -394,6 +452,9 @@ metadata.update(
         "render_viewport_mm": list(render_viewport_mm),
         "image_size_unit": image_size_unit,
         "requested_image_size": [image_width, image_height],
+        "animation_legend_mode": "odb_full_timeline_fixed",
+        "animation_legend_ranges": animation_legend_ranges,
+        "static_contour_legend_mode": "comparison_group_fixed_selected_frames",
     }
 )
 with open(metadata_path, "w", encoding="utf-8") as stream:

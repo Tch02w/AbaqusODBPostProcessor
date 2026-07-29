@@ -57,7 +57,19 @@ from .constants import (
 )
 from .memory_adapter import QtMemoryMonitorAdapter
 from .memory_monitor import MemoryMonitorService, format_memory_size
+from .app_settings import (
+    load_app_settings,
+    load_settings_section,
+    save_app_settings,
+)
 from .models import QueueItem
+from .odb_merge import (
+    MergeConflictPolicy,
+    OdbMergeRequest,
+    OdbMergeResult,
+    OdbMergeService,
+    normalize_joined_output,
+)
 from .command import (
     MEMORY_OPTIONS,
     SubmitOptions,
@@ -78,6 +90,7 @@ from .job_controller import JobController
 from .job_runtime import JobRuntimeController
 from .process_observation import ProcessObservationService
 from .restart_dependency import RestartDependencyLifecycle
+from .remote_frontend import ExecutionLocation, RemoteFrontendBridge
 from .runtime_record import RuntimeRecord
 from .app_paths import SCHEDULER_STATE_PATH
 from .scheduler_adapter import (
@@ -103,6 +116,19 @@ from .ui_components import (
     format_run_status,
     runtime_job_display_label as ui_runtime_job_display_label,
     safe_int,
+    SegmentedSpinBox,
+    WorkbenchComboBox,
+)
+from .cluster_ui import (
+    ClusterTopologyWidget,
+    SubmissionWizardDialog,
+)
+from .workbench_ui import (
+    capture_local_resource_snapshot,
+    JobConfigurationWorkbench,
+    ProjectRemoteExplorer,
+    WorkbenchLogDock,
+    WorkbenchPropertiesPanel,
 )
 from .ui_styles import (
     APP_TITLE,
@@ -183,62 +209,6 @@ class RuntimeSelectorDelegate(QtWidgets.QStyledItemDelegate):
         return size
 
 
-class ArrowComboBox(QtWidgets.QComboBox):
-    """Combo box with a painted arrow that does not depend on theme assets."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-        self.view().setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        self.view().setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, False)
-        self.view().setWindowFlag(QtCore.Qt.WindowType.NoDropShadowWindowHint, True)
-
-    def showPopup(self) -> None:
-        view = self.view()
-        view.setWindowFlag(QtCore.Qt.WindowType.NoDropShadowWindowHint, True)
-        view.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, False)
-        super().showPopup()
-        QtCore.QTimer.singleShot(0, self.position_popup_below)
-
-    def position_popup_below(self) -> None:
-        view = self.view()
-        popup = view.window()
-        if popup is None:
-            return
-
-        popup.setWindowFlag(QtCore.Qt.WindowType.NoDropShadowWindowHint, True)
-        popup.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, False)
-
-        top_left = self.mapToGlobal(QtCore.QPoint(0, self.height()))
-        screen = QtGui.QGuiApplication.screenAt(top_left) or self.screen()
-        available = screen.availableGeometry() if screen is not None else QtCore.QRect()
-        row_count = max(1, self.count())
-        row_height = max(view.sizeHintForRow(0), 26)
-        content_height = row_count * row_height + 2
-        if available.isValid():
-            available_below = max(row_height + 2, available.bottom() - top_left.y() + 1)
-            content_height = min(content_height, available_below)
-        popup_width = max(self.width(), view.sizeHintForColumn(0) + 24)
-        popup.setGeometry(top_left.x(), top_left.y(), popup_width, content_height)
-
-    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
-        super().paintEvent(event)
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
-        painter.setBrush(QtGui.QColor("#475569"))
-        painter.setPen(QtCore.Qt.PenStyle.NoPen)
-        center_x = self.width() - 13
-        center_y = self.height() // 2 + 1
-        painter.drawPolygon(
-            QtGui.QPolygon(
-                [
-                    QtCore.QPoint(center_x - 4, center_y - 2),
-                    QtCore.QPoint(center_x + 4, center_y - 2),
-                    QtCore.QPoint(center_x, center_y + 3),
-                ]
-            )
-        )
-
-
 class MainWindow(QtWidgets.QMainWindow):
     """AbaqusSubmitter 主窗口。"""
 
@@ -247,15 +217,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._startup_timeline = StartupTimeline("MainWindow")
         self._startup_timeline.mark("main-init-start")
         self.setWindowTitle(APP_TITLE)
-        self.setMinimumSize(
-            COMPACT_WINDOW_MIN_WIDTH,
-            720,
-        )
-
-        self.resize(
-            COMPACT_WINDOW_MIN_WIDTH,
-            720,
-        )
+        self.setMinimumSize(COMPACT_WINDOW_MIN_WIDTH, 760)
+        self.resize(1600, 1000)
 
         self.current_work_dir = ""
         self.current_job_name = ""
@@ -318,6 +281,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.runtime_controller.jobUpdated.connect(self.on_runtime_job_updated)
         self.runtime_controller.processError.connect(self.on_process_error)
         self.runtime_controller.executionEvent.connect(self.on_execution_event)
+        self.odb_merge_service = OdbMergeService(self)
         self.last_effective_slot_signature: tuple[int, int, int, int] | None = None
         self._closing = False
         self._dispatch_pending = False
@@ -386,8 +350,45 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_ui_heartbeat(self) -> None:
         now = time.monotonic()
         self._ui_heartbeat_last = now
+        last_refresh = getattr(self, "_resource_ui_refresh_last", 0.0)
+        if now - last_refresh < 2.0:
+            return
+        self._resource_ui_refresh_last = now
+        resource_snapshot = capture_local_resource_snapshot()
+        if hasattr(self, "project_explorer"):
+            self.project_explorer.resource_summary.refresh(
+                self.queue_items,
+                scheduler_ready=self.scheduler is not None,
+                resource_snapshot=resource_snapshot,
+            )
+        selected_item = None
+        selected_run = self.run_records.get(self.selected_job_key())
+        if selected_run is not None:
+            selected_item = selected_run.get("queue_item")
+        if hasattr(self, "properties_panel"):
+            self.properties_panel.refresh(
+                self.queue_items,
+                selected_item,
+                resource_snapshot,
+            )
+            if selected_item is None and hasattr(self, "job_configuration"):
+                self.refresh_workbench_draft()
+        if hasattr(self, "cluster_topology"):
+            active_names = [
+                str(run.get("job_name") or job_key)
+                for job_key, run in self.active_runs.items()
+            ]
+            self.cluster_topology.refresh_local_resource(
+                work_dir=self.current_work_dir,
+                active_job_text="\n".join(active_names[:3]),
+                logical_cpus=resource_snapshot.logical_cpus,
+                cpu_percent=resource_snapshot.cpu_percent,
+                memory_used_bytes=resource_snapshot.memory_used_bytes,
+                memory_total_bytes=resource_snapshot.memory_total_bytes,
+                memory_percent=resource_snapshot.memory_percent,
+            )
 
-    def build_ui(self) -> None:
+    def _build_legacy_ui(self) -> None:
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
 
@@ -447,13 +448,12 @@ class MainWindow(QtWidgets.QMainWindow):
         core_label = QtWidgets.QLabel("Core")
         core_label.setFixedWidth(38)
         settings.addWidget(core_label)
-        self.cpus_spin = QtWidgets.QSpinBox()
+        self.cpus_spin = SegmentedSpinBox()
         self.cpus_spin.setObjectName("plainSpin")
         self.cpus_spin.setRange(0, MAX_CPUS)
         self.cpus_spin.setValue(DEFAULT_CPUS)
         self.cpus_spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.cpus_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.cpus_spin.setFixedSize(52, 30)
+        self.cpus_spin.setFixedSize(112, 30)
         settings.addWidget(self.cpus_spin)
         settings.addStretch(1)
         settings.addWidget(QtWidgets.QLabel("Mem"))
@@ -462,7 +462,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.memory_value.setText("90")
         self.memory_value.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.memory_value.setFixedSize(52, 30)
-        self.memory_unit = ArrowComboBox()
+        self.memory_unit = WorkbenchComboBox()
         self.memory_unit.setObjectName("submitParamCombo")
         self.memory_unit.addItems(MEMORY_OPTIONS)
         self.memory_unit.setCurrentText("%")
@@ -478,13 +478,12 @@ class MainWindow(QtWidgets.QMainWindow):
         queue_parallel_label = QtWidgets.QLabel("并行上限")
         queue_parallel_label.setObjectName("hint")
         settings.addWidget(queue_parallel_label)
-        self.max_parallel_spin = QtWidgets.QSpinBox()
+        self.max_parallel_spin = SegmentedSpinBox()
         self.max_parallel_spin.setObjectName("queueMaxParallelSpin")
         self.max_parallel_spin.setRange(1, 999)
         self.max_parallel_spin.setValue(calculate_default_joblist_parallel(DEFAULT_CPUS))
         self.max_parallel_spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.max_parallel_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
-        self.max_parallel_spin.setFixedSize(64, 30)
+        self.max_parallel_spin.setFixedSize(112, 30)
         self.max_parallel_spin.setToolTip("队列中允许同时运行的最大作业数")
         settings.addWidget(self.max_parallel_spin)
         card_layout.addLayout(settings)
@@ -611,7 +610,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         selector_row.addWidget(QtWidgets.QLabel("Job"))
 
-        self.job_selector = ArrowComboBox()
+        self.job_selector = WorkbenchComboBox()
 
         self.job_selector.setObjectName("runtimeSelector")
 
@@ -851,19 +850,734 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.open_dat_btn.clicked.connect(lambda: self.select_runtime_log_file(".dat"))
 
-        self.root_layout.addWidget(
-            left_panel,
-            0,
-        )
-
-        self.root_layout.addWidget(
-            self.right_panel,
-            1,
-        )
-
-        self.right_panel.hide()
+        self._install_cluster_console(left_panel)
 
         self.update_process_buttons(False)
+
+    def build_ui(self) -> None:
+        """Build only the selected C console and B submission workflow."""
+        central = QtWidgets.QWidget()
+        self.setCentralWidget(central)
+        self.root_layout = QtWidgets.QHBoxLayout(central)
+        self.root_layout.setContentsMargins(12, 12, 12, 12)
+        self.root_layout.setSpacing(0)
+
+        self.history = QtWidgets.QPlainTextEdit()
+        self.history.setReadOnly(True)
+        self.history.document().setMaximumBlockCount(MAX_HISTORY_LOG_LINES)
+        self.history.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.history.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.history.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        self._build_runtime_inspector()
+        self._install_cluster_console()
+        self.update_process_buttons(False)
+
+    def _build_runtime_inspector(self) -> None:
+        self.right_panel = QtWidgets.QFrame()
+        self.right_panel.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        right_layout = QtWidgets.QVBoxLayout(self.right_panel)
+        right_layout.setContentsMargins(10, 10, 10, 10)
+        right_layout.setSpacing(8)
+
+        runtime_title = QtWidgets.QLabel("作业运行情况")
+        runtime_title.setObjectName("runtimeTitle")
+        right_layout.addWidget(runtime_title)
+
+        selector_row = QtWidgets.QHBoxLayout()
+        selector_row.setSpacing(8)
+        selector_row.addWidget(QtWidgets.QLabel("Job"))
+        self.job_selector = WorkbenchComboBox()
+        self.job_selector.setObjectName("runtimeSelector")
+        self.job_selector.setMinimumWidth(148)
+        self.job_selector.setMaximumWidth(220)
+        self.job_selector.setFixedHeight(30)
+        self.job_selector.setToolTip("点击展开切换作业；颜色表示作业状态")
+        self.job_selector.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.job_selector.setItemDelegate(RuntimeSelectorDelegate(self.job_selector))
+        self.job_selector.view().setMouseTracking(True)
+        self.job_selector.currentIndexChanged.connect(self.on_job_selector_changed)
+        selector_row.addWidget(self.job_selector)
+        selector_row.addStretch(1)
+        self.job_stats_label = QtWidgets.QLabel("运行中 0 | 完成 0 | 异常 0")
+        self.job_stats_label.setObjectName("hint")
+        selector_row.addWidget(self.job_stats_label)
+        right_layout.addLayout(selector_row)
+
+        self.runtime_body_frame = QtWidgets.QFrame()
+        self.runtime_body_frame.setObjectName("runtimeBodyCard")
+        runtime_body_layout = QtWidgets.QVBoxLayout(self.runtime_body_frame)
+        runtime_body_layout.setContentsMargins(8, 8, 8, 8)
+        runtime_body_layout.setSpacing(7)
+
+        current_job_row = QtWidgets.QHBoxLayout()
+        self.current_job_title_label = QtWidgets.QLabel("Job: 未选择")
+        self.current_job_title_label.setObjectName("runtimeJobTitle")
+        current_job_row.addWidget(self.current_job_title_label)
+        current_job_row.addStretch(1)
+        self.status_label = QtWidgets.QLabel("状态：未运行")
+        self.status_label.setObjectName("runtimeStatus")
+        current_job_row.addWidget(self.status_label)
+        runtime_body_layout.addLayout(current_job_row)
+
+        action_row = QtWidgets.QHBoxLayout()
+        action_row.setSpacing(6)
+        self.open_dir_btn = QtWidgets.QPushButton("目录")
+        self.open_sta_btn = QtWidgets.QPushButton("STA")
+        self.open_msg_btn = QtWidgets.QPushButton("MSG")
+        self.open_dat_btn = QtWidgets.QPushButton("DAT")
+        for button in (
+            self.open_dir_btn,
+            self.open_sta_btn,
+            self.open_msg_btn,
+            self.open_dat_btn,
+        ):
+            action_row.addWidget(button)
+        action_row.addStretch(1)
+        self.pause_btn = QtWidgets.QPushButton("暂停")
+        self.pause_btn.setObjectName("warning")
+        self.stop_btn = QtWidgets.QPushButton("终止")
+        self.stop_btn.setObjectName("danger")
+        action_row.addWidget(self.pause_btn)
+        action_row.addWidget(self.stop_btn)
+        runtime_body_layout.addLayout(action_row)
+
+        self.job_meta = QtWidgets.QScrollArea()
+        self.job_meta.setObjectName("runtimeMeta")
+        self.job_meta.setWidgetResizable(True)
+        self.job_meta.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.job_meta.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.job_meta.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.job_meta.setMinimumHeight(170)
+        self.job_meta.setMaximumHeight(230)
+        self.job_meta_content = QtWidgets.QWidget()
+        self.job_meta_content.setObjectName("runtimeMetaContent")
+        self.job_meta_layout = QtWidgets.QVBoxLayout(self.job_meta_content)
+        self.job_meta_layout.setContentsMargins(8, 8, 8, 8)
+        self.job_meta_layout.setSpacing(8)
+        self.job_meta.setWidget(self.job_meta_content)
+        self.set_job_meta_empty()
+        runtime_body_layout.addWidget(self.job_meta)
+
+        self.sta_sticky_header_label = QtWidgets.QLabel(
+            build_sta_table_header() + "\n" + "-" * LOG_SEPARATOR_WIDTH
+        )
+        self.sta_sticky_header_label.setObjectName("staStickyHeader")
+        self.sta_sticky_header_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft)
+        self.sta_sticky_header_label.hide()
+
+        self.job_log = QtWidgets.QPlainTextEdit()
+        self.job_log.setReadOnly(True)
+        self.job_log.setObjectName("runtimeLog")
+        self.job_log.document().setMaximumBlockCount(MAX_JOB_LOG_LINES)
+        self.job_log.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        self.job_log.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.job_log.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.job_log.setMinimumHeight(180)
+
+        self.runtime_log_frame = QtWidgets.QFrame()
+        self.runtime_log_frame.setObjectName("runtimeLogFrame")
+        runtime_log_layout = QtWidgets.QVBoxLayout(self.runtime_log_frame)
+        runtime_log_layout.setContentsMargins(1, 1, 1, 1)
+        runtime_log_layout.setSpacing(0)
+        runtime_log_layout.addWidget(self.sta_sticky_header_label)
+        runtime_log_layout.addWidget(self.job_log, 1)
+        runtime_body_layout.addWidget(self.runtime_log_frame, 1)
+        right_layout.addWidget(self.runtime_body_frame, 1)
+
+        self.job_log.verticalScrollBar().valueChanged.connect(
+            self.update_sta_sticky_header_visibility
+        )
+        self.pause_btn.clicked.connect(self.toggle_pause_resume)
+        self.stop_btn.clicked.connect(self.terminate_job)
+        self.open_dir_btn.clicked.connect(self.open_work_dir)
+        self.open_sta_btn.clicked.connect(lambda: self.select_runtime_log_file(".sta"))
+        self.open_msg_btn.clicked.connect(lambda: self.select_runtime_log_file(".msg"))
+        self.open_dat_btn.clicked.connect(lambda: self.select_runtime_log_file(".dat"))
+
+    def _install_cluster_console(
+        self,
+        legacy_left_panel: QtWidgets.QWidget | None = None,
+    ) -> None:
+        """Install the C-style shell and the B-style submission workflow."""
+        self.remote_frontend = RemoteFrontendBridge(self)
+        self._remote_resource_snapshots: dict[str, dict] = {}
+        self.submission_wizard = SubmissionWizardDialog(self.remote_frontend, self)
+        self.submit_card = self.submission_wizard
+
+        self.inp_row = self.submission_wizard.inp_row
+        self.oldjob_row = self.submission_wizard.oldjob_row
+        self.for_row = self.submission_wizard.for_row
+        self.cpus_spin = self.submission_wizard.cpus_spin
+        self.memory_value = self.submission_wizard.memory_value
+        self.memory_unit = self.submission_wizard.memory_unit
+        self.max_parallel_spin = self.submission_wizard.max_parallel_spin
+        self.interactive_check = self.submission_wizard.interactive_check
+        self.datacheck_check = self.submission_wizard.datacheck_check
+        self.notify_check = self.submission_wizard.notify_check
+        self.preview_btn = self.submission_wizard.preview_btn
+        self.submit_btn = self.submission_wizard.submit_btn
+        self.abaqus_status_label = self.submission_wizard.abaqus_status_label
+
+        self.inp_row.button.clicked.connect(self.select_inp_file)
+        self.oldjob_row.button.clicked.connect(self.select_oldjob_file)
+        self.for_row.button.clicked.connect(self.select_for_file)
+        self.inp_row.pathChanged.connect(self.on_input_changed)
+        self.oldjob_row.pathChanged.connect(self.update_command_preview)
+        self.for_row.pathChanged.connect(self.update_command_preview)
+        self.cpus_spin.valueChanged.connect(self.update_command_preview)
+        self.memory_value.textChanged.connect(self.update_command_preview)
+        self.memory_unit.currentTextChanged.connect(self.update_command_preview)
+        self.interactive_check.toggled.connect(self.update_command_preview)
+        self.datacheck_check.toggled.connect(self.update_command_preview)
+        self.submission_wizard.previewRequested.connect(self.preview_command)
+        self.submission_wizard.localSubmitRequested.connect(self.submit_job)
+
+        self.remote_frontend.testConnectionRequested.connect(
+            lambda payload: self.handle_remote_frontend_request("测试 SSH 连接", payload)
+        )
+        self.remote_frontend.reconnectRequested.connect(
+            lambda server: self.handle_remote_frontend_request("重新连接服务器", server)
+        )
+        self.remote_frontend.resourceSnapshotReceived.connect(
+            self.apply_remote_resource_snapshot
+        )
+        self.remote_frontend.browseRemoteDirectoryRequested.connect(
+            lambda payload: self.handle_remote_frontend_request("浏览服务器允许目录", payload)
+        )
+        self.remote_frontend.submitRemoteJobRequested.connect(
+            lambda payload: self.handle_remote_frontend_request("提交远程作业", payload)
+        )
+        self.remote_frontend.cancelRemoteJobRequested.connect(
+            lambda job_id, force: self.handle_remote_frontend_request(
+                "强制终止远程作业" if force else "温和停止远程作业",
+                {"job_id": job_id, "force": force},
+            )
+        )
+        self.remote_frontend.mergeOdbRequested.connect(
+            lambda payload: self.handle_remote_frontend_request("合并服务器 ODB", payload)
+        )
+
+        shell = QtWidgets.QWidget()
+        shell.setObjectName("workbenchShell")
+        shell_layout = QtWidgets.QVBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+        shell_layout.addWidget(self._build_workbench_top_bar())
+
+        resource_snapshot = capture_local_resource_snapshot()
+        self.project_explorer = ProjectRemoteExplorer()
+        self.project_explorer.refresh(
+            self.queue_items,
+            self.inp_row.text(),
+            scheduler_ready=self.scheduler is not None,
+            resource_snapshot=resource_snapshot,
+        )
+        self.project_explorer.refreshRequested.connect(
+            self.refresh_project_explorer
+        )
+        self.project_explorer.itemActivated.connect(
+            self.on_project_item_activated
+        )
+        self.left_panel = self.project_explorer
+
+        self.workbench_tabs = QtWidgets.QTabWidget()
+        self.workbench_tabs.setObjectName("workbenchTabs")
+        self.right_panel.setObjectName("runtimeInspector")
+        self.workbench_tabs.addTab(self.right_panel, "作业概览")
+        self.job_configuration = JobConfigurationWorkbench(
+            self.submission_wizard,
+            self.remote_frontend,
+        )
+        self.workbench_tabs.addTab(self.job_configuration, "作业配置")
+
+        topology_page = QtWidgets.QWidget()
+        topology_layout = QtWidgets.QVBoxLayout(topology_page)
+        topology_layout.setContentsMargins(10, 10, 10, 10)
+        self.cluster_topology = ClusterTopologyWidget()
+        self.cluster_topology.set_queue_count(len(self.queue_items))
+        self.cluster_topology.refresh_local_resource(
+            logical_cpus=resource_snapshot.logical_cpus,
+            cpu_percent=resource_snapshot.cpu_percent,
+            memory_used_bytes=resource_snapshot.memory_used_bytes,
+            memory_total_bytes=resource_snapshot.memory_total_bytes,
+            memory_percent=resource_snapshot.memory_percent,
+        )
+        self.cluster_topology.nodeSelected.connect(self.on_cluster_node_selected)
+        topology_layout.addWidget(self.cluster_topology)
+        self.workbench_tabs.addTab(topology_page, "计算拓扑")
+
+        self.restart_chain_label = QtWidgets.QLabel(
+            "重启动链由当前队列与前置依赖生成；尚未选择包含 oldjob 的真实作业。"
+        )
+        self.restart_chain_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.restart_chain_label.setObjectName("emptyState")
+        self.workbench_tabs.addTab(self.restart_chain_label, "重启动链")
+        self.odb_validation_label = QtWidgets.QLabel(
+            "尚未生成或选择可验证的 joined ODB。"
+        )
+        self.odb_validation_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.odb_validation_label.setObjectName("emptyState")
+        self.workbench_tabs.addTab(self.odb_validation_label, "ODB 验证")
+        self.workbench_tabs.setCurrentWidget(self.job_configuration)
+
+        self.properties_panel = WorkbenchPropertiesPanel()
+        self.properties_panel.refresh(
+            self.queue_items,
+            resource_snapshot=resource_snapshot,
+        )
+        self.job_configuration.jobNameChanged.connect(self.refresh_workbench_draft)
+        self.job_configuration.chooseInputRequested.connect(self.select_inp_file)
+        self.job_configuration.chooseOriginalRequested.connect(self.select_oldjob_file)
+        self.job_configuration.chooseFortranRequested.connect(self.select_for_file)
+        self.job_configuration.chooseCalculationRootRequested.connect(
+            self.select_calculation_root
+        )
+        self.job_configuration.chooseArchiveRootRequested.connect(
+            self.select_archive_root
+        )
+        self.job_configuration.chooseMergeOriginalRequested.connect(
+            self.select_merge_original_odb
+        )
+        self.job_configuration.chooseMergeRestartRequested.connect(
+            self.select_merge_restart_odb
+        )
+        self.job_configuration.chooseMergeOutputRequested.connect(
+            self.select_merge_output_odb
+        )
+        self.job_configuration.mergeExecuteRequested.connect(self.execute_odb_merge)
+        self.job_configuration.mergeStopRequested.connect(
+            self.odb_merge_service.cancel
+        )
+        self.job_configuration.connectionTestRequested.connect(
+            self.open_server_configuration
+        )
+        self.job_configuration.previewRequested.connect(self.preview_command)
+        self.job_configuration.submitRequested.connect(self.submit_workbench_job)
+        self.properties_panel.saveRequested.connect(self.save_workbench_configuration)
+        self.properties_panel.submitRequested.connect(self.submit_workbench_job)
+        self.properties_panel.stopRequested.connect(self.stop_workbench_job)
+        saved_app_settings = load_app_settings()
+        workbench_settings = load_settings_section("workbench")
+        workbench_settings.setdefault(
+            "calculation_root_dir",
+            saved_app_settings.get("qt_ssd_work_dir", ""),
+        )
+        workbench_settings.setdefault(
+            "archive_dir",
+            saved_app_settings.get("qt_archive_dir", ""),
+        )
+        self.job_configuration.apply_settings(workbench_settings)
+        self.max_parallel_spin = self.job_configuration.max_parallel_spin
+
+        self.queue_manager_dialog = QueueManagerDialog(
+            self,
+            self.queue_items,
+            self.current_queue_settings(),
+            self.inp_row.text(),
+            embedded=True,
+            initial_candidates=self.candidate_queue_items,
+            joblist_save_callback=self.request_joblist_save,
+        )
+        self.queue_manager_dialog.terminateRequested.connect(
+            self.terminate_queue_items_by_ids
+        )
+        self.queue_manager_dialog.startQueueRequested.connect(self.start_queue)
+        self.queue_manager_dialog.stopQueueRequested.connect(self.stop_queue)
+        self.queue_manager_dialog.scanExternalRequested.connect(
+            lambda work_dir: self.scan_external_jobs(
+                work_dir,
+                self.queue_manager_dialog,
+            )
+        )
+        self.queue_manager_dialog.ssd_dir_edit.setText(
+            self.job_configuration.calculation_root_edit.text()
+        )
+        self.queue_manager_dialog.archive_dir_edit.setText(
+            self.job_configuration.archive_root_edit.text()
+        )
+        self.job_configuration.calculation_root_edit.textChanged.connect(
+            self.queue_manager_dialog.ssd_dir_edit.setText
+        )
+        self.job_configuration.archive_root_edit.textChanged.connect(
+            self.queue_manager_dialog.archive_dir_edit.setText
+        )
+        self.queue_manager_dialog.ssd_dir_edit.textChanged.connect(
+            self.job_configuration.calculation_root_edit.setText
+        )
+        self.queue_manager_dialog.archive_dir_edit.textChanged.connect(
+            self.job_configuration.archive_root_edit.setText
+        )
+        self.workbench_tabs.insertTab(
+            1,
+            self.queue_manager_dialog,
+            "作业队列",
+        )
+        self.refresh_workbench_draft()
+
+        upper_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        upper_splitter.setObjectName("workbenchUpperSplitter")
+        upper_splitter.addWidget(self.project_explorer)
+        upper_splitter.addWidget(self.workbench_tabs)
+        upper_splitter.addWidget(self.properties_panel)
+        upper_splitter.setStretchFactor(0, 0)
+        upper_splitter.setStretchFactor(1, 1)
+        upper_splitter.setStretchFactor(2, 0)
+        upper_splitter.setSizes([270, 900, 320])
+
+        self.log_dock = WorkbenchLogDock(self.history)
+        self.remote_frontend.transferEventReceived.connect(
+            lambda payload: self.log_dock.append_event(
+                self.log_dock.transfer_table,
+                payload,
+            )
+        )
+        self.remote_frontend.mergeEventReceived.connect(
+            lambda payload: self.log_dock.append_event(
+                self.log_dock.merge_table,
+                payload,
+            )
+        )
+        self.remote_frontend.problemEventReceived.connect(
+            lambda payload: self.log_dock.append_event(
+                self.log_dock.problem_table,
+                payload,
+            )
+        )
+        self.odb_merge_service.busyChanged.connect(
+            self.job_configuration.set_merge_busy
+        )
+        self.odb_merge_service.phaseChanged.connect(self.on_odb_merge_phase)
+        self.odb_merge_service.progressChanged.connect(
+            self.job_configuration.merge_progress.setValue
+        )
+        self.odb_merge_service.outputReceived.connect(self.on_odb_merge_output)
+        self.odb_merge_service.succeeded.connect(self.on_odb_merge_succeeded)
+        self.odb_merge_service.failed.connect(self.on_odb_merge_failed)
+        self.odb_merge_service.cancelled.connect(self.on_odb_merge_cancelled)
+        main_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
+        main_splitter.setObjectName("workbenchMainSplitter")
+        main_splitter.addWidget(upper_splitter)
+        main_splitter.addWidget(self.log_dock)
+        main_splitter.setStretchFactor(0, 1)
+        main_splitter.setStretchFactor(1, 0)
+        main_splitter.setSizes([660, 210])
+        shell_layout.addWidget(main_splitter, 1)
+        self.root_layout.addWidget(shell, 1)
+        self.queue_status_label = self.project_explorer.resource_summary.job_label
+        self.refresh_workbench_derived_state()
+
+        if legacy_left_panel is not None:
+            legacy_left_panel.hide()
+            legacy_left_panel.deleteLater()
+
+    def _build_workbench_top_bar(self) -> QtWidgets.QWidget:
+        top_bar = QtWidgets.QFrame()
+        top_bar.setObjectName("workbenchTopBar")
+        outer = QtWidgets.QVBoxLayout(top_bar)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        menu_bar = QtWidgets.QMenuBar()
+        menu_bar.setObjectName("workbenchMenuBar")
+        file_menu = menu_bar.addMenu("文件(&F)")
+        file_menu.addAction("新建作业", self.open_submission_wizard)
+        file_menu.addAction("退出", self.close)
+        job_menu = menu_bar.addMenu("作业(&J)")
+        job_menu.addAction("管理队列", self.open_queue_manager)
+        job_menu.addAction("开始队列", self.start_queue)
+        job_menu.addAction("终止队列", self.stop_queue)
+        server_menu = menu_bar.addMenu("服务器(&S)")
+        server_action = server_menu.addAction(
+            "连接服务器",
+            self.open_server_configuration,
+        )
+        server_action.setEnabled(False)
+        server_action.setToolTip("远程执行 Adapter 尚未实现")
+        outer.addWidget(menu_bar)
+
+        toolbar = QtWidgets.QFrame()
+        toolbar.setObjectName("workbenchToolbar")
+        layout = QtWidgets.QHBoxLayout(toolbar)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(7)
+        self.new_job_btn = QtWidgets.QPushButton("新建作业")
+        self.new_job_btn.setObjectName("toolbarButton")
+        self.toolbar_submit_btn = QtWidgets.QPushButton("提交")
+        self.toolbar_submit_btn.setObjectName("toolbarPrimary")
+        self.toolbar_stop_btn = QtWidgets.QPushButton("停止")
+        self.toolbar_stop_btn.setObjectName("toolbarDanger")
+        self.connect_server_btn = QtWidgets.QPushButton("连接服务器")
+        self.connect_server_btn.setObjectName("toolbarButton")
+        self.connect_server_btn.hide()
+        layout.addWidget(self.new_job_btn)
+        layout.addWidget(self.toolbar_submit_btn)
+        layout.addWidget(self.toolbar_stop_btn)
+        layout.addSpacing(12)
+        layout.addWidget(self.connect_server_btn)
+
+        self.global_search = QtWidgets.QLineEdit()
+        self.global_search.setObjectName("globalSearch")
+        self.global_search.setPlaceholderText("搜索命令、文件或作业")
+        self.global_search.setMaximumWidth(460)
+        self.global_search.hide()
+        layout.addWidget(self.global_search, 1)
+        layout.addStretch(1)
+        self.connection_state_combo = WorkbenchComboBox()
+        self.connection_state_combo.setObjectName("connectionState")
+        self.connection_state_combo.addItem("○ 远程服务器未连接")
+        self.connection_state_combo.hide()
+        layout.addWidget(self.connection_state_combo)
+        outer.addWidget(toolbar)
+
+        self.start_queue_btn = QtWidgets.QPushButton()
+        self.start_queue_btn.hide()
+        self.stop_queue_btn = QtWidgets.QPushButton()
+        self.stop_queue_btn.hide()
+        self.queue_btn = QtWidgets.QPushButton()
+        self.queue_btn.hide()
+        self.new_job_btn.clicked.connect(self.open_submission_wizard)
+        self.toolbar_submit_btn.clicked.connect(self.submit_workbench_job)
+        self.toolbar_stop_btn.clicked.connect(self.stop_workbench_job)
+        self.connect_server_btn.clicked.connect(
+            self.open_server_configuration
+        )
+        self.start_queue_btn.clicked.connect(self.start_queue)
+        self.stop_queue_btn.clicked.connect(self.stop_queue)
+        return top_bar
+
+    def _build_cluster_navigation(self) -> QtWidgets.QWidget:
+        navigation = QtWidgets.QFrame()
+        navigation.setObjectName("clusterNavigation")
+        navigation.setFixedWidth(208)
+        layout = QtWidgets.QVBoxLayout(navigation)
+        layout.setContentsMargins(8, 10, 8, 10)
+        layout.setSpacing(5)
+
+        nav_specs = (
+            ("集群拓扑", self.show_topology_view),
+            ("作业队列", self.open_queue_manager),
+            ("服务器", lambda: self.inspector_tabs.setCurrentIndex(1)),
+            ("文件传输", self.focus_event_timeline),
+            ("ODB 合并", lambda: self.inspector_tabs.setCurrentIndex(1)),
+            ("事件日志", self.focus_event_timeline),
+            ("配置中心", lambda: self.inspector_tabs.setCurrentIndex(1)),
+        )
+        self.navigation_buttons: list[QtWidgets.QPushButton] = []
+        for index, (text, slot) in enumerate(nav_specs):
+            button = QtWidgets.QPushButton(text)
+            button.setObjectName("navSelected" if index == 0 else "navButton")
+            button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(slot)
+            layout.addWidget(button)
+            self.navigation_buttons.append(button)
+        self.queue_btn = self.navigation_buttons[1]
+        layout.addStretch(1)
+
+        resource_card = QtWidgets.QFrame()
+        resource_card.setObjectName("navigationStatusCard")
+        resource_layout = QtWidgets.QVBoxLayout(resource_card)
+        resource_layout.setContentsMargins(10, 9, 10, 9)
+        resource_layout.addWidget(QtWidgets.QLabel("资源总览"))
+        resource_layout.addWidget(QtWidgets.QLabel("CPU　32 / 96"))
+        resource_layout.addWidget(QtWidgets.QLabel("内存　146 / 256 GB"))
+        self.queue_status_label = QtWidgets.QLabel("队列：未生成")
+        self.queue_status_label.setObjectName("hint")
+        self.queue_status_label.setWordWrap(True)
+        resource_layout.addWidget(self.queue_status_label)
+        layout.addWidget(resource_card)
+
+        scheduler_status = QtWidgets.QLabel("● Scheduler Core 运行正常")
+        scheduler_status.setObjectName("successBanner")
+        scheduler_status.setWordWrap(True)
+        layout.addWidget(scheduler_status)
+        return navigation
+
+    def open_submission_wizard(self) -> None:
+        """Start a draft directly in the primary workbench."""
+        if not hasattr(self, "job_configuration"):
+            return
+        has_draft = any(
+            (
+                self.job_configuration.input_path_edit.text().strip(),
+                self.job_configuration.oldjob_path_edit.text().strip(),
+                self.job_configuration.fortran_path_edit.text().strip(),
+            )
+        )
+        if has_draft:
+            answer = QtWidgets.QMessageBox.question(
+                self,
+                "新建作业",
+                "是否清空当前未提交配置并新建作业？",
+                (
+                    QtWidgets.QMessageBox.StandardButton.Yes
+                    | QtWidgets.QMessageBox.StandardButton.No
+                ),
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        self.workbench_tabs.setCurrentWidget(self.job_configuration)
+        self.job_configuration.reset_for_new_job()
+
+    def open_server_configuration(self) -> None:
+        """Focus the server fields already present in the primary workbench."""
+        if not hasattr(self, "job_configuration"):
+            return
+        self.workbench_tabs.setCurrentWidget(self.job_configuration)
+        self.job_configuration.host_edit.setFocus(
+            QtCore.Qt.FocusReason.OtherFocusReason
+        )
+
+    def show_topology_view(self) -> None:
+        if hasattr(self, "workbench_tabs") and hasattr(self, "cluster_topology"):
+            self.workbench_tabs.setCurrentIndex(
+                self.workbench_tabs.indexOf(self.cluster_topology.parentWidget())
+            )
+
+    def focus_event_timeline(self) -> None:
+        self.history.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
+
+    def on_cluster_node_selected(self, node_id: str) -> None:
+        self.append_history(f"已选择计算节点：{node_id}")
+
+    def handle_remote_frontend_request(self, action: str, payload: object) -> None:
+        """Acknowledge a reserved frontend Interface without performing I/O."""
+        self.append_history(f"{action}：请求已由前端收集；远程 Adapter 当前暂停，未执行网络操作。")
+        if hasattr(self, "connection_state_combo"):
+            self.connection_state_combo.setItemText(0, "○ 远程服务器未连接")
+
+    def apply_remote_resource_snapshot(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        profile_name = str(payload.get("profile_name") or "未命名服务器")
+        self._remote_resource_snapshots[profile_name] = dict(payload)
+        self.project_explorer.apply_remote_snapshot(payload)
+        self.properties_panel.apply_remote_snapshot(payload)
+        self.cluster_topology.apply_remote_resource_snapshot(payload)
+        connected = bool(payload.get("connected", False))
+        self.connection_state_combo.setItemText(
+            0,
+            f"{'●' if connected else '○'} {profile_name} · "
+            f"{'已连接' if connected else '未连接'}",
+        )
+
+    def restore_remote_explorer_snapshots(self) -> None:
+        for snapshot in self._remote_resource_snapshots.values():
+            self.project_explorer.apply_remote_snapshot(snapshot)
+
+    def refresh_project_explorer(self) -> None:
+        snapshot = capture_local_resource_snapshot()
+        self.project_explorer.refresh(
+            self.queue_items,
+            self.job_configuration.input_path_edit.text().strip(),
+            scheduler_ready=self.scheduler is not None,
+            resource_snapshot=snapshot,
+        )
+        self.restore_remote_explorer_snapshots()
+
+    def on_project_item_activated(self, value: str) -> None:
+        path = Path(value)
+        if not path.is_file():
+            return
+        suffix = path.suffix.lower()
+        if suffix == ".inp":
+            self.inp_row.set_path(str(path))
+            self.workbench_tabs.setCurrentWidget(self.job_configuration)
+            return
+        if suffix != ".odb":
+            return
+        self.workbench_tabs.setCurrentWidget(self.job_configuration)
+        if not self.job_configuration.merge_original_edit.text().strip():
+            self.job_configuration.set_merge_original_path(str(path))
+        else:
+            self.job_configuration.set_merge_restart_path(str(path))
+
+    def refresh_workbench_derived_state(self) -> None:
+        if not hasattr(self, "restart_chain_label"):
+            return
+        restart_items = [
+            item for item in self.queue_items if item.oldjob_name or item.oldjob_path
+        ]
+        if restart_items:
+            self.restart_chain_label.setText(
+                "\n".join(
+                    f"{item.oldjob_name or Path(item.oldjob_path).stem} → "
+                    f"{item.job_name}　{item.status}"
+                    for item in restart_items
+                )
+            )
+        else:
+            self.restart_chain_label.setText(
+                "当前队列没有包含 oldjob 的重启动作业。"
+            )
+
+        joined_paths: list[Path] = []
+        input_path = self.inp_row.text()
+        if input_path:
+            parent = Path(input_path).parent
+            if parent.is_dir():
+                try:
+                    joined_paths = sorted(
+                        parent.glob("*_joined.odb"),
+                        key=lambda path: path.name.lower(),
+                    )
+                except OSError:
+                    joined_paths = []
+        self.odb_validation_label.setText(
+            "\n".join(str(path) for path in joined_paths)
+            if joined_paths
+            else "当前 INP 目录中没有实际的 *_joined.odb。"
+        )
+
+    def refresh_workbench_draft(self, _job_name: str = "") -> None:
+        if not hasattr(self, "job_configuration"):
+            return
+        self.properties_panel.set_draft(
+            job_name=self.job_configuration.job_name_edit.text().strip(),
+            original_job=self.job_configuration.original_job_edit.text().strip(),
+            input_path=self.job_configuration.input_path_edit.text().strip(),
+        )
+        self.toolbar_submit_btn.setEnabled(
+            bool(self.job_configuration.input_path_edit.text().strip())
+        )
+        self.job_configuration.submit_job_btn.setEnabled(
+            bool(self.job_configuration.input_path_edit.text().strip())
+        )
+        self.job_configuration.preview_submit_btn.setEnabled(
+            bool(self.job_configuration.input_path_edit.text().strip())
+        )
+
+    def save_workbench_configuration(self) -> None:
+        self.job_configuration.sync_to_wizard()
+        try:
+            values = self.job_configuration.export_settings()
+            payload = load_app_settings()
+            payload["workbench"] = values
+            payload["qt_ssd_work_dir"] = values["calculation_root_dir"]
+            payload["qt_archive_dir"] = values["archive_dir"]
+            save_app_settings(payload)
+        except OSError as exc:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "保存配置失败",
+                f"无法保存主界面配置：\n{exc}",
+            )
+            return
+        self.append_history("主界面作业配置已保存。")
+
+    def submit_workbench_job(self) -> None:
+        self.job_configuration.sync_to_wizard()
+        self.submission_wizard.submit_current()
+
+    def stop_workbench_job(self) -> None:
+        if self.selected_job_key() in self.active_runs:
+            self.terminate_job()
+            return
+        self.append_history("当前没有可停止的活动作业。")
 
     def apply_styles(self) -> None:
         self.setStyleSheet(build_main_stylesheet())
@@ -871,33 +1585,44 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------- Data ----------
 
     def collect_options(self) -> SubmitOptions:
+        if hasattr(self, "job_configuration"):
+            return self.job_configuration.local_job_draft().to_submit_options()
         inp_file = self.inp_row.text()
-        return SubmitOptions(
-            inp_file=inp_file,
-            job_name=derive_job_name(inp_file),
-            cpus=self.cpus_spin.value(),
-            oldjob_path=self.oldjob_row.text(),
-            for_file=self.for_row.text(),
-            interactive=self.interactive_check.isChecked(),
-            datacheck=self.datacheck_check.isChecked(),
-            memory_value=self.memory_value.text().strip(),
-            memory_unit=self.memory_unit.currentText(),
-        )
+        return SubmitOptions(inp_file=inp_file, job_name=derive_job_name(inp_file))
 
     def current_queue_settings(self) -> dict:
+        if hasattr(self, "job_configuration"):
+            draft = self.job_configuration.local_job_draft()
+            memory = ""
+            if draft.memory_value:
+                memory = (
+                    f"{draft.memory_value}"
+                    f"{'%' if draft.memory_unit == '%' else draft.memory_unit.lower()}"
+                )
+            return {
+                "job_name": draft.effective_job_name(),
+                "cores": draft.cpus,
+                "memory": memory,
+                "oldjob_path": draft.oldjob_path,
+                "for_file": draft.fortran_path,
+                "interactive": draft.interactive,
+                "datacheck": draft.datacheck,
+                "notify": draft.notify,
+                "abaqus_command": draft.abaqus_command,
+                "priority": draft.priority,
+            }
         memory = ""
-        memory_value = self.memory_value.text().strip()
-        if memory_value:
-            unit = self.memory_unit.currentText()
-            memory = f"{memory_value}{'%' if unit == '%' else unit.lower()}"
         return {
-            "cores": self.cpus_spin.value(),
+            "job_name": derive_job_name(self.inp_row.text()),
+            "cores": 0,
             "memory": memory,
-            "oldjob_path": self.oldjob_row.text(),
-            "for_file": self.for_row.text(),
-            "interactive": self.interactive_check.isChecked(),
-            "datacheck": self.datacheck_check.isChecked(),
-            "notify": self.notify_check.isChecked(),
+            "oldjob_path": "",
+            "for_file": "",
+            "interactive": False,
+            "datacheck": False,
+            "notify": True,
+            "abaqus_command": "abaqus",
+            "priority": 0,
         }
 
     def restore_joblist_state(self) -> None:
@@ -1033,6 +1758,18 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------- Slots ----------
 
     def select_inp_file(self) -> None:
+        if (
+            hasattr(self, "job_configuration")
+            and self.job_configuration.execution_combo.currentData()
+            == ExecutionLocation.SERVER_EXISTING
+        ):
+            self.remote_frontend.browseRemoteDirectoryRequested.emit(
+                {
+                    "profile_name": self.job_configuration.server_combo.currentText(),
+                    "file_type": "inp",
+                }
+            )
+            return
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "选择 INP 文件",
@@ -1051,6 +1788,10 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if path:
             self.oldjob_row.set_path(path)
+            if hasattr(self, "job_configuration"):
+                self.job_configuration.set_oldjob_path(path)
+                if not self.job_configuration.merge_original_edit.text().strip():
+                    self.job_configuration.set_merge_original_path(path)
 
     def select_for_file(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1061,8 +1802,219 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if path:
             self.for_row.set_path(path)
+            if hasattr(self, "job_configuration"):
+                self.job_configuration.set_fortran_path(path)
+
+    def select_calculation_root(self) -> None:
+        initial = self.job_configuration.calculation_root_edit.text().strip()
+        if not initial:
+            input_path = self.job_configuration.input_path_edit.text().strip()
+            initial = str(Path(input_path).parent) if input_path else ""
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "选择本机 SSD 工作目录",
+            initial,
+        )
+        if folder:
+            self.job_configuration.calculation_root_edit.setText(
+                os.path.normpath(folder)
+            )
+
+    def select_archive_root(self) -> None:
+        initial = self.job_configuration.archive_root_edit.text().strip()
+        if not initial:
+            input_path = self.job_configuration.input_path_edit.text().strip()
+            initial = str(Path(input_path).parent) if input_path else ""
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "选择结果归档目录",
+            initial,
+        )
+        if folder:
+            self.job_configuration.archive_root_edit.setText(
+                os.path.normpath(folder)
+            )
+
+    def _merge_dialog_directory(self) -> str:
+        if not hasattr(self, "job_configuration"):
+            return ""
+        for edit in (
+            self.job_configuration.merge_restart_edit,
+            self.job_configuration.merge_original_edit,
+            self.job_configuration.input_path_edit,
+        ):
+            value = edit.text().strip()
+            if value:
+                path = Path(value)
+                return str(path if path.is_dir() else path.parent)
+        return ""
+
+    def select_merge_original_odb(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择原始 ODB",
+            self._merge_dialog_directory(),
+            "Abaqus ODB (*.odb);;所有文件 (*.*)",
+        )
+        if path:
+            self.job_configuration.set_merge_original_path(path)
+
+    def select_merge_restart_odb(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "选择重启动 ODB",
+            self._merge_dialog_directory(),
+            "Abaqus ODB (*.odb);;所有文件 (*.*)",
+        )
+        if path:
+            self.job_configuration.set_merge_restart_path(path)
+
+    def select_merge_output_odb(self) -> None:
+        current = self.job_configuration.merge_output_edit.text().strip()
+        if not current:
+            restart = self.job_configuration.merge_restart_edit.text().strip()
+            if restart:
+                restart_path = Path(restart)
+                stem = restart_path.stem
+                if stem.lower().endswith("_original"):
+                    stem = stem[: -len("_original")]
+                current = str(restart_path.with_name(f"{stem}_joined.odb"))
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "选择合并结果保存位置",
+            current or self._merge_dialog_directory(),
+            "Abaqus ODB (*.odb);;所有文件 (*.*)",
+        )
+        if path:
+            self.job_configuration.set_merge_output_path(
+                str(normalize_joined_output(Path(path)))
+            )
+
+    def execute_odb_merge(self) -> None:
+        values = self.job_configuration.merge_values()
+        missing_labels = [
+            label
+            for key, label in (
+                ("original_odb", "原始 ODB"),
+                ("restart_odb", "重启动 ODB"),
+                ("output_odb", "输出 ODB"),
+                ("abaqus_command", "Abaqus 命令"),
+            )
+            if not str(values.get(key) or "").strip()
+        ]
+        if missing_labels:
+            self.on_odb_merge_failed(
+                f"请先填写：{'、'.join(missing_labels)}。"
+            )
+            return
+        try:
+            original = Path(str(values["original_odb"]))
+            restart = Path(str(values["restart_odb"]))
+            output = normalize_joined_output(Path(str(values["output_odb"])))
+        except (KeyError, TypeError, ValueError) as exc:
+            self.on_odb_merge_failed(f"ODB 合并参数无效：{exc}")
+            return
+        self.job_configuration.set_merge_output_path(str(output))
+
+        strategy = str(values["conflict_strategy"])
+        policy = MergeConflictPolicy.AUTO_NUMBER
+        if strategy == "confirm" and output.exists():
+            answer = QtWidgets.QMessageBox.warning(
+                self,
+                "覆盖合并结果",
+                f"输出文件已经存在：\n{output}\n\n是否覆盖该结果？两个源 ODB 不会被修改。",
+                (
+                    QtWidgets.QMessageBox.StandardButton.Yes
+                    | QtWidgets.QMessageBox.StandardButton.No
+                ),
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                self.job_configuration.set_merge_status("已取消覆盖，未执行合并。")
+                return
+            policy = MergeConflictPolicy.OVERWRITE
+
+        request = OdbMergeRequest(
+            original_odb=original,
+            restart_odb=restart,
+            output_odb=output,
+            abaqus_command=str(values["abaqus_command"]),
+            include_history=bool(values["include_history"]),
+            compress_result=bool(values["compress_result"]),
+            copy_original=bool(values["copy_original"]),
+            conflict_policy=policy,
+        )
+        self.job_configuration.merge_progress.setValue(0)
+        self.job_configuration.set_merge_status("正在检查 ODB 合并参数…")
+        self.odb_merge_service.start(request)
+
+    def _append_merge_event(self, level: str, message: str) -> None:
+        if not hasattr(self, "log_dock"):
+            return
+        self.log_dock.append_event(
+            self.log_dock.merge_table,
+            {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "source": "本机 ODB 合并",
+                "level": level,
+                "message": message,
+            },
+        )
+
+    def on_odb_merge_phase(self, phase: str) -> None:
+        self.job_configuration.set_merge_status(phase)
+        self._append_merge_event("信息", phase)
+
+    def on_odb_merge_output(self, text: str) -> None:
+        self.append_history(f"ODB 合并：{text}", operation="odb-merge")
+
+    def on_odb_merge_succeeded(self, payload: object) -> None:
+        if not isinstance(payload, OdbMergeResult):
+            return
+        message = f"合并完成：{payload.output_odb}"
+        self.job_configuration.set_merge_status(message, state="success")
+        self._append_merge_event("成功", message)
+        self.append_history(
+            f"{message}\n"
+            f"原始 ODB 安全副本：{payload.original_backup}\n"
+            f"重启动 ODB 安全副本：{payload.restart_backup}"
+        )
+        self.refresh_workbench_derived_state()
+        self.odb_validation_label.setText(str(payload.output_odb))
+
+    def on_odb_merge_failed(self, message: str) -> None:
+        self.job_configuration.set_merge_status(message, state="error")
+        self._append_merge_event("错误", message)
+        if not self._closing:
+            QtWidgets.QMessageBox.warning(self, "ODB 合并失败", message)
+
+    def on_odb_merge_cancelled(self) -> None:
+        message = "ODB 合并已停止，两个源 ODB 未被修改。"
+        self.job_configuration.set_merge_status(message)
+        self._append_merge_event("警告", message)
 
     def on_input_changed(self, _path: str) -> None:
+        if hasattr(self, "job_configuration") and _path:
+            previous_path = self.job_configuration.input_path_edit.text().strip()
+            current_name = self.job_configuration.job_name_edit.text().strip()
+            should_infer_name = (
+                not current_name
+                or current_name == derive_job_name(previous_path)
+            )
+            if self.job_configuration.input_path_edit.text().strip() != _path:
+                self.job_configuration.input_path_edit.setText(_path)
+            if should_infer_name:
+                self.job_configuration.job_name_edit.setText(
+                    derive_job_name(_path)
+                )
+        if hasattr(self, "project_explorer"):
+            self.project_explorer.refresh(
+                self.queue_items,
+                _path,
+                scheduler_ready=self.scheduler is not None,
+            )
+            self.restore_remote_explorer_snapshots()
+            self.refresh_workbench_derived_state()
         self.update_command_preview()
 
     def update_command_preview(self) -> None:
@@ -1083,6 +2035,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @hang_probe_function("MainWindow.submit_job")
     def submit_job(self) -> None:
+        draft = self.job_configuration.local_job_draft()
         options = self.collect_options()
 
         ok, message = validate_options(options)
@@ -1096,6 +2049,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
             return
 
+        ok, message = draft.validate_local_paths()
+        if not ok:
+            QtWidgets.QMessageBox.warning(self, "提交作业", message)
+            return
+
         work_dir = str(Path(options.inp_file).parent)
 
         queue_item = self.find_queue_item_by_job(
@@ -1106,10 +2064,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if queue_item is None:
             queue_item = build_direct_submit_queue_item(
                 options,
-                notify=self.notify_check.isChecked(),
+                notify=draft.notify,
             )
 
             self.queue_items.append(queue_item)
+        draft.apply_to_queue_item(queue_item)
 
         started = self.job_controller.submit_scheduled_job(
             options,
@@ -1138,10 +2097,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def open_queue_manager(self) -> None:
         self._startup_timeline.mark("open-queue-manager-start")
-        if self.queue_manager_dialog is not None and self.queue_manager_dialog.isVisible():
-            self.queue_manager_dialog.refresh_tables()
-            self.queue_manager_dialog.raise_()
-            self.queue_manager_dialog.activateWindow()
+        if self.queue_manager_dialog is not None:
+            dialog = self.queue_manager_dialog
+            dialog.current_inp = self.inp_row.text()
+            dialog.current_settings = self.current_queue_settings()
+            dialog.refresh_tables()
+            tab_index = self.workbench_tabs.indexOf(dialog)
+            if tab_index >= 0:
+                self.workbench_tabs.setCurrentIndex(tab_index)
+            else:
+                dialog.raise_()
+                dialog.activateWindow()
             self.request_restored_status_scan_after_queue_manager_render()
             self._startup_timeline.mark("open-queue-manager-existing")
             return
@@ -1158,6 +2124,8 @@ class MainWindow(QtWidgets.QMainWindow):
         dialog.setModal(False)
         dialog.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dialog.terminateRequested.connect(self.terminate_queue_items_by_ids)
+        dialog.startQueueRequested.connect(self.start_queue)
+        dialog.stopQueueRequested.connect(self.stop_queue)
         dialog.scanExternalRequested.connect(
             lambda work_dir, queue_dialog=dialog: self.scan_external_jobs(work_dir, queue_dialog)
         )
@@ -2183,12 +3151,18 @@ class MainWindow(QtWidgets.QMainWindow):
         左侧保持固定宽度；
         右侧最窄时仍可以完整显示基准分隔符。
         """
+        if hasattr(self, "inspector_tabs") or hasattr(self, "workbench_tabs"):
+            self.right_panel.setMinimumWidth(0)
+            self.setMinimumWidth(COMPACT_WINDOW_MIN_WIDTH)
+            return
+
         right_panel_min_width = self.calculate_runtime_panel_min_width()
 
         self.right_panel.setMinimumWidth(right_panel_min_width)
 
-        full_window_min_width = (
-            LEFT_PANEL_MIN_WIDTH + right_panel_min_width + WINDOW_OUTER_HORIZONTAL_MARGIN + PANEL_HORIZONTAL_SPACING
+        full_window_min_width = max(
+            COMPACT_WINDOW_MIN_WIDTH,
+            LEFT_PANEL_MIN_WIDTH + right_panel_min_width + WINDOW_OUTER_HORIZONTAL_MARGIN + PANEL_HORIZONTAL_SPACING,
         )
 
         if self.right_panel.isHidden():
@@ -2210,6 +3184,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         显示右侧运行区，并根据日志框字体应用宽度下限。
         """
+        if hasattr(self, "workbench_tabs"):
+            self.workbench_tabs.setCurrentWidget(self.right_panel)
         if self.right_panel.isHidden():
             self.right_panel.show()
 
@@ -2682,6 +3658,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 "",
             )
         )
+        if hasattr(self, "properties_panel"):
+            self.properties_panel.refresh(
+                self.queue_items,
+                run.get("queue_item"),
+            )
 
         index = self.job_selector.findData(job_key)
 
@@ -2712,6 +3693,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_queue_status_label(self) -> None:
         counts = scheduler_queue_status_counts(self.queue_items)
+        resource_snapshot = capture_local_resource_snapshot()
+        if hasattr(self, "cluster_topology"):
+            self.cluster_topology.set_queue_count(len(self.queue_items))
+        if hasattr(self, "project_explorer"):
+            self.project_explorer.refresh(
+                self.queue_items,
+                self.inp_row.text(),
+                scheduler_ready=self.scheduler is not None,
+                resource_snapshot=resource_snapshot,
+            )
+            self.restore_remote_explorer_snapshots()
+            self.refresh_workbench_derived_state()
+        if hasattr(self, "properties_panel"):
+            selected_queue_item = None
+            selected_run = self.run_records.get(self.selected_job_key())
+            if selected_run is not None:
+                selected_queue_item = selected_run.get("queue_item")
+            self.properties_panel.refresh(
+                self.queue_items,
+                selected_queue_item,
+                resource_snapshot,
+            )
+            if selected_queue_item is None and hasattr(self, "job_configuration"):
+                self.refresh_workbench_draft()
         pending = counts.get(STATUS_PENDING_RUN, 0) + counts.get(STATUS_WAITING_DEPENDENCY, 0)
         running = sum(counts.get(status, 0) for status in ACTIVE_STATUSES)
         completed = counts.get(STATUS_COMPLETED, 0) + counts.get(STATUS_DATACHECK_COMPLETED, 0)
@@ -2723,14 +3728,15 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         cancelled = counts.get(STATUS_CANCELED, 0) + counts.get(STATUS_TERMINATED, 0)
         if not self.queue_items:
-            self.queue_status_label.setText("队列：未生成")
+            self.queue_status_label.setText("队列　0 个 · 运行 0 · 等待 0")
             self.request_joblist_save()
             return
         covered = running + pending + completed + failed + cancelled
         other = max(0, len(self.queue_items) - covered)
         other_text = f" | 其他 {other}" if other else ""
         self.queue_status_label.setText(
-            f"队列：{len(self.queue_items)} 个 | 运行 {running} | 等待 {pending} | 完成 {completed} | 失败 {failed} | 取消 {cancelled}{other_text}"
+            f"队列　{len(self.queue_items)} 个 · 运行 {running} · 等待 {pending}"
+            f" · 完成 {completed} · 失败 {failed} · 取消 {cancelled}{other_text}"
         )
         self.request_joblist_save()
 
@@ -2915,6 +3921,20 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """根据当前 Job 状态更新右侧操作按钮。"""
         self.submit_btn.setEnabled(not running)
+        if hasattr(self, "toolbar_stop_btn"):
+            self.toolbar_stop_btn.setEnabled(running)
+        if hasattr(self, "toolbar_submit_btn"):
+            has_input = bool(
+                getattr(self, "job_configuration", None)
+                and self.job_configuration.input_path_edit.text().strip()
+            )
+            self.toolbar_submit_btn.setEnabled(has_input and not running)
+            self.job_configuration.submit_job_btn.setEnabled(
+                has_input and not running
+            )
+            self.job_configuration.preview_submit_btn.setEnabled(
+                has_input and not running
+            )
 
         self.stop_btn.setEnabled(running)
 
@@ -2954,6 +3974,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if abaqus_status_thread.isRunning():
                 abaqus_status_thread.wait(1500)
         self.runtime_controller.shutdown()
+        self.odb_merge_service.shutdown()
         self.workspace_prepare_service.shutdown()
         self._workspace_prepare_contexts.clear()
         self.archive_move_service.shutdown()

@@ -45,6 +45,7 @@ from .queue_presentation import (
     runtime_cell_projection,
 )
 from .restart_dependency import RestartDependencyLifecycle
+from .ui_components import SegmentedSpinBox, WorkbenchComboBox
 from .ui_styles import build_queue_manager_stylesheet
 
 RESULT_EXTENSIONS = (".odb", ".sta", ".msg", ".dat", ".log")
@@ -202,6 +203,8 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
     terminateRequested = Signal(list)
     scanExternalRequested = Signal(str)
+    startQueueRequested = Signal()
+    stopQueueRequested = Signal()
 
     def __init__(
         self,
@@ -210,19 +213,25 @@ class QueueManagerDialog(QtWidgets.QDialog):
         current_settings,
         current_inp="",
         *,
+        embedded: bool = False,
         initial_candidates: list[QueueItem] | None = None,
         joblist_save_callback=None,
     ):
-        super().__init__(None)
+        super().__init__(parent if embedded else None)
+        self.embedded = embedded
         self.host_window = parent
         self._startup_timeline = StartupTimeline("QueueManagerDialog")
         self._startup_timeline_active = self._startup_timeline.enabled
         self._startup_candidate_refresh_done = False
         self._startup_queue_refresh_done = False
         self._startup_timeline.mark("queue-dialog-init-start")
-        self.setWindowFlag(QtCore.Qt.WindowType.Window, True)
-        self.setWindowTitle("作业队列管理")
-        self.resize(1280, 752)
+        if embedded:
+            self.setWindowFlags(QtCore.Qt.WindowType.Widget)
+            self.setObjectName("embeddedQueueManager")
+        else:
+            self.setWindowFlag(QtCore.Qt.WindowType.Window, True)
+            self.setWindowTitle("作业队列管理")
+            self.resize(1280, 752)
         self.queue_items = queue_items
         self.current_settings = current_settings
         self.current_inp = current_inp
@@ -268,6 +277,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
         candidate_layout.setSpacing(6)
 
         candidate_toolbar = QtWidgets.QHBoxLayout()
+        self.candidate_toolbar = candidate_toolbar
         candidate_toolbar.setSpacing(6)
         self.add_current_btn = self.make_button("加入当前 INP")
         self.add_files_btn = self.make_button("添加 INP 文件")
@@ -277,6 +287,12 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.invert_btn = self.make_button("反选")
         self.remove_candidate_btn = self.make_button("移除选中候选项", "danger")
         self.confirm_btn = self.make_button("确认选中项加入队列", "primary")
+        self.use_ssd_check = QtWidgets.QCheckBox("使用 SSD 目录计算")
+        self.use_ssd_check.setToolTip(
+            "勾选后才启用 SSD 工作目录和 ARC 归档目录；"
+            "未勾选时作业在 INP 所在目录运行。"
+        )
+        self.use_ssd_check.setChecked(False)
         for button in (
             self.add_current_btn,
             self.add_files_btn,
@@ -288,6 +304,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             self.confirm_btn,
         ):
             candidate_toolbar.addWidget(button)
+        candidate_toolbar.addWidget(self.use_ssd_check)
         candidate_toolbar.addStretch(1)
         candidate_layout.addLayout(candidate_toolbar)
 
@@ -307,6 +324,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
         candidate_paths.addWidget(self.archive_dir_edit, 1)
         candidate_paths.addWidget(self.choose_archive_btn)
         candidate_layout.addLayout(candidate_paths)
+        self._set_candidate_path_controls_enabled(False)
 
         candidate_options = QtWidgets.QHBoxLayout()
         candidate_options.setSpacing(14)
@@ -337,13 +355,31 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
         queue_toolbar = QtWidgets.QHBoxLayout()
         queue_toolbar.setSpacing(6)
-        self.remove_queue_btn = self.make_button("取消选中的待运行作业")
-        self.edit_queue_btn = self.make_button("编辑选中的待运行作业")
+        self.start_queue_btn = self.make_button("开始队列", "primary")
+        self.stop_queue_btn = self.make_button("终止队列", "danger")
+        self.remove_queue_btn = self.make_button(
+            "取消选中",
+            tooltip="取消选中的待运行作业",
+        )
+        self.edit_queue_btn = self.make_button(
+            "编辑选中",
+            tooltip="编辑选中的待运行作业",
+        )
         self.hold_queue_btn = self.make_button("暂停调度")
         self.release_queue_btn = self.make_button("恢复调度")
         self.requeue_btn = self.make_button("重新排队")
-        self.terminate_queue_btn = self.make_button("终止选中的运行中作业", "danger")
-        self.clear_finished_btn = self.make_button("清理已结束记录")
+        self.terminate_queue_btn = self.make_button(
+            "终止选中",
+            "danger",
+            tooltip="终止选中的运行中作业",
+        )
+        self.clear_finished_btn = self.make_button(
+            "清理记录",
+            tooltip="清理已结束记录",
+        )
+        queue_toolbar.addWidget(self.start_queue_btn)
+        queue_toolbar.addWidget(self.stop_queue_btn)
+        queue_toolbar.addSpacing(8)
         queue_toolbar.addWidget(self.remove_queue_btn)
         queue_toolbar.addWidget(self.edit_queue_btn)
         queue_toolbar.addWidget(self.hold_queue_btn)
@@ -383,8 +419,17 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.invert_btn.clicked.connect(self.invert_candidate_selection)
         self.remove_candidate_btn.clicked.connect(self.remove_selected_candidates)
         self.confirm_btn.clicked.connect(self.confirm_candidates)
+        self.use_ssd_check.toggled.connect(self.on_use_ssd_toggled)
         self.choose_ssd_btn.clicked.connect(self.choose_ssd_dir)
         self.choose_archive_btn.clicked.connect(self.choose_archive_dir)
+        self.ssd_dir_edit.editingFinished.connect(
+            self.on_candidate_directory_edited
+        )
+        self.archive_dir_edit.editingFinished.connect(
+            self.on_candidate_directory_edited
+        )
+        self.start_queue_btn.clicked.connect(self.startQueueRequested.emit)
+        self.stop_queue_btn.clicked.connect(self.stopQueueRequested.emit)
         self.remove_queue_btn.clicked.connect(self.cancel_selected_pending)
         self.edit_queue_btn.clicked.connect(self.edit_selected_pending)
         self.hold_queue_btn.clicked.connect(lambda: self.set_selected_pending_hold(True))
@@ -395,11 +440,21 @@ class QueueManagerDialog(QtWidgets.QDialog):
         self.choose_work_dir_btn.clicked.connect(self.choose_work_dir)
         self.scan_external_btn.clicked.connect(self.request_external_scan)
 
-        self.setStyleSheet(build_queue_manager_stylesheet())
+        self.setStyleSheet(
+            build_queue_manager_stylesheet(compact=self.embedded)
+        )
 
-    def make_button(self, text: str, variant: str = "light") -> QtWidgets.QPushButton:
+    def make_button(
+        self,
+        text: str,
+        variant: str = "light",
+        *,
+        tooltip: str = "",
+    ) -> QtWidgets.QPushButton:
         button = QtWidgets.QPushButton(text)
         button.setObjectName(variant)
+        if tooltip:
+            button.setToolTip(tooltip)
         return button
 
     def setup_table(self, table: QtWidgets.QTableWidget, columns: tuple[str, ...]) -> None:
@@ -801,6 +856,37 @@ class QueueManagerDialog(QtWidgets.QDialog):
         except OSError as exc:
             QtWidgets.QMessageBox.warning(self, "保存配置失败", f"无法保存目录配置：\n{exc}")
 
+    def _set_candidate_path_controls_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self.ssd_dir_edit,
+            self.choose_ssd_btn,
+            self.archive_dir_edit,
+            self.choose_archive_btn,
+        ):
+            widget.setEnabled(enabled)
+
+    def candidate_calculation_root_dir(self) -> str:
+        if not self.use_ssd_check.isChecked():
+            return ""
+        return self.ssd_dir_edit.text().strip()
+
+    def candidate_archive_dir(self) -> str:
+        if not self.use_ssd_check.isChecked():
+            return ""
+        return self.archive_dir_edit.text().strip()
+
+    def on_use_ssd_toggled(self, checked: bool) -> None:
+        self._set_candidate_path_controls_enabled(checked)
+        self.revalidate_candidates()
+        self.refresh_candidate_table()
+        self.request_joblist_save()
+
+    def on_candidate_directory_edited(self) -> None:
+        self.save_saved_paths()
+        self.revalidate_candidates()
+        self.refresh_candidate_table()
+        self.request_joblist_save()
+
     def choose_ssd_dir(self) -> None:
         folder = QtWidgets.QFileDialog.getExistingDirectory(
             self,
@@ -847,26 +933,42 @@ class QueueManagerDialog(QtWidgets.QDialog):
         if normalized_key in existing_paths:
             return False
 
+        job_name = derive_job_name(normalized)
+        if (
+            source == "当前 INP"
+            and self.current_inp
+            and normalized_key
+            == os.path.normcase(os.path.normpath(os.path.abspath(self.current_inp)))
+        ):
+            job_name = str(self.current_settings.get("job_name") or job_name)
+
         item = QueueItem(
             inp_path=normalized,
-            job_name=derive_job_name(normalized),
+            job_name=job_name,
             source=source,
             status=STATUS_PENDING_CONFIRM,
             selected=True,
             valid=True,
             message="可加入",
-            cores=0,
+            cores=int(self.current_settings.get("cores") or 0),
             memory=self.current_settings["memory"],
             fortran_path=self.current_settings["for_file"],
             oldjob_path=self.current_settings["oldjob_path"],
             interactive=self.current_settings["interactive"],
             datacheck_only=self.current_settings["datacheck"],
             complete_notify=self.current_settings["notify"],
+            abaqus_command=str(
+                self.current_settings.get("abaqus_command") or "abaqus"
+            ),
             source_inp_path=normalized,
-            calculation_root_dir=self.ssd_dir_edit.text().strip(),
-            archive_dir=self.archive_dir_edit.text().strip(),
-            archive_after_complete=bool(self.archive_dir_edit.text().strip()),
-            cleanup_after_archive=True,
+            calculation_root_dir=self.candidate_calculation_root_dir(),
+            archive_dir=self.candidate_archive_dir(),
+            archive_after_complete=bool(self.candidate_archive_dir()),
+            cleanup_after_archive=bool(
+                self.candidate_calculation_root_dir()
+                and self.candidate_archive_dir()
+            ),
+            priority=int(self.current_settings.get("priority") or 0),
         )
         self.detect_restart(item)
         self.validate_candidate(item)
@@ -1103,6 +1205,16 @@ class QueueManagerDialog(QtWidgets.QDialog):
             item.valid = False
             item.message = "FOR 文件不存在"
             return
+        if item.calculation_root_dir and not os.path.isdir(
+            item.calculation_root_dir
+        ):
+            item.valid = False
+            item.message = "SSD 工作目录不存在或不是文件夹"
+            return
+        if item.archive_dir and not os.path.isdir(item.archive_dir):
+            item.valid = False
+            item.message = "ARC 归档目录不存在或不是文件夹"
+            return
         pending_restart_dependency = False
         oldjob_name = item.oldjob_name or derive_oldjob_name(item.oldjob_path)
         if item.run_mode == "restart" and not oldjob_name:
@@ -1143,9 +1255,15 @@ class QueueManagerDialog(QtWidgets.QDialog):
         return None
 
     def revalidate_candidates(self) -> None:
-        current_calculation_root_dir = self.ssd_dir_edit.text().strip()
+        current_calculation_root_dir = self.candidate_calculation_root_dir()
+        current_archive_dir = self.candidate_archive_dir()
         for item in self.candidates:
             item.calculation_root_dir = current_calculation_root_dir
+            item.archive_dir = current_archive_dir
+            item.archive_after_complete = bool(current_archive_dir)
+            item.cleanup_after_archive = bool(
+                current_calculation_root_dir and current_archive_dir
+            )
             item.effective_work_dir = ""
             self.validate_candidate(item)
 
@@ -1368,8 +1486,12 @@ class QueueManagerDialog(QtWidgets.QDialog):
         layout.addWidget(QtWidgets.QLabel(f"当前 Restart 作业：\n{item.job_name}"))
 
         form = QtWidgets.QFormLayout()
+        form.setLabelAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight
+            | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
         dependency_options = self.build_restart_dependency_options(item, preceding_candidates)
-        dependency_combo = QtWidgets.QComboBox() if dependency_options else None
+        dependency_combo = WorkbenchComboBox() if dependency_options else None
         if dependency_combo is not None:
             for option in dependency_options:
                 dependency_combo.addItem(option["label"], option)
@@ -1521,6 +1643,15 @@ class QueueManagerDialog(QtWidgets.QDialog):
             f"内存设置：{memory_summary}",
             f"FOR 文件：{len(fortran_items)} 个",
         ]
+        if self.use_ssd_check.isChecked():
+            lines.append(
+                f"计算位置：SSD {self.candidate_calculation_root_dir() or '未设置'}"
+            )
+            lines.append(
+                f"归档目录：{self.candidate_archive_dir() or '不归档'}"
+            )
+        else:
+            lines.append("计算位置：INP 所在目录")
 
         if fortran_items:
             lines.append(f"FOR 分布：{fortran_summary}")
@@ -1589,12 +1720,14 @@ class QueueManagerDialog(QtWidgets.QDialog):
             if os.path.normcase(item.inp_path) in existing:
                 continue
             item.source_inp_path = item.source_inp_path or item.inp_path
-            item.calculation_root_dir = self.ssd_dir_edit.text().strip()
+            item.calculation_root_dir = self.candidate_calculation_root_dir()
             item.effective_work_dir = ""
             item.effective_work_dir = effective_queue_item_work_dir(item)
-            item.archive_dir = self.archive_dir_edit.text().strip()
+            item.archive_dir = self.candidate_archive_dir()
             item.archive_after_complete = bool(item.archive_dir)
-            item.cleanup_after_archive = True
+            item.cleanup_after_archive = bool(
+                item.calculation_root_dir and item.archive_after_complete
+            )
             item.status = STATUS_PENDING_RUN
             item.message = "待提交"
             item.source = item.source or "候选"
@@ -1705,7 +1838,11 @@ class QueueManagerDialog(QtWidgets.QDialog):
         if pending_ids:
             self.host_window.cancel_pending_queue_items(pending_ids)
         if blocked:
-            QtWidgets.QMessageBox.information(self, "不能取消运行中作业", "运行中作业请使用“终止选中的运行中作业”。")
+            QtWidgets.QMessageBox.information(
+                self,
+                "不能取消运行中作业",
+                "运行中作业请使用“终止选中”。",
+            )
 
     def set_selected_pending_hold(self, held: bool) -> None:
         selected_keys = self.selected_table_row_keys(self.queue_table)
@@ -1752,11 +1889,15 @@ class QueueManagerDialog(QtWidgets.QDialog):
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("编辑待运行作业")
         layout = QtWidgets.QFormLayout(dialog)
-        core_spin = QtWidgets.QSpinBox()
+        layout.setLabelAlignment(
+            QtCore.Qt.AlignmentFlag.AlignRight
+            | QtCore.Qt.AlignmentFlag.AlignVCenter
+        )
+        core_spin = SegmentedSpinBox()
         core_spin.setRange(0, 999)
         core_spin.setSpecialValueText("未设置")
         core_spin.setValue(item.cores)
-        priority_spin = QtWidgets.QSpinBox()
+        priority_spin = SegmentedSpinBox()
         priority_spin.setRange(-10000, 10000)
         priority_spin.setValue(item.priority)
         priority_spin.setToolTip("数值越高越优先；同优先级按进入队列顺序调度。")

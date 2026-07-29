@@ -29,6 +29,7 @@ class QueueItem:
     interactive: bool = False
     datacheck_only: bool = False
     complete_notify: bool = False
+    abaqus_command: str = "abaqus"
     source_inp_path: str = ""
     calculation_root_dir: str = ""
     effective_work_dir: str = ""

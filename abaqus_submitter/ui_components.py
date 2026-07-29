@@ -5,7 +5,7 @@ import time
 import unicodedata
 from collections.abc import Mapping
 
-from .qt_compat import QtWidgets, Signal
+from .qt_compat import QtCore, QtGui, QtWidgets, Signal
 
 
 def format_elapsed_seconds(elapsed_seconds: float) -> str:
@@ -196,6 +196,298 @@ def build_memory_summary_table(
         value_line,
         separator,
     ]
+
+
+class ResourceProgressBar(QtWidgets.QProgressBar):
+    """Rounded resource meter that keeps low non-zero values visibly circular."""
+
+    TRACK_COLOR = QtGui.QColor("#e2e8f0")
+    CHUNK_COLOR = QtGui.QColor("#2563eb")
+    BAR_HEIGHT = 8
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.setObjectName("resourceProgressBar")
+        self.setTextVisible(False)
+        self.setMinimumHeight(self.BAR_HEIGHT)
+        self.setMaximumHeight(self.BAR_HEIGHT)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        if self.maximum() <= self.minimum():
+            super().paintEvent(event)
+            return
+
+        track = QtCore.QRectF(self.rect())
+        if track.isEmpty():
+            return
+
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(
+            QtGui.QPainter.RenderHint.Antialiasing,
+            True,
+        )
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        track_radius = min(track.width(), track.height()) / 2
+        painter.setBrush(self.TRACK_COLOR)
+        painter.drawRoundedRect(
+            track,
+            track_radius,
+            track_radius,
+        )
+
+        value = max(self.minimum(), min(self.maximum(), self.value()))
+        if value <= self.minimum():
+            return
+        ratio = (value - self.minimum()) / (
+            self.maximum() - self.minimum()
+        )
+        chunk_width = min(
+            track.width(),
+            max(track.height(), track.width() * ratio),
+        )
+        chunk = QtCore.QRectF(
+            (
+                track.right() - chunk_width
+                if self.invertedAppearance()
+                else track.left()
+            ),
+            track.top(),
+            chunk_width,
+            track.height(),
+        )
+        chunk_radius = min(chunk.width(), chunk.height()) / 2
+        painter.setBrush(self.CHUNK_COLOR)
+        painter.drawRoundedRect(
+            chunk,
+            chunk_radius,
+            chunk_radius,
+        )
+
+
+class SegmentedSpinBox(QtWidgets.QSpinBox):
+    """Horizontal ``− | value | +`` spin box with native QSpinBox behavior."""
+
+    SEGMENT_WIDTH = 30
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.setProperty("segmentedSpin", True)
+        self.setButtonSymbols(
+            QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons
+        )
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+
+        self.step_down_button = QtWidgets.QToolButton(self)
+        self.step_down_button.setObjectName("spinStepDown")
+        self.step_down_button.setText("−")
+        self.step_down_button.setToolTip("减少")
+        self.step_down_button.setAccessibleName("减少数值")
+        self.step_down_button.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+
+        self.step_up_button = QtWidgets.QToolButton(self)
+        self.step_up_button.setObjectName("spinStepUp")
+        self.step_up_button.setText("+")
+        self.step_up_button.setToolTip("增加")
+        self.step_up_button.setAccessibleName("增加数值")
+        self.step_up_button.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+
+        for button in (self.step_down_button, self.step_up_button):
+            button.setAutoRepeat(True)
+            button.setAutoRepeatDelay(350)
+            button.setAutoRepeatInterval(80)
+
+        self.step_down_button.clicked.connect(
+            lambda _checked=False: self._step_and_focus(-1)
+        )
+        self.step_up_button.clicked.connect(
+            lambda _checked=False: self._step_and_focus(1)
+        )
+        self.valueChanged.connect(self._refresh_step_buttons)
+        self._apply_text_margins()
+        self._refresh_step_buttons()
+
+    def _step_and_focus(self, direction: int) -> None:
+        self.setFocus(QtCore.Qt.FocusReason.MouseFocusReason)
+        if direction < 0:
+            self.stepDown()
+        else:
+            self.stepUp()
+
+    def _apply_text_margins(self) -> None:
+        line_edit = self.lineEdit()
+        if line_edit is not None:
+            margin = self.SEGMENT_WIDTH + 2
+            line_edit.setTextMargins(margin, 0, margin, 0)
+
+    def _refresh_step_buttons(self, *_args) -> None:
+        can_step = self.isEnabled() and not self.isReadOnly()
+        wraps = self.wrapping()
+        self.step_down_button.setEnabled(
+            can_step and (wraps or self.value() > self.minimum())
+        )
+        self.step_up_button.setEnabled(
+            can_step and (wraps or self.value() < self.maximum())
+        )
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        button_height = max(0, self.height() - 2)
+        self.step_down_button.setGeometry(
+            1,
+            1,
+            self.SEGMENT_WIDTH,
+            button_height,
+        )
+        self.step_up_button.setGeometry(
+            max(1, self.width() - self.SEGMENT_WIDTH - 1),
+            1,
+            self.SEGMENT_WIDTH,
+            button_height,
+        )
+        self.step_down_button.raise_()
+        self.step_up_button.raise_()
+        self._apply_text_margins()
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() in {
+            QtCore.QEvent.Type.EnabledChange,
+            QtCore.QEvent.Type.StyleChange,
+        }:
+            self._refresh_step_buttons()
+
+    def setRange(self, minimum: int, maximum: int) -> None:
+        super().setRange(minimum, maximum)
+        if hasattr(self, "step_down_button"):
+            self._refresh_step_buttons()
+
+    def setMinimum(self, minimum: int) -> None:
+        super().setMinimum(minimum)
+        if hasattr(self, "step_down_button"):
+            self._refresh_step_buttons()
+
+    def setMaximum(self, maximum: int) -> None:
+        super().setMaximum(maximum)
+        if hasattr(self, "step_down_button"):
+            self._refresh_step_buttons()
+
+    def setReadOnly(self, read_only: bool) -> None:
+        super().setReadOnly(read_only)
+        if hasattr(self, "step_down_button"):
+            self._refresh_step_buttons()
+
+    def setWrapping(self, wrapping: bool) -> None:
+        super().setWrapping(wrapping)
+        if hasattr(self, "step_down_button"):
+            self._refresh_step_buttons()
+
+    def sizeHint(self) -> QtCore.QSize:
+        hint = super().sizeHint()
+        return QtCore.QSize(
+            max(112, hint.width() + self.SEGMENT_WIDTH * 2),
+            max(30, hint.height()),
+        )
+
+    def minimumSizeHint(self) -> QtCore.QSize:
+        hint = super().minimumSizeHint()
+        return QtCore.QSize(
+            max(96, hint.width() + self.SEGMENT_WIDTH * 2),
+            max(30, hint.height()),
+        )
+
+
+class WorkbenchComboBox(QtWidgets.QComboBox):
+    """Shared combo box with an explicit arrow and a flat, shadowless popup."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        view = self.view()
+        view.setObjectName("workbenchComboPopup")
+        view.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        view.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TranslucentBackground,
+            False,
+        )
+        view.setWindowFlag(
+            QtCore.Qt.WindowType.NoDropShadowWindowHint,
+            True,
+        )
+
+    def showPopup(self) -> None:
+        view = self.view()
+        view.setWindowFlag(
+            QtCore.Qt.WindowType.NoDropShadowWindowHint,
+            True,
+        )
+        view.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TranslucentBackground,
+            False,
+        )
+        super().showPopup()
+        QtCore.QTimer.singleShot(0, self._position_popup_below)
+
+    def _position_popup_below(self) -> None:
+        view = self.view()
+        popup = view.window()
+        if popup is None:
+            return
+
+        popup.setWindowFlag(
+            QtCore.Qt.WindowType.NoDropShadowWindowHint,
+            True,
+        )
+        popup.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TranslucentBackground,
+            False,
+        )
+        popup.clearMask()
+
+        top_left = self.mapToGlobal(QtCore.QPoint(0, self.height()))
+        screen = QtGui.QGuiApplication.screenAt(top_left) or self.screen()
+        available = (
+            screen.availableGeometry()
+            if screen is not None
+            else QtCore.QRect()
+        )
+        row_count = max(1, self.count())
+        row_height = max(view.sizeHintForRow(0), 26)
+        content_height = row_count * row_height + 2
+        if available.isValid():
+            available_below = max(
+                row_height + 2,
+                available.bottom() - top_left.y() + 1,
+            )
+            content_height = min(content_height, available_below)
+        popup_width = max(self.width(), view.sizeHintForColumn(0) + 28)
+        popup.setGeometry(
+            top_left.x(),
+            top_left.y(),
+            popup_width,
+            content_height,
+        )
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        super().paintEvent(event)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+        arrow_color = "#94a3b8" if not self.isEnabled() else "#475569"
+        painter.setBrush(QtGui.QColor(arrow_color))
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        center_x = self.width() - 13
+        center_y = self.height() // 2 + 1
+        painter.drawPolygon(
+            QtGui.QPolygon(
+                [
+                    QtCore.QPoint(center_x - 4, center_y - 2),
+                    QtCore.QPoint(center_x + 4, center_y - 2),
+                    QtCore.QPoint(center_x, center_y + 3),
+                ]
+            )
+        )
 
 
 class FilePickerRow(QtWidgets.QWidget):

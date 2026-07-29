@@ -26,6 +26,7 @@ class SubmitOptions:
     datacheck: bool = False
     memory_value: str = ""
     memory_unit: str = "%"
+    abaqus_command: str = "abaqus"
     ask_delete_off: bool = False
 
 
@@ -105,7 +106,12 @@ def validate_memory_argument(argument: str) -> tuple[bool, str]:
 
 def build_abaqus_command(options: SubmitOptions) -> str:
     """Build the Abaqus command line from UI options."""
-    parts = [f"abaqus job={options.job_name}"]
+    abaqus_command = (options.abaqus_command or "abaqus").strip()
+    if re.search(r"\s", abaqus_command) and not (
+        abaqus_command.startswith('"') and abaqus_command.endswith('"')
+    ):
+        abaqus_command = f'"{abaqus_command}"'
+    parts = [f"{abaqus_command} job={options.job_name}"]
 
     if options.datacheck and options.inp_file:
         parts.append(f"input={os.path.basename(options.inp_file)}")
@@ -195,6 +201,7 @@ def queue_item_to_options(
         datacheck=item.datacheck_only,
         memory_value=memory_value,
         memory_unit=memory_unit,
+        abaqus_command=item.abaqus_command or "abaqus",
     )
 
 
@@ -226,6 +233,7 @@ def build_direct_submit_queue_item(
         interactive=options.interactive,
         datacheck_only=options.datacheck,
         complete_notify=notify,
+        abaqus_command=options.abaqus_command or "abaqus",
         is_external=False,
         effective_work_dir=str(Path(options.inp_file).parent),
     )

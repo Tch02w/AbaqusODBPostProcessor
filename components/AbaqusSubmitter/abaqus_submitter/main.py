@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 import shutil
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
+
+from abaqus_workbench_core.abaqus import AbaqusCommandProfile
 
 from .abaqus_diagnostics import (
     build_sta_table_header,
@@ -159,8 +160,12 @@ QUEUE_DISPATCH_DEBOUNCE_MS = 50
 class AbaqusPathCheckWorker(QtCore.QObject):
     finished = Signal(str)
 
+    def __init__(self, command: str = "abaqus") -> None:
+        super().__init__()
+        self.profile = AbaqusCommandProfile(command=command)
+
     def run(self) -> None:
-        self.finished.emit(shutil.which("abaqus") or "")
+        self.finished.emit(self.profile.resolved_executable())
 
 
 class RuntimeSelectorDelegate(QtWidgets.QStyledItemDelegate):
@@ -3973,7 +3978,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.request_joblist_save()
 
     def update_abaqus_status(self) -> None:
-        abaqus_path = shutil.which("abaqus")
+        abaqus_path = AbaqusCommandProfile().resolved_executable()
         if abaqus_path:
             self.abaqus_status_label.setText("Abaqus 状态：已检测到 Abaqus")
         else:
@@ -4221,29 +4226,16 @@ def main(
     startup_timeline_last: float | None = None,
     startup_timeline_enabled: bool = False,
 ) -> int:
-    """Run the Qt frontend."""
-    startup_timeline = StartupTimeline(
-        "App",
-        enabled=startup_timeline_enabled,
-        start=startup_timeline_start,
-        last=startup_timeline_last,
-    )
+    """Compatibility wrapper for callers that imported ``main.main``."""
 
-    startup_timeline.mark("main-function-start")
-    argv = list(sys.argv if argv is None else argv)
-    startup_timeline.mark("argv-ready")
-    app = QtWidgets.QApplication(argv)
-    startup_timeline.mark("qapplication-created")
-    app.setApplicationName(APP_TITLE)
-    QtWidgets.QApplication.setStyle(QtWidgets.QStyleFactory.create("Fusion"))
-    startup_timeline.mark("qt-style-ready")
-    window = MainWindow()
-    startup_timeline.mark("mainwindow-created")
-    window.show()
-    startup_timeline.mark("mainwindow-shown")
-    QtCore.QTimer.singleShot(0, lambda: startup_timeline.mark("event-loop-first-tick"))
-    QtCore.QTimer.singleShot(0, window.request_restored_status_scan_after_main_window_render)
-    return app.exec()
+    from .application import main as run_application
+
+    return run_application(
+        argv,
+        startup_timeline_start=startup_timeline_start,
+        startup_timeline_last=startup_timeline_last,
+        startup_timeline_enabled=startup_timeline_enabled,
+    )
 
 
 if __name__ == "__main__":

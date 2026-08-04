@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from abaqus_workbench_core.theme import apply_workbench_theme
 from PySide6.QtCore import QEvent, QObject
-from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -25,17 +25,12 @@ class AccidentalWheelGuard(QObject):
 
 
 def apply_application_style(application: QApplication) -> None:
-    """Use Qt's built-in light controls with one application-wide font."""
+    """Apply the shared workbench theme and the postprocessor wheel guard."""
 
-    application.setStyle("Fusion")
-    application.setPalette(application.style().standardPalette())
-    font = QFont("Microsoft YaHei UI")
-    font.setPointSize(11)
-    application.setFont(font)
+    apply_workbench_theme(application)
     wheel_guard = AccidentalWheelGuard(application)
     application.installEventFilter(wheel_guard)
     application._accidental_wheel_guard = wheel_guard
-    application.setStyleSheet("")
 
 
 def configure_main_window(window: QMainWindow) -> None:

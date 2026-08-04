@@ -6,6 +6,8 @@ import threading
 from pathlib import Path
 from typing import Callable, Iterable
 
+from abaqus_workbench_core.processes import is_environment_startup_noise
+
 from .config import abaqus_script
 
 LogCallback = Callable[[str], None]
@@ -14,28 +16,7 @@ LogCallback = Callable[[str], None]
 def is_process_startup_noise(line: str) -> bool:
     """Return True for compiler-environment banners unrelated to ODB work."""
 
-    text = line.strip()
-    lowered = text.casefold()
-    if len(text) >= 20 and set(text) == {"*"}:
-        return True
-    if lowered.startswith("** visual studio") and "developer command prompt" in lowered:
-        return True
-    if (
-        lowered.startswith("** copyright (c)")
-        and "microsoft corporation" in lowered
-    ):
-        return True
-    if lowered.startswith("[debug:ext\\vcvars.bat]"):
-        return True
-    if lowered.startswith("[vcvarsall.bat] environment initialized for:"):
-        return True
-    if (
-        "warning: vars.bat does not set up dependencies when invoked directly"
-        in lowered
-        and "dpc++" in lowered
-    ):
-        return True
-    return False
+    return is_environment_startup_noise(line)
 
 
 class ProcessCancelled(RuntimeError):

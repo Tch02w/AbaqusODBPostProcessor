@@ -2,21 +2,16 @@
 
 from __future__ import annotations
 
-import json
-import os
 from pathlib import Path
 from typing import Any
+
+from abaqus_workbench_core.settings import JsonSettingsStore
 
 from .app_paths import CONFIG_PATH
 
 
 def load_app_settings(path: Path = CONFIG_PATH) -> dict[str, Any]:
-    try:
-        with path.open("r", encoding="utf-8") as stream:
-            payload = json.load(stream)
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    return JsonSettingsStore(path).load()
 
 
 def load_settings_section(
@@ -47,14 +42,7 @@ def save_app_settings(
 ) -> None:
     """Atomically replace the settings payload with UTF-8 JSON."""
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = path.with_name(f"{path.name}.tmp")
-    with temporary_path.open("w", encoding="utf-8", newline="\n") as stream:
-        json.dump(values, stream, ensure_ascii=False, indent=2)
-        stream.write("\n")
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary_path, path)
+    JsonSettingsStore(path).save(values)
 
 
 __all__ = [

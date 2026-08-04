@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-import csv, json, math, re, shutil
+import csv
+import json
+import math
+import re
+import shutil
 from collections import defaultdict
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image
 import xlsxwriter
+from PIL import Image
 
 from .file_attributes import hide_internal_result_json_files
+from .plotting import LineSeries, save_line_chart
 
 
 def read_csv(path: Path) -> list[dict[str, str]]:
@@ -175,11 +179,18 @@ def plot_pile_axial(output_dir: Path) -> Path | None:
     rebar = [float(row["RebarAxial_Interpolated_CompressionPositive_N"])/1000 for row in rows]
     total = [float(row["PileTotalAxial_CompressionPositive_N"])/1000 for row in rows]
     plot_dir = output_dir/"plots"; plot_dir.mkdir(parents=True, exist_ok=True); target = plot_dir/"pile_total_axial_force_depth.png"
-    fig, ax = plt.subplots(figsize=(7.6, 8.0), constrained_layout=True)
-    ax.plot(concrete, depth, label="Concrete/pipe FreeBody"); ax.plot(rebar, depth, label="Rebar interpolated")
-    ax.plot(total, depth, label="Pile total", linewidth=2.4); ax.axhline(0, color="black", linewidth=0.8)
-    ax.invert_yaxis(); ax.grid(True, alpha=0.25); ax.set_xlabel("Axial force, compression positive (kN)")
-    ax.set_ylabel("Depth from ground (m)"); ax.legend(); fig.savefig(target, dpi=180); plt.close(fig); return target
+    return save_line_chart(
+        target,
+        (
+            LineSeries("Concrete/pipe FreeBody", concrete, depth),
+            LineSeries("Rebar interpolated", rebar, depth),
+            LineSeries("Pile total", total, depth, 2.4),
+        ),
+        x_label="Axial force, compression positive (kN)",
+        y_label="Depth from ground (m)",
+        invert_y=True,
+        zero_y=True,
+    )
 
 
 def plot_pile_bending(output_dir: Path) -> list[Path]:
@@ -194,13 +205,21 @@ def plot_pile_bending(output_dir: Path) -> list[Path]:
         rebar = [float(row["RebarBendingMoment_Interpolated_My_Nmm"])/1.0e6 for row in rows]
         total = [float(row["PileTotalBendingMoment_My_Nmm"])/1.0e6 for row in rows]
         target = plot_dir/f"pile_bending_moment_My_depth_SEQ{sequence:04d}.png"
-        fig, ax = plt.subplots(figsize=(7.6, 8.0), constrained_layout=True)
-        ax.plot(concrete, depth, label="Concrete/pipe My"); ax.plot(rebar, depth, label="Rebar My")
-        ax.plot(total, depth, label="Pile total My", linewidth=2.4); ax.axvline(0, color="black", linewidth=0.8)
-        ax.axhline(0, color="black", linewidth=0.8); ax.invert_yaxis(); ax.grid(True, alpha=0.25)
-        ax.set_xlabel("Bending moment My about global 2-axis (kN·m)"); ax.set_ylabel("Depth from ground (m)")
-        ax.set_title(f"Sequence {sequence}: lateral load in global 1 uses My"); ax.legend()
-        fig.savefig(target, dpi=180); plt.close(fig); targets.append(target)
+        save_line_chart(
+            target,
+            (
+                LineSeries("Concrete/pipe My", concrete, depth),
+                LineSeries("Rebar My", rebar, depth),
+                LineSeries("Pile total My", total, depth, 2.4),
+            ),
+            x_label="Bending moment My about global 2-axis (kN·m)",
+            y_label="Depth from ground (m)",
+            title=f"Sequence {sequence}: lateral load in global 1 uses My",
+            invert_y=True,
+            zero_x=True,
+            zero_y=True,
+        )
+        targets.append(target)
     return targets
 
 
@@ -520,27 +539,26 @@ def plot_load_resistance(output_dir: Path) -> Path | None:
     ]
     history_output_dir.mkdir(parents=True, exist_ok=True)
     target = history_output_dir / "load_resistance_sharing.png"
-    fig, ax = plt.subplots(figsize=(8.6, 6.2), constrained_layout=True)
-    for column, label in (
-        ("PileTopReaction_kN", "Pile-top reaction"),
-        ("RootKeyTotalBearing_kN", "Root-key total"),
-        ("PileShaftFriction_kN", "Pile-shaft friction"),
-        ("UnresolvedResistance_kN", "Unresolved / other"),
-    ):
-        ax.plot(
-            displacement,
-            [float(row[column]) for row in rows],
-            label=label,
-            linewidth=2.2 if column == "PileTopReaction_kN" else 1.7,
-        )
-    ax.axhline(0.0, color="black", linewidth=0.8)
-    ax.grid(True, alpha=0.25)
-    ax.set_xlabel("Pile-top displacement magnitude (mm)")
-    ax.set_ylabel("Resistance (kN)")
-    ax.legend()
-    fig.savefig(target, dpi=180)
-    plt.close(fig)
-    return target
+    return save_line_chart(
+        target,
+        tuple(
+            LineSeries(
+                label,
+                displacement,
+                [float(row[column]) for row in rows],
+                2.2 if column == "PileTopReaction_kN" else 1.7,
+            )
+            for column, label in (
+                ("PileTopReaction_kN", "Pile-top reaction"),
+                ("RootKeyTotalBearing_kN", "Root-key total"),
+                ("PileShaftFriction_kN", "Pile-shaft friction"),
+                ("UnresolvedResistance_kN", "Unresolved / other"),
+            )
+        ),
+        x_label="Pile-top displacement magnitude (mm)",
+        y_label="Resistance (kN)",
+        zero_y=True,
+    )
 
 
 def build_xlsx(output_dir: Path) -> Path:

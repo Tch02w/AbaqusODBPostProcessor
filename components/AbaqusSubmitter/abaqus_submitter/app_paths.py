@@ -2,28 +2,20 @@
 
 from __future__ import annotations
 
-import os
-import sys
 from pathlib import Path
+
+from abaqus_workbench_core.paths import resolve_application_data_dir
 
 APP_NAME = "AbaqusSubmitter"
 APP_DATA_DIR_ENV = "ABAQUS_SUBMITTER_DATA_DIR"
 
 
 def resolve_app_data_dir() -> Path:
-    override = os.environ.get(APP_DATA_DIR_ENV, "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-
-    if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA", "").strip()
-        return (Path(base) if base else Path.home() / "AppData" / "Local") / APP_NAME
-
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / APP_NAME
-
-    base = os.environ.get("XDG_DATA_HOME", "").strip()
-    return (Path(base).expanduser() if base else Path.home() / ".local" / "share") / APP_NAME
+    return resolve_application_data_dir(
+        APP_NAME,
+        env_var=APP_DATA_DIR_ENV,
+        windows_scope="local",
+    )
 
 
 APP_DATA_DIR = resolve_app_data_dir()

@@ -16,7 +16,7 @@ def run() -> int:
     )
     timeline.mark("script-start")
 
-    from .main import main
+    from .application import main
 
     timeline.mark("import-main-module")
     return main(

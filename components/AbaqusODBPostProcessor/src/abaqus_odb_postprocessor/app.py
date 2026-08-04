@@ -2,21 +2,20 @@
 
 from __future__ import annotations
 
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from abaqus_workbench_core.abaqus import AbaqusCommandProfile
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QDialog,
     QDialogButtonBox,
-    QHeaderView,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -31,7 +30,7 @@ from . import __version__
 from . import batch_window as _base
 from .cache import abaqus_cache_version
 from .config import load_defaults
-from .naming import natural_sort_key
+from .discovery import discover_odb_paths
 from .paths import scan_cache_dir
 from .runner import (
     MultiProcessController,
@@ -42,8 +41,6 @@ from .runner import (
     upgrade_odb_files,
     upgrade_target_path,
 )
-from .ui_style import apply_application_style
-
 
 STATUS_PRESENTATION = {
     "unknown": ("未检测", "#64748b"),
@@ -58,32 +55,6 @@ STATUS_PRESENTATION = {
     "upgrade_failed": ("升级失败", "#b91c1c"),
     "cancelled": ("已取消", "#64748b"),
 }
-
-
-def discover_odb_paths(folder: Path) -> list[Path]:
-    """Discover ODB files recursively while excluding generated result trees."""
-
-    excluded_directories = {
-        "AbaqusODBPostProcessor_Results",
-        "_AbaqusODBPostProcessor_Results",
-        ".git",
-        ".venv",
-    }
-    paths = []
-    for path in folder.rglob("*"):
-        if not path.is_file() or path.suffix.lower() != ".odb":
-            continue
-        stem = path.stem.casefold()
-        if stem.endswith("-old") or "-old-" in stem or "-upgrading-" in stem:
-            continue
-        relative_parts = path.relative_to(folder).parts[:-1]
-        if any(part in excluded_directories for part in relative_parts):
-            continue
-        paths.append(path)
-    return sorted(
-        paths,
-        key=lambda path: natural_sort_key(str(path.relative_to(folder))),
-    )
 
 
 class OdbFileList(QTreeWidget):
@@ -110,10 +81,13 @@ class OdbSelectionDialog(QDialog):
         super().__init__(parent)
         self.folder = folder.resolve()
         defaults = getattr(parent, "defaults", None) or load_defaults()
-        self.abaqus_command = abaqus_command or str(defaults["abaqus_command"])
-        self.local_release = local_release or str(
+        command = abaqus_command or str(defaults["abaqus_command"])
+        release = local_release or str(
             defaults.get("local_abaqus_release", "2025")
         )
+        self.abaqus_profile = AbaqusCommandProfile(command=command, release=release)
+        self.abaqus_command = self.abaqus_profile.command
+        self.local_release = self.abaqus_profile.release
         self.force_rescan = bool(force_rescan)
         self.parallel_workers = max(1, min(int(parallel_workers), 4))
         self.compatibility_cache_version = abaqus_cache_version(
@@ -731,11 +705,11 @@ safe_folder_name = _base.safe_folder_name
 
 
 def main() -> int:
-    application = QApplication(sys.argv)
-    apply_application_style(application)
-    window = MainWindow()
-    window.showMaximized()
-    return application.exec()
+    """Compatibility wrapper for the standalone component entry point."""
+
+    from .application import main as run_application
+
+    return run_application()
 
 
 if __name__ == "__main__":

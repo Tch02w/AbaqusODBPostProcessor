@@ -6,8 +6,10 @@ import os
 import tempfile
 from pathlib import Path
 
+from abaqus_workbench_core.paths import resolve_application_data_dir
 
 APP_NAME = "AbaqusODBPostProcessor"
+APP_DATA_DIR_ENV = "ABAQUS_POSTPROCESSOR_DATA_DIR"
 
 
 def temp_root() -> Path:
@@ -31,8 +33,18 @@ def batch_temp_dir(batch_id: str) -> Path:
 
 
 def state_file() -> Path:
-    base = Path(os.environ.get("APPDATA", tempfile.gettempdir()))
-    path = base / APP_NAME / "project_state.json"
+    override = os.environ.get(APP_DATA_DIR_ENV, "").strip()
+    if override:
+        base = resolve_application_data_dir(
+            APP_NAME,
+            env_var=APP_DATA_DIR_ENV,
+            windows_scope="roaming",
+        )
+    elif os.name == "nt" and not os.environ.get("APPDATA", "").strip():
+        base = Path(tempfile.gettempdir()) / APP_NAME
+    else:
+        base = resolve_application_data_dir(APP_NAME, windows_scope="roaming")
+    path = base / "project_state.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 

@@ -3,22 +3,19 @@ requires = ["setuptools>=75", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "abaqus-odb-postprocessor"
-version = "0.8.1"
-description = "Abaqus 2025 grouped ODB extraction, contour animation, and pile force/moment postprocessing"
+name = "abaqus-workbench"
+version = "0.1.0"
+description = "Unified PySide6 workbench for Abaqus submission and ODB postprocessing"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.15.0b1,<3.16"
 dependencies = [
-  "PySide6>=6.8",
-  "Pillow>=11.0",
-  "matplotlib>=3.9",
-  "numpy>=2.0",
-  "XlsxWriter>=3.2",
+  "abaqus-workbench-core",
+  "abaqus-odb-postprocessor",
+  "abaqus-submitter",
 ]
 
 [project.gui-scripts]
-abaqus-odb-post = "abaqus_odb_postprocessor.app:main"
-abaqus-odb-results = "abaqus_odb_postprocessor.result_browser:main"
+abaqus-workbench = "abaqus_workbench.app:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -26,8 +23,27 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools.package-data]
-abaqus_odb_postprocessor = ["defaults.json", "abaqus_scripts/*.py"]
+[tool.uv]
+prerelease = "allow"
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+[tool.uv.workspace]
+members = [
+  "components/AbaqusWorkbenchCore",
+  "components/AbaqusODBPostProcessor",
+  "components/AbaqusSubmitter",
+]
+
+[tool.uv.sources]
+abaqus-workbench-core = { workspace = true }
+abaqus-odb-postprocessor = { workspace = true }
+abaqus-submitter = { workspace = true }
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "pyinstaller>=6.0",
+  "ruff>=0.11",
+]
+
+[tool.ruff]
+line-length = 120

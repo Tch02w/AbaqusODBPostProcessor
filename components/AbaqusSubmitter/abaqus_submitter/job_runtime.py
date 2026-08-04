@@ -6,6 +6,8 @@ import os
 import sys
 import time
 
+from abaqus_workbench_core.processes import is_environment_startup_noise
+
 from .abaqus_diagnostics import (
     classify_job_text,
     format_sta_output_for_log,
@@ -15,9 +17,7 @@ from .abaqus_diagnostics import (
 from .constants import SOLVER_START_GRACE_SECONDS, STA_POLL_INTERVAL_MS, STATUS_CONFIRMING
 from .diagnostics import hang_probe, hang_probe_function, hang_probe_log
 from .process_observation import ProcessObservationService
-from .scheduling import ExecutionEvent, ExecutionEventKind
 from .qt_compat import QtCore, Signal
-from .runtime_record import RuntimeRecord
 from .runtime_evidence import (
     collect_runtime_evidence,
     runtime_completion_ready,
@@ -26,19 +26,8 @@ from .runtime_evidence import (
     update_file_stability,
     update_runtime_phase,
 )
-
-
-VS_INIT_NOISE_PREFIXES = (
-    "[DEBUG:ext\\vcvars.bat] Found potential",
-    "[DEBUG:ext\\vcvars.bat] Testing",
-    "[vcvarsall.bat] Environment initialized for:",
-)
-
-VS_INIT_NOISE_SUBSTRINGS = (
-    "Visual Studio 2026 Developer Command Prompt",
-    "Copyright (c) 2025 Microsoft Corporation",
-    "WARNING: vars.bat does not set up dependencies when invoked directly.",
-)
+from .runtime_record import RuntimeRecord
+from .scheduling import ExecutionEvent, ExecutionEventKind
 
 MAX_CONSOLE_OUTPUT_CHARS = 12000
 LAUNCHER_START_TIMEOUT_MS = 3000
@@ -70,10 +59,7 @@ def mark_runtime_completion_confirmed(run: dict, reason: str) -> None:
 
 
 def is_visual_studio_init_noise_line(line: str) -> bool:
-    stripped = line.strip()
-    if any(stripped.startswith(prefix) for prefix in VS_INIT_NOISE_PREFIXES):
-        return True
-    return any(marker in stripped for marker in VS_INIT_NOISE_SUBSTRINGS)
+    return not is_star_separator_line(line) and is_environment_startup_noise(line)
 
 
 def is_star_separator_line(line: str) -> bool:

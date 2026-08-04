@@ -4,6 +4,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .codex_pytest_tmp_*/
+.codex_test_temp/
 build/
 dist/
 *.egg-info/

@@ -1,8 +1,7 @@
-"""Frontend contracts for future Windows SSH execution and ODB merging.
+"""Frontend contracts for Windows SSH execution and ODB merging.
 
-This module deliberately contains no SSH, SFTP, or Abaqus merge implementation.
-The Qt layer emits immutable request payloads through ``RemoteFrontendBridge``;
-future Adapters can consume those signals without coupling the UI to a transport.
+The immutable payloads in this module keep Qt forms independent from the SSH
+adapter.  Credentials intentionally live in a separate, non-persistent request.
 """
 
 from __future__ import annotations
@@ -33,6 +32,14 @@ class ServerProfileDraft:
     abaqus_command: str
     compute_root: str
     allowed_roots: tuple[str, ...]
+    port: int = 22
+    private_key_path: str = ""
+
+    def persistent_payload(self) -> dict:
+        """Return the non-secret subset that may be written to settings."""
+        payload = asdict(self)
+        payload["allowed_roots"] = list(self.allowed_roots)
+        return payload
 
 
 @dataclass(frozen=True)

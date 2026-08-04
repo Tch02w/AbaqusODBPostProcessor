@@ -26,6 +26,7 @@ class LocalJobDraft:
     abaqus_command: str = "abaqus"
     priority: int = 0
     max_parallel: int = 1
+    use_ssd_calculation: bool = False
     calculation_root_dir: str = ""
     archive_dir: str = ""
 
@@ -47,6 +48,8 @@ class LocalJobDraft:
         )
 
     def validate_local_paths(self) -> tuple[bool, str]:
+        if self.use_ssd_calculation and not self.calculation_root_dir.strip():
+            return False, "已启用 SSD 目录计算，请选择 SSD 工作目录。"
         for label, value in (
             ("SSD 工作目录", self.calculation_root_dir),
             ("结果归档目录", self.archive_dir),

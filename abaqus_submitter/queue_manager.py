@@ -45,7 +45,11 @@ from .queue_presentation import (
     runtime_cell_projection,
 )
 from .restart_dependency import RestartDependencyLifecycle
-from .ui_components import SegmentedSpinBox, WorkbenchComboBox
+from .ui_components import (
+    SegmentedSpinBox,
+    WorkbenchComboBox,
+    configure_path_picker_button,
+)
 from .ui_styles import build_queue_manager_stylesheet
 
 RESULT_EXTENSIONS = (".odb", ".sta", ".msg", ".dat", ".log")
@@ -256,7 +260,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
             parent=self,
         )
         self._startup_timeline.mark("build-ui")
-        QtCore.QTimer.singleShot(0, self.refresh_tables)
+        QtCore.QTimer.singleShot(0, self, self.refresh_tables)
         self._startup_timeline.mark("schedule-initial-refresh")
 
     def request_joblist_save(self) -> None:
@@ -313,14 +317,20 @@ class QueueManagerDialog(QtWidgets.QDialog):
         candidate_paths.addWidget(QtWidgets.QLabel("SSD 工作目录"))
         self.ssd_dir_edit = QtWidgets.QLineEdit(self.saved_paths.get("qt_ssd_work_dir", ""))
         self.ssd_dir_edit.setPlaceholderText("固态工作目录")
-        self.choose_ssd_btn = self.make_button("选择")
+        self.choose_ssd_btn = configure_path_picker_button(
+            self.make_button(""),
+            "选择 SSD 工作目录",
+        )
         candidate_paths.addWidget(self.ssd_dir_edit, 1)
         candidate_paths.addWidget(self.choose_ssd_btn)
         candidate_paths.addSpacing(10)
         candidate_paths.addWidget(QtWidgets.QLabel("ARC 归档目录"))
         self.archive_dir_edit = QtWidgets.QLineEdit(self.saved_paths.get("qt_archive_dir", ""))
         self.archive_dir_edit.setPlaceholderText("结果存档目录")
-        self.choose_archive_btn = self.make_button("选择")
+        self.choose_archive_btn = configure_path_picker_button(
+            self.make_button(""),
+            "选择 ARC 归档目录",
+        )
         candidate_paths.addWidget(self.archive_dir_edit, 1)
         candidate_paths.addWidget(self.choose_archive_btn)
         candidate_layout.addLayout(candidate_paths)
@@ -398,7 +408,10 @@ class QueueManagerDialog(QtWidgets.QDialog):
         queue_scan_toolbar.addWidget(QtWidgets.QLabel("工作目录："))
         self.work_dir_edit = QtWidgets.QLineEdit(self.default_work_dir())
         queue_scan_toolbar.addWidget(self.work_dir_edit, 1)
-        self.choose_work_dir_btn = self.make_button("选择")
+        self.choose_work_dir_btn = configure_path_picker_button(
+            self.make_button(""),
+            "选择外部作业工作目录",
+        )
         self.scan_external_btn = self.make_button("扫描", "primary")
         queue_scan_toolbar.addWidget(self.choose_work_dir_btn)
         queue_scan_toolbar.addWidget(self.scan_external_btn)
@@ -724,6 +737,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
 
         QtCore.QTimer.singleShot(
             0,
+            self,
             lambda: self.populate_table_rows_batched(
                 table,
                 token,
@@ -1503,7 +1517,10 @@ class QueueManagerDialog(QtWidgets.QDialog):
         oldjob_name_edit = QtWidgets.QLineEdit(item.oldjob_name or derive_oldjob_name(item.oldjob_path))
         oldjob_path_edit = QtWidgets.QLineEdit(item.oldjob_path)
         oldjob_path_edit.setReadOnly(True)
-        choose_odb_btn = QtWidgets.QPushButton("选择 ODB 文件")
+        choose_odb_btn = configure_path_picker_button(
+            QtWidgets.QPushButton(),
+            "选择前置 ODB 文件",
+        )
         file_row = QtWidgets.QHBoxLayout()
         file_row.addWidget(oldjob_path_edit, 1)
         file_row.addWidget(choose_odb_btn)
@@ -2015,7 +2032,7 @@ class QueueManagerDialog(QtWidgets.QDialog):
                 queue=len(self.queue_items),
             )
         self.refresh_candidate_table()
-        QtCore.QTimer.singleShot(0, self.refresh_queue_table)
+        QtCore.QTimer.singleShot(0, self, self.refresh_queue_table)
 
     @hang_probe_function("QueueManagerDialog.refresh_candidate_table")
     def refresh_candidate_table(self) -> None:

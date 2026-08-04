@@ -98,13 +98,36 @@ def _button_styles() -> str:
             QPushButton#danger:pressed {{
                 background: #991b1b;
             }}
-            QPushButton:focus {{
-                border-color: {FOCUS};
-            }}
             QPushButton:disabled {{
                 background: #e5e7eb;
                 color: #94a3b8;
                 border-color: transparent;
+            }}
+            """
+
+
+def _path_picker_styles() -> str:
+    return f"""
+            QPushButton#pathPicker {{
+                background: #f8fafc;
+                color: #475569;
+                border: 1px solid {BORDER};
+                border-radius: 5px;
+                min-width: 30px;
+                max-width: 30px;
+                min-height: {BUTTON_HEIGHT}px;
+                max-height: {BUTTON_HEIGHT}px;
+                padding: 0;
+                font-weight: 600;
+            }}
+            QPushButton#pathPicker:hover {{
+                background: #ffffff;
+                border-color: #94a3b8;
+            }}
+            QPushButton#pathPicker:disabled {{
+                background: #f1f5f9;
+                color: #94a3b8;
+                border-color: {BORDER_SOFT};
             }}
             """
 
@@ -208,6 +231,10 @@ def _segmented_spinbox_styles() -> str:
             QSpinBox[segmentedSpin="true"]:focus {{
                 border-color: {FOCUS};
             }}
+            QSpinBox#resourceCpuSpin {{
+                min-width: 178px;
+                max-width: 178px;
+            }}
             QSpinBox[segmentedSpin="true"]::up-button,
             QSpinBox[segmentedSpin="true"]::down-button {{
                 width: 0;
@@ -287,11 +314,11 @@ def _table_styles() -> str:
 def _combo_popup_styles() -> str:
     return f"""
             QAbstractItemView#workbenchComboPopup {{
-                background: #ffffff;
+                background: transparent;
                 color: {TEXT};
-                border: 1px solid {BORDER};
+                border: 0;
                 border-radius: 0;
-                padding: 0;
+                padding: 3px;
                 outline: 0;
                 selection-background-color: {SELECTION_BG};
                 selection-color: {SELECTION_TEXT};
@@ -300,7 +327,7 @@ def _combo_popup_styles() -> str:
                 min-height: 26px;
                 padding: 0 8px;
                 border: 0;
-                border-radius: 0;
+                border-radius: 3px;
             }}
             """
 
@@ -380,8 +407,8 @@ def build_runtime_selector_stylesheet(background: str | None = None) -> str:
             QComboBox#runtimeSelector QAbstractItemView {{
                 background: {FIELD_BG};
                 border: 1px solid {BORDER};
-                border-radius: 0;
-                padding: 0;
+                border-radius: 6px;
+                padding: 3px;
                 outline: 0;
                 selection-background-color: transparent;
                 selection-color: {SELECTION_TEXT};
@@ -443,6 +470,7 @@ def build_queue_manager_stylesheet(*, compact: bool = False) -> str:
                 font-weight: 400;
             }}
             {_button_styles()}
+            {_path_picker_styles()}
             {compact_styles}
             {_field_styles()}
             {_segmented_spinbox_styles()}
@@ -460,11 +488,76 @@ def build_main_stylesheet() -> str:
                 font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
                 font-size: 12px;
             }}
+            QMainWindow#mainWindow {{
+                border: 1px solid {BORDER};
+            }}
+            QFrame#framelessTitleBar {{
+                background: {CARD_BG};
+                border: 0;
+                border-bottom: 1px solid {BORDER_SOFT};
+            }}
+            QFrame#framelessTitleBar[maximized="true"] {{
+                border-bottom-color: {BORDER};
+            }}
+            QLabel#framelessWindowTitle {{
+                color: #334155;
+                background: #e2e8f0;
+                border: 1px solid #cbd5e1;
+                border-radius: 5px;
+                min-height: 22px;
+                max-height: 22px;
+                padding: 0 8px;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QToolButton#windowMinimizeButton,
+            QToolButton#windowMaximizeButton,
+            QToolButton#windowCloseButton {{
+                min-width: 16px;
+                max-width: 16px;
+                min-height: 16px;
+                max-height: 16px;
+                padding: 0;
+                border: 1px solid transparent;
+                border-radius: 8px;
+            }}
+            QToolButton#windowMinimizeButton {{
+                background: #fbbf24;
+                border-color: #e5a812;
+            }}
+            QToolButton#windowMaximizeButton {{
+                background: #34c759;
+                border-color: #25a244;
+            }}
+            QToolButton#windowCloseButton {{
+                background: #ff5f57;
+                border-color: #e54841;
+            }}
+            QToolButton#windowMinimizeButton:hover {{
+                background: #f59e0b;
+                color: #78350f;
+            }}
+            QToolButton#windowMaximizeButton:hover {{
+                background: #15803d;
+                border-color: #166534;
+            }}
+            QToolButton#windowCloseButton:hover {{
+                background: #ef4444;
+                color: #7f1d1d;
+            }}
+            QToolButton#windowMinimizeButton:pressed,
+            QToolButton#windowMaximizeButton:pressed,
+            QToolButton#windowCloseButton:pressed {{
+                margin-top: 1px;
+            }}
             QLabel,
             QCheckBox {{
                 background: transparent;
             }}
             QWidget#formFieldRow {{
+                background: transparent;
+            }}
+            QWidget#resourceInlineGroup {{
                 background: transparent;
             }}
             QWidget#clusterShell,
@@ -475,11 +568,6 @@ def build_main_stylesheet() -> str:
             }}
             QWidget#workbenchShell {{
                 background: #f5f7fa;
-            }}
-            QFrame#workbenchTopBar {{
-                background: {CARD_BG};
-                border: 0;
-                border-bottom: 1px solid {BORDER};
             }}
             QMenuBar#workbenchMenuBar {{
                 background: {CARD_BG};
@@ -495,35 +583,35 @@ def build_main_stylesheet() -> str:
                 background: #e2e8f0;
                 border-radius: 4px;
             }}
-            QFrame#workbenchToolbar {{
-                background: #f8fafc;
-                border: 0;
-                border-top: 1px solid #eef2f7;
-            }}
-            QPushButton#toolbarButton,
-            QPushButton#toolbarPrimary,
-            QPushButton#toolbarDanger {{
+            QMenu#workbenchPopupMenu {{
                 background: transparent;
                 color: {TEXT};
-                border: 1px solid transparent;
-                border-radius: 5px;
-                min-height: 28px;
-                max-height: 28px;
-                padding: 0 10px;
-                font-weight: 600;
+                border: 0;
+                padding: 3px;
             }}
-            QPushButton#toolbarButton:hover {{
-                background: #e7edf6;
-                border-color: #d8e1ee;
+            QFrame#workbenchComboContainer {{
+                background: transparent;
+                border: 0;
             }}
-            QPushButton#toolbarPrimary {{
-                color: #1d4ed8;
+            QMenu#workbenchPopupMenu::item {{
+                background: transparent;
+                border: 0;
+                border-radius: 3px;
+                padding: 6px 26px 6px 10px;
+                margin: 0;
             }}
-            QPushButton#toolbarDanger {{
-                color: #c2410c;
+            QMenu#workbenchPopupMenu::item:selected {{
+                background: {SELECTION_BG};
+                color: {SELECTION_TEXT};
             }}
-            QPushButton#toolbarPrimary:disabled,
-            QPushButton#toolbarDanger:disabled,
+            QMenu#workbenchPopupMenu::item:disabled {{
+                color: #94a3b8;
+            }}
+            QMenu#workbenchPopupMenu::separator {{
+                height: 1px;
+                background: {BORDER_SOFT};
+                margin: 3px 6px;
+            }}
             QPushButton#success:disabled,
             QPushButton#outlineDanger:disabled {{
                 background: #e5e7eb;
@@ -593,6 +681,50 @@ def build_main_stylesheet() -> str:
                 border: 1px solid {BORDER_SOFT};
                 border-radius: 7px;
                 margin: 6px;
+            }}
+            QWidget#resourceChoices {{
+                background: transparent;
+                border: 0;
+            }}
+            QFrame#resourceNodeSummary {{
+                min-height: 108px;
+                max-height: 108px;
+                background: transparent;
+                border: 0;
+                border-left: 2px solid transparent;
+                border-bottom: 1px solid {BORDER_SOFT};
+                border-radius: 0;
+            }}
+            QFrame#resourceNodeSummary:hover {{
+                background: #f1f5f9;
+            }}
+            QFrame#resourceNodeSummary[selected="true"] {{
+                background: #f8fbff;
+                border-left: 2px solid {PRIMARY};
+            }}
+            QFrame#resourceNodeSummary QLabel {{
+                background: transparent;
+                border: 0;
+                color: {TEXT};
+                font-weight: 400;
+            }}
+            QLabel#resourceNodeName {{
+                font-weight: 600;
+            }}
+            QLabel#resourceNodeMetricName {{
+                font-size: 11px;
+            }}
+            QLabel#resourceNodeMetricValue {{
+                color: #475569;
+                font-size: 11px;
+            }}
+            QComboBox#resourceSelector {{
+                min-height: 22px;
+                max-height: 22px;
+                padding: 0 22px 0 7px;
+            }}
+            QComboBox#resourceSelector::drop-down {{
+                width: 18px;
             }}
             QLabel#explorerFooter {{
                 color: #64748b;
@@ -708,6 +840,7 @@ def build_main_stylesheet() -> str:
                 padding: 0 8px;
                 font-weight: 600;
             }}
+            QSplitter#workbenchOuterSplitter::handle,
             QSplitter#workbenchUpperSplitter::handle,
             QSplitter#workbenchMainSplitter::handle {{
                 background: #dbe4ef;
@@ -775,70 +908,6 @@ def build_main_stylesheet() -> str:
             QFrame#runtimeInspector QCheckBox {{
                 background: transparent;
             }}
-            QFrame#schedulerHub {{
-                background: #2563eb;
-                border: 1px solid #1d4ed8;
-                border-radius: 10px;
-            }}
-            QLabel#hubTitle {{
-                background: transparent;
-                color: #ffffff;
-                font-size: 15px;
-                font-weight: 700;
-            }}
-            QLabel#hubStatus,
-            QLabel#hubQueue {{
-                background: transparent;
-                color: #dbeafe;
-                font-weight: 600;
-            }}
-            QLabel#topologyArrow {{
-                color: #0891b2;
-                font-size: 28px;
-                font-weight: 700;
-                padding: 0 2px;
-            }}
-            QFrame#resourceNode {{
-                background: {CARD_BG};
-                border: 1px solid {BORDER};
-                border-radius: 10px;
-            }}
-            QFrame#resourceNode:hover {{
-                border: 2px solid #60a5fa;
-                background: #f8fbff;
-            }}
-            QLabel#nodeTitle {{
-                font-size: 13px;
-                font-weight: 700;
-            }}
-            QLabel#nodePath {{
-                color: #475569;
-                background: #f8fafc;
-                border: 1px solid #e2e8f0;
-                border-radius: 5px;
-                padding: 4px 6px;
-            }}
-            QLabel#nodeJob {{
-                color: #1e3a8a;
-                background: #eff6ff;
-                border: 1px solid #bfdbfe;
-                border-radius: 6px;
-                padding: 5px 7px;
-            }}
-            QLabel#statusOnline {{
-                color: #15803d;
-                background: #dcfce7;
-                border-radius: 5px;
-                padding: 2px 6px;
-                font-weight: 600;
-            }}
-            QLabel#statusWarning {{
-                color: #b45309;
-                background: #fef3c7;
-                border-radius: 5px;
-                padding: 2px 6px;
-                font-weight: 600;
-            }}
             QProgressBar {{
                 background: #e2e8f0;
                 color: {TEXT};
@@ -851,20 +920,6 @@ def build_main_stylesheet() -> str:
             QProgressBar::chunk {{
                 background: {PRIMARY};
                 border-radius: 4px;
-            }}
-            QFrame#routeCard {{
-                background: #ecfeff;
-                border: 1px solid #a5f3fc;
-                border-radius: 9px;
-            }}
-            QFrame#mergeRouteCard {{
-                background: #faf5ff;
-                border: 1px solid #d8b4fe;
-                border-radius: 9px;
-            }}
-            QLabel#routeTitle {{
-                font-size: 13px;
-                font-weight: 700;
             }}
             QLabel#mergeFlow,
             QLabel#mergeFlowLarge {{
@@ -879,7 +934,6 @@ def build_main_stylesheet() -> str:
                 font-size: 13px;
                 padding: 10px 12px;
             }}
-            QLabel#topologyRule,
             QLabel#infoBanner {{
                 color: #1e40af;
                 background: #eff6ff;
@@ -1289,6 +1343,7 @@ def build_main_stylesheet() -> str:
                 padding: 5px 7px;
             }}
             {_button_styles()}
+            {_path_picker_styles()}
             {_segmented_spinbox_styles()}
             {_combo_popup_styles()}
             {_scrollbar_styles()}

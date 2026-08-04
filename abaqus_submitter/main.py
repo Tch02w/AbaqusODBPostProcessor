@@ -61,6 +61,7 @@ from .app_settings import (
     load_app_settings,
     load_settings_section,
     save_app_settings,
+    save_settings_section,
 )
 from .models import QueueItem
 from .odb_merge import (
@@ -91,6 +92,12 @@ from .job_runtime import JobRuntimeController
 from .process_observation import ProcessObservationService
 from .restart_dependency import RestartDependencyLifecycle
 from .remote_frontend import ExecutionLocation, RemoteFrontendBridge
+from .remote_connection import (
+    RemoteConnectionService,
+    ServerConnectionRequest,
+)
+from .remote_frontend import ServerProfileDraft
+from .server_ui import ServerConnectionDialog
 from .runtime_record import RuntimeRecord
 from .app_paths import SCHEDULER_STATE_PATH
 from .scheduler_adapter import (
@@ -118,6 +125,7 @@ from .ui_components import (
     safe_int,
     SegmentedSpinBox,
     WorkbenchComboBox,
+    configure_popup_menu,
 )
 from .cluster_ui import (
     ClusterTopologyWidget,
@@ -143,6 +151,7 @@ from .ui_styles import (
     build_main_stylesheet,
     build_runtime_selector_stylesheet,
 )
+from .window_chrome_prototype import install_frameless_window_chrome
 
 QUEUE_DISPATCH_DEBOUNCE_MS = 50
 
@@ -327,6 +336,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.build_ui()
         self._startup_timeline.mark("build-ui")
+        (
+            self.window_chrome,
+            self._frameless_resize_controller,
+        ) = install_frameless_window_chrome(self, APP_TITLE)
+        self.window_chrome.set_menu_bar(self.workbench_menu_bar)
+        self.root_layout.setContentsMargins(12, 0, 12, 12)
         self.apply_styles()
         self._startup_timeline.mark("apply-styles")
 
@@ -1004,6 +1019,10 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """Install the C-style shell and the B-style submission workflow."""
         self.remote_frontend = RemoteFrontendBridge(self)
+        self.remote_connection_service = RemoteConnectionService(parent=self)
+        self._server_dialog: ServerConnectionDialog | None = None
+        self._pending_remote_request: ServerConnectionRequest | None = None
+        self._trusted_remote_retry: ServerConnectionRequest | None = None
         self._remote_resource_snapshots: dict[str, dict] = {}
         self.submission_wizard = SubmissionWizardDialog(self.remote_frontend, self)
         self.submit_card = self.submission_wizard
@@ -1037,13 +1056,37 @@ class MainWindow(QtWidgets.QMainWindow):
         self.submission_wizard.localSubmitRequested.connect(self.submit_job)
 
         self.remote_frontend.testConnectionRequested.connect(
-            lambda payload: self.handle_remote_frontend_request("测试 SSH 连接", payload)
+            self.request_remote_connection
         )
         self.remote_frontend.reconnectRequested.connect(
-            lambda server: self.handle_remote_frontend_request("重新连接服务器", server)
+            lambda _server: self.open_server_configuration()
+        )
+        self.remote_frontend.resourceRefreshRequested.connect(
+            lambda _server: self.refresh_remote_resources()
         )
         self.remote_frontend.resourceSnapshotReceived.connect(
             self.apply_remote_resource_snapshot
+        )
+        self.remote_connection_service.busyChanged.connect(
+            self.on_remote_connection_busy_changed
+        )
+        self.remote_connection_service.confirmationRequired.connect(
+            self.confirm_remote_host_key
+        )
+        self.remote_connection_service.connected.connect(
+            self.on_remote_server_connected
+        )
+        self.remote_connection_service.snapshotReceived.connect(
+            self.remote_frontend.resourceSnapshotReceived
+        )
+        self.remote_connection_service.disconnected.connect(
+            self.on_remote_server_disconnected
+        )
+        self.remote_connection_service.failed.connect(
+            self.on_remote_connection_failed
+        )
+        self.remote_connection_service.idle.connect(
+            self.continue_remote_connection_when_idle
         )
         self.remote_frontend.browseRemoteDirectoryRequested.connect(
             lambda payload: self.handle_remote_frontend_request("浏览服务器允许目录", payload)
@@ -1066,7 +1109,7 @@ class MainWindow(QtWidgets.QMainWindow):
         shell_layout = QtWidgets.QVBoxLayout(shell)
         shell_layout.setContentsMargins(0, 0, 0, 0)
         shell_layout.setSpacing(0)
-        shell_layout.addWidget(self._build_workbench_top_bar())
+        self.workbench_menu_bar = self._build_workbench_menu_bar()
 
         resource_snapshot = capture_local_resource_snapshot()
         self.project_explorer = ProjectRemoteExplorer()
@@ -1087,12 +1130,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.workbench_tabs = QtWidgets.QTabWidget()
         self.workbench_tabs.setObjectName("workbenchTabs")
         self.right_panel.setObjectName("runtimeInspector")
-        self.workbench_tabs.addTab(self.right_panel, "作业概览")
         self.job_configuration = JobConfigurationWorkbench(
             self.submission_wizard,
             self.remote_frontend,
         )
-        self.workbench_tabs.addTab(self.job_configuration, "作业配置")
+        self.workbench_tabs.addTab(self.job_configuration, "新建作业")
+        self.workbench_tabs.addTab(self.right_panel, "作业概览")
 
         topology_page = QtWidgets.QWidget()
         topology_layout = QtWidgets.QVBoxLayout(topology_page)
@@ -1107,8 +1150,14 @@ class MainWindow(QtWidgets.QMainWindow):
             memory_percent=resource_snapshot.memory_percent,
         )
         self.cluster_topology.nodeSelected.connect(self.on_cluster_node_selected)
+        self.cluster_topology.refreshRequested.connect(
+            self.refresh_project_explorer
+        )
+        self.cluster_topology.refreshRequested.connect(
+            self.refresh_remote_resources
+        )
         topology_layout.addWidget(self.cluster_topology)
-        self.workbench_tabs.addTab(topology_page, "计算拓扑")
+        self.workbench_tabs.addTab(topology_page, "计算资源")
 
         self.restart_chain_label = QtWidgets.QLabel(
             "重启动链由当前队列与前置依赖生成；尚未选择包含 oldjob 的真实作业。"
@@ -1116,18 +1165,42 @@ class MainWindow(QtWidgets.QMainWindow):
         self.restart_chain_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.restart_chain_label.setObjectName("emptyState")
         self.workbench_tabs.addTab(self.restart_chain_label, "重启动链")
-        self.odb_validation_label = QtWidgets.QLabel(
-            "尚未生成或选择可验证的 joined ODB。"
+        self.odb_merge_page = QtWidgets.QScrollArea()
+        self.odb_merge_page.setWidgetResizable(True)
+        self.odb_merge_page.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.odb_merge_page.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
-        self.odb_validation_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.odb_validation_label.setObjectName("emptyState")
-        self.workbench_tabs.addTab(self.odb_validation_label, "ODB 验证")
+        self.odb_merge_content = QtWidgets.QWidget()
+        odb_merge_layout = QtWidgets.QVBoxLayout(self.odb_merge_content)
+        odb_merge_layout.setContentsMargins(10, 10, 10, 10)
+        odb_merge_layout.setSpacing(10)
+        odb_merge_layout.addWidget(self.job_configuration.odb_merge_group)
+        self.job_configuration.odb_merge_group.show()
+        merge_results_group = QtWidgets.QGroupBox("合并结果")
+        merge_results_layout = QtWidgets.QVBoxLayout(merge_results_group)
+        self.odb_validation_label = QtWidgets.QLabel(
+            "当前 INP 目录中没有实际的 *_joined.odb。"
+        )
+        self.odb_validation_label.setObjectName("hint")
+        self.odb_validation_label.setWordWrap(True)
+        self.odb_validation_label.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        merge_results_layout.addWidget(self.odb_validation_label)
+        odb_merge_layout.addWidget(merge_results_group)
+        odb_merge_layout.addStretch(1)
+        self.odb_merge_page.setWidget(self.odb_merge_content)
+        self.workbench_tabs.addTab(self.odb_merge_page, "ODB 合并")
         self.workbench_tabs.setCurrentWidget(self.job_configuration)
 
         self.properties_panel = WorkbenchPropertiesPanel()
         self.properties_panel.refresh(
             self.queue_items,
             resource_snapshot=resource_snapshot,
+        )
+        self.project_explorer.resource_summary.resourceSelected.connect(
+            self.on_cluster_node_selected
         )
         self.job_configuration.jobNameChanged.connect(self.refresh_workbench_draft)
         self.job_configuration.chooseInputRequested.connect(self.select_inp_file)
@@ -1218,15 +1291,17 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         self.refresh_workbench_draft()
 
-        upper_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        upper_splitter.setObjectName("workbenchUpperSplitter")
-        upper_splitter.addWidget(self.project_explorer)
-        upper_splitter.addWidget(self.workbench_tabs)
-        upper_splitter.addWidget(self.properties_panel)
-        upper_splitter.setStretchFactor(0, 0)
-        upper_splitter.setStretchFactor(1, 1)
-        upper_splitter.setStretchFactor(2, 0)
-        upper_splitter.setSizes([270, 900, 320])
+        self.workbench_upper_splitter = QtWidgets.QSplitter(
+            QtCore.Qt.Orientation.Horizontal
+        )
+        self.workbench_upper_splitter.setObjectName("workbenchUpperSplitter")
+        self.workbench_upper_splitter.addWidget(self.workbench_tabs)
+        self.workbench_upper_splitter.addWidget(self.properties_panel)
+        self.workbench_upper_splitter.setStretchFactor(0, 1)
+        self.workbench_upper_splitter.setStretchFactor(1, 0)
+        self.workbench_upper_splitter.setCollapsible(0, False)
+        self.workbench_upper_splitter.setCollapsible(1, False)
+        self.workbench_upper_splitter.setSizes([900, 320])
 
         self.log_dock = WorkbenchLogDock(self.history)
         self.remote_frontend.transferEventReceived.connect(
@@ -1258,14 +1333,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.odb_merge_service.succeeded.connect(self.on_odb_merge_succeeded)
         self.odb_merge_service.failed.connect(self.on_odb_merge_failed)
         self.odb_merge_service.cancelled.connect(self.on_odb_merge_cancelled)
-        main_splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
-        main_splitter.setObjectName("workbenchMainSplitter")
-        main_splitter.addWidget(upper_splitter)
-        main_splitter.addWidget(self.log_dock)
-        main_splitter.setStretchFactor(0, 1)
-        main_splitter.setStretchFactor(1, 0)
-        main_splitter.setSizes([660, 210])
-        shell_layout.addWidget(main_splitter, 1)
+        self.workbench_main_splitter = QtWidgets.QSplitter(
+            QtCore.Qt.Orientation.Vertical
+        )
+        self.workbench_main_splitter.setObjectName("workbenchMainSplitter")
+        self.workbench_main_splitter.addWidget(self.workbench_upper_splitter)
+        self.workbench_main_splitter.addWidget(self.log_dock)
+        self.workbench_main_splitter.setStretchFactor(0, 1)
+        self.workbench_main_splitter.setStretchFactor(1, 0)
+        self.workbench_main_splitter.setCollapsible(0, False)
+        self.workbench_main_splitter.setCollapsible(1, False)
+        self.workbench_main_splitter.setSizes([660, 210])
+
+        self.workbench_outer_splitter = QtWidgets.QSplitter(
+            QtCore.Qt.Orientation.Horizontal
+        )
+        self.workbench_outer_splitter.setObjectName("workbenchOuterSplitter")
+        self.workbench_outer_splitter.addWidget(self.project_explorer)
+        self.workbench_outer_splitter.addWidget(self.workbench_main_splitter)
+        self.workbench_outer_splitter.setStretchFactor(0, 0)
+        self.workbench_outer_splitter.setStretchFactor(1, 1)
+        self.workbench_outer_splitter.setCollapsible(0, False)
+        self.workbench_outer_splitter.setCollapsible(1, False)
+        self.workbench_outer_splitter.setSizes([270, 1220])
+        shell_layout.addWidget(self.workbench_outer_splitter, 1)
         self.root_layout.addWidget(shell, 1)
         self.queue_status_label = self.project_explorer.resource_summary.job_label
         self.refresh_workbench_derived_state()
@@ -1274,80 +1365,37 @@ class MainWindow(QtWidgets.QMainWindow):
             legacy_left_panel.hide()
             legacy_left_panel.deleteLater()
 
-    def _build_workbench_top_bar(self) -> QtWidgets.QWidget:
-        top_bar = QtWidgets.QFrame()
-        top_bar.setObjectName("workbenchTopBar")
-        outer = QtWidgets.QVBoxLayout(top_bar)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
+    def _build_workbench_menu_bar(self) -> QtWidgets.QMenuBar:
         menu_bar = QtWidgets.QMenuBar()
         menu_bar.setObjectName("workbenchMenuBar")
-        file_menu = menu_bar.addMenu("文件(&F)")
+        file_menu = configure_popup_menu(menu_bar.addMenu("文件(&F)"))
         file_menu.addAction("新建作业", self.open_submission_wizard)
         file_menu.addAction("退出", self.close)
-        job_menu = menu_bar.addMenu("作业(&J)")
+        job_menu = configure_popup_menu(menu_bar.addMenu("作业(&J)"))
         job_menu.addAction("管理队列", self.open_queue_manager)
         job_menu.addAction("开始队列", self.start_queue)
         job_menu.addAction("终止队列", self.stop_queue)
-        server_menu = menu_bar.addMenu("服务器(&S)")
-        server_action = server_menu.addAction(
-            "连接服务器",
+        server_menu = configure_popup_menu(menu_bar.addMenu("服务器(&S)"))
+        self.server_connect_action = server_menu.addAction(
+            "连接 / 配置服务器",
             self.open_server_configuration,
         )
-        server_action.setEnabled(False)
-        server_action.setToolTip("远程执行 Adapter 尚未实现")
-        outer.addWidget(menu_bar)
-
-        toolbar = QtWidgets.QFrame()
-        toolbar.setObjectName("workbenchToolbar")
-        layout = QtWidgets.QHBoxLayout(toolbar)
-        layout.setContentsMargins(10, 6, 10, 6)
-        layout.setSpacing(7)
-        self.new_job_btn = QtWidgets.QPushButton("新建作业")
-        self.new_job_btn.setObjectName("toolbarButton")
-        self.toolbar_submit_btn = QtWidgets.QPushButton("提交")
-        self.toolbar_submit_btn.setObjectName("toolbarPrimary")
-        self.toolbar_stop_btn = QtWidgets.QPushButton("停止")
-        self.toolbar_stop_btn.setObjectName("toolbarDanger")
-        self.connect_server_btn = QtWidgets.QPushButton("连接服务器")
-        self.connect_server_btn.setObjectName("toolbarButton")
-        self.connect_server_btn.hide()
-        layout.addWidget(self.new_job_btn)
-        layout.addWidget(self.toolbar_submit_btn)
-        layout.addWidget(self.toolbar_stop_btn)
-        layout.addSpacing(12)
-        layout.addWidget(self.connect_server_btn)
-
-        self.global_search = QtWidgets.QLineEdit()
-        self.global_search.setObjectName("globalSearch")
-        self.global_search.setPlaceholderText("搜索命令、文件或作业")
-        self.global_search.setMaximumWidth(460)
-        self.global_search.hide()
-        layout.addWidget(self.global_search, 1)
-        layout.addStretch(1)
+        self.server_refresh_action = server_menu.addAction(
+            "刷新服务器资源",
+            self.refresh_remote_resources,
+        )
+        self.server_disconnect_action = server_menu.addAction(
+            "断开服务器",
+            self.disconnect_remote_server,
+        )
+        self.server_refresh_action.setEnabled(False)
+        self.server_disconnect_action.setEnabled(False)
         self.connection_state_combo = WorkbenchComboBox()
         self.connection_state_combo.setObjectName("connectionState")
         self.connection_state_combo.addItem("○ 远程服务器未连接")
         self.connection_state_combo.hide()
-        layout.addWidget(self.connection_state_combo)
-        outer.addWidget(toolbar)
-
-        self.start_queue_btn = QtWidgets.QPushButton()
-        self.start_queue_btn.hide()
-        self.stop_queue_btn = QtWidgets.QPushButton()
-        self.stop_queue_btn.hide()
-        self.queue_btn = QtWidgets.QPushButton()
-        self.queue_btn.hide()
-        self.new_job_btn.clicked.connect(self.open_submission_wizard)
-        self.toolbar_submit_btn.clicked.connect(self.submit_workbench_job)
-        self.toolbar_stop_btn.clicked.connect(self.stop_workbench_job)
-        self.connect_server_btn.clicked.connect(
-            self.open_server_configuration
-        )
-        self.start_queue_btn.clicked.connect(self.start_queue)
-        self.stop_queue_btn.clicked.connect(self.stop_queue)
-        return top_bar
+        self.connection_state_combo.setParent(menu_bar)
+        return menu_bar
 
     def _build_cluster_navigation(self) -> QtWidgets.QWidget:
         navigation = QtWidgets.QFrame()
@@ -1423,14 +1471,193 @@ class MainWindow(QtWidgets.QMainWindow):
         self.workbench_tabs.setCurrentWidget(self.job_configuration)
         self.job_configuration.reset_for_new_job()
 
-    def open_server_configuration(self) -> None:
-        """Focus the server fields already present in the primary workbench."""
-        if not hasattr(self, "job_configuration"):
+    def open_server_configuration(
+        self,
+        profile: ServerProfileDraft | None = None,
+    ) -> None:
+        """Open the real SSH profile and connection dialog."""
+        if isinstance(profile, bool):
+            profile = None
+        if self._server_dialog is None:
+            dialog = ServerConnectionDialog(
+                load_settings_section("remote_server"),
+                self,
+            )
+            dialog.connectRequested.connect(self.request_remote_connection)
+            dialog.saveRequested.connect(self.save_remote_server_profile)
+            dialog.refreshRequested.connect(self.refresh_remote_resources)
+            dialog.disconnectRequested.connect(self.disconnect_remote_server)
+            self._server_dialog = dialog
+        if profile is not None:
+            self._server_dialog.apply_profile(profile)
+        self._server_dialog.show()
+        self._server_dialog.raise_()
+        self._server_dialog.activateWindow()
+
+    @QtCore.Slot(object)
+    def request_remote_connection(self, payload: object) -> None:
+        """Start an asynchronous SSH connection or open the credential form."""
+        if isinstance(payload, ServerConnectionRequest):
+            self._pending_remote_request = payload
+            self.append_history(
+                f"正在连接服务器：{payload.profile.profile_name or payload.profile.host}"
+            )
+            self.remote_connection_service.connect_to_server(payload)
             return
-        self.workbench_tabs.setCurrentWidget(self.job_configuration)
-        self.job_configuration.host_edit.setFocus(
-            QtCore.Qt.FocusReason.OtherFocusReason
+        if isinstance(payload, ServerProfileDraft):
+            self.open_server_configuration(payload)
+            return
+        self.open_server_configuration()
+
+    @QtCore.Slot(object)
+    def save_remote_server_profile(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        try:
+            save_settings_section("remote_server", payload)
+        except OSError as exc:
+            self.on_remote_connection_failed(f"保存服务器配置失败：{exc}")
+            return
+        self.append_history("服务器配置已保存（未保存密码或私钥口令）。")
+
+    @QtCore.Slot(object, str)
+    def confirm_remote_host_key(
+        self,
+        request: object,
+        fingerprint: str,
+    ) -> None:
+        if not isinstance(request, ServerConnectionRequest):
+            return
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "确认服务器主机指纹",
+            (
+                f"服务器：{request.profile.host}:{request.profile.port}\n"
+                f"SHA256 指纹：\n{fingerprint}\n\n"
+                "请通过可信渠道核对该指纹。确认信任并继续连接吗？"
+            ),
+            (
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.No
+            ),
+            QtWidgets.QMessageBox.StandardButton.No,
         )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            self._pending_remote_request = None
+            self._trusted_remote_retry = None
+            self.append_history("已取消连接：服务器主机指纹未获确认。")
+            if self._server_dialog is not None:
+                self._server_dialog.set_error("主机指纹未确认")
+            return
+        trusted_request = request.with_fingerprint(fingerprint)
+        self._pending_remote_request = trusted_request
+        self._trusted_remote_retry = trusted_request
+        if self._server_dialog is not None:
+            self._server_dialog.apply_profile(trusted_request.profile)
+        self.continue_remote_connection_when_idle()
+
+    @QtCore.Slot()
+    def continue_remote_connection_when_idle(self) -> None:
+        request = self._trusted_remote_retry
+        if request is None or self.remote_connection_service.is_busy:
+            return
+        self._trusted_remote_retry = None
+        self.remote_connection_service.connect_to_server(request)
+
+    @QtCore.Slot(object)
+    def on_remote_server_connected(self, snapshot: object) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        request = self._pending_remote_request
+        fingerprint = str(snapshot.get("host_fingerprint") or "")
+        if request is not None:
+            trusted_request = request.with_fingerprint(fingerprint)
+            self.save_remote_server_profile(
+                trusted_request.profile.persistent_payload()
+            )
+            self._sync_remote_profile_to_forms(trusted_request.profile)
+        self._pending_remote_request = None
+        self._trusted_remote_retry = None
+        if self._server_dialog is not None:
+            self._server_dialog.set_connected(snapshot)
+        self.server_refresh_action.setEnabled(True)
+        self.server_disconnect_action.setEnabled(True)
+        profile_name = str(snapshot.get("profile_name") or "服务器")
+        self.append_history(f"SSH 连接成功：{profile_name}，已读取真实资源快照。")
+
+    @QtCore.Slot(str)
+    def on_remote_server_disconnected(self, profile_name: str) -> None:
+        if self._server_dialog is not None:
+            self._server_dialog.set_disconnected()
+        self.server_refresh_action.setEnabled(False)
+        self.server_disconnect_action.setEnabled(False)
+        self._pending_remote_request = None
+        self._trusted_remote_retry = None
+        name = profile_name or "服务器"
+        snapshot = dict(self._remote_resource_snapshots.get(name, {}))
+        snapshot.update(
+            {
+                "profile_name": name,
+                "connected": False,
+                "active_jobs": (),
+                "running_jobs": 0,
+            }
+        )
+        self.remote_frontend.resourceSnapshotReceived.emit(snapshot)
+        self.append_history(f"已断开 SSH 服务器：{name}")
+
+    @QtCore.Slot(bool)
+    def on_remote_connection_busy_changed(self, busy: bool) -> None:
+        if self._server_dialog is not None:
+            self._server_dialog.set_busy(busy)
+        self.server_connect_action.setEnabled(not busy)
+        self.server_refresh_action.setEnabled(
+            not busy
+            and bool(self.remote_connection_service.manager.connected_profile_name)
+        )
+        self.server_disconnect_action.setEnabled(
+            not busy
+            and bool(self.remote_connection_service.manager.connected_profile_name)
+        )
+
+    @QtCore.Slot(str)
+    def on_remote_connection_failed(self, message: str) -> None:
+        self._pending_remote_request = None
+        self._trusted_remote_retry = None
+        self.append_history(f"服务器操作失败：{message}")
+        if self._server_dialog is not None:
+            self._server_dialog.set_remote_operation_error(message)
+
+    @QtCore.Slot()
+    def refresh_remote_resources(self) -> None:
+        if not self.remote_connection_service.manager.connected_profile_name:
+            return
+        self.append_history("正在刷新服务器资源…")
+        self.remote_connection_service.refresh()
+
+    @QtCore.Slot()
+    def disconnect_remote_server(self) -> None:
+        self.remote_connection_service.disconnect()
+
+    def _sync_remote_profile_to_forms(
+        self,
+        profile: ServerProfileDraft,
+    ) -> None:
+        for target in (self.job_configuration, self.submission_wizard):
+            target.server_combo.setItemText(0, profile.profile_name)
+            target.host_edit.setText(profile.host)
+            target.username_edit.setText(profile.username)
+            auth_combo = getattr(
+                target,
+                "authentication_combo",
+                getattr(target, "auth_combo", None),
+            )
+            if auth_combo is not None:
+                auth_combo.setCurrentText(profile.authentication)
+            target.fingerprint_edit.setText(profile.host_fingerprint)
+            target.abaqus_command_edit.setText(profile.abaqus_command)
+            target.compute_root_edit.setText(profile.compute_root)
+            target.allowed_roots_edit.setText("; ".join(profile.allowed_roots))
 
     def show_topology_view(self) -> None:
         if hasattr(self, "workbench_tabs") and hasattr(self, "cluster_topology"):
@@ -1442,6 +1669,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.history.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
 
     def on_cluster_node_selected(self, node_id: str) -> None:
+        if hasattr(self, "project_explorer"):
+            self.project_explorer.resource_summary.select_resource(node_id)
         self.append_history(f"已选择计算节点：{node_id}")
 
     def handle_remote_frontend_request(self, action: str, payload: object) -> None:
@@ -1456,7 +1685,6 @@ class MainWindow(QtWidgets.QMainWindow):
         profile_name = str(payload.get("profile_name") or "未命名服务器")
         self._remote_resource_snapshots[profile_name] = dict(payload)
         self.project_explorer.apply_remote_snapshot(payload)
-        self.properties_panel.apply_remote_snapshot(payload)
         self.cluster_topology.apply_remote_resource_snapshot(payload)
         connected = bool(payload.get("connected", False))
         self.connection_state_combo.setItemText(
@@ -1490,7 +1718,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if suffix != ".odb":
             return
-        self.workbench_tabs.setCurrentWidget(self.job_configuration)
+        self.workbench_tabs.setCurrentWidget(self.odb_merge_page)
         if not self.job_configuration.merge_original_edit.text().strip():
             self.job_configuration.set_merge_original_path(str(path))
         else:
@@ -1540,9 +1768,6 @@ class MainWindow(QtWidgets.QMainWindow):
             job_name=self.job_configuration.job_name_edit.text().strip(),
             original_job=self.job_configuration.original_job_edit.text().strip(),
             input_path=self.job_configuration.input_path_edit.text().strip(),
-        )
-        self.toolbar_submit_btn.setEnabled(
-            bool(self.job_configuration.input_path_edit.text().strip())
         )
         self.job_configuration.submit_job_btn.setEnabled(
             bool(self.job_configuration.input_path_edit.text().strip())
@@ -3717,6 +3942,13 @@ class MainWindow(QtWidgets.QMainWindow):
             )
             if selected_queue_item is None and hasattr(self, "job_configuration"):
                 self.refresh_workbench_draft()
+        if (
+            hasattr(self, "project_explorer")
+            and self.queue_status_label
+            is self.project_explorer.resource_summary.job_label
+        ):
+            self.request_joblist_save()
+            return
         pending = counts.get(STATUS_PENDING_RUN, 0) + counts.get(STATUS_WAITING_DEPENDENCY, 0)
         running = sum(counts.get(status, 0) for status in ACTIVE_STATUSES)
         completed = counts.get(STATUS_COMPLETED, 0) + counts.get(STATUS_DATACHECK_COMPLETED, 0)
@@ -3921,14 +4153,10 @@ class MainWindow(QtWidgets.QMainWindow):
     ) -> None:
         """根据当前 Job 状态更新右侧操作按钮。"""
         self.submit_btn.setEnabled(not running)
-        if hasattr(self, "toolbar_stop_btn"):
-            self.toolbar_stop_btn.setEnabled(running)
-        if hasattr(self, "toolbar_submit_btn"):
+        if hasattr(self, "job_configuration"):
             has_input = bool(
-                getattr(self, "job_configuration", None)
-                and self.job_configuration.input_path_edit.text().strip()
+                self.job_configuration.input_path_edit.text().strip()
             )
-            self.toolbar_submit_btn.setEnabled(has_input and not running)
             self.job_configuration.submit_job_btn.setEnabled(
                 has_input and not running
             )
@@ -3981,6 +4209,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._archive_move_contexts.clear()
         self._archive_move_reserved_keys.clear()
         self.memory_adapter.stop()
+        self.remote_connection_service.shutdown()
         self.scheduler.close()
         super().closeEvent(event)
 

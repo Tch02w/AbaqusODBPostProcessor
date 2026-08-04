@@ -9,7 +9,7 @@ import psutil
 
 from .command import MEMORY_OPTIONS
 from .constants import DEFAULT_CPUS, MAX_CPUS, calculate_default_joblist_parallel
-from .qt_compat import QtCore, QtGui, QtWidgets, Signal
+from .qt_compat import QtCore, QtWidgets, Signal
 from .remote_frontend import (
     ExecutionLocation,
     OdbMergeDraft,
@@ -17,7 +17,12 @@ from .remote_frontend import (
     RemoteJobDraft,
     ServerProfileDraft,
 )
-from .ui_components import FilePickerRow, SegmentedSpinBox, WorkbenchComboBox
+from .ui_components import (
+    FilePickerRow,
+    SegmentedSpinBox,
+    WorkbenchComboBox,
+    configure_path_picker_button,
+)
 
 
 def _card(object_name: str = "dashboardCard") -> tuple[QtWidgets.QFrame, QtWidgets.QVBoxLayout]:
@@ -35,266 +40,121 @@ def _section_title(text: str) -> QtWidgets.QLabel:
     return label
 
 
-class ResourceNodeCard(QtWidgets.QFrame):
-    """One resource card in the cluster topology."""
-
-    selected = Signal(str)
-
-    def __init__(
-        self,
-        node_id: str,
-        title: str,
-        subtitle: str,
-        *,
-        status: str,
-        cpu_text: str,
-        cpu_percent: int,
-        memory_text: str,
-        memory_percent: int,
-        path_text: str,
-        job_text: str,
-        parent=None,
-    ) -> None:
-        super().__init__(parent)
-        self.node_id = node_id
-        self.setObjectName("resourceNode")
-        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.setMinimumWidth(196)
-        self.setMaximumWidth(246)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(7)
-
-        title_row = QtWidgets.QHBoxLayout()
-        title_label = QtWidgets.QLabel(title)
-        title_label.setObjectName("nodeTitle")
-        title_row.addWidget(title_label)
-        title_row.addStretch(1)
-        self.status_badge = QtWidgets.QLabel(status)
-        if status == "在线":
-            status_style = "statusOnline"
-        elif status in {"未连接", "未配置"}:
-            status_style = "statusOffline"
-        else:
-            status_style = "statusWarning"
-        self.status_badge.setObjectName(status_style)
-        title_row.addWidget(self.status_badge)
-        layout.addLayout(title_row)
-
-        subtitle_label = QtWidgets.QLabel(subtitle)
-        subtitle_label.setObjectName("hint")
-        layout.addWidget(subtitle_label)
-
-        self.cpu_label = QtWidgets.QLabel(f"CPU　{cpu_text}")
-        self.cpu_bar = QtWidgets.QProgressBar()
-        self.cpu_bar.setRange(0, 100)
-        self.cpu_bar.setValue(max(0, min(100, cpu_percent)))
-        self.cpu_bar.setTextVisible(False)
-        layout.addWidget(self.cpu_label)
-        layout.addWidget(self.cpu_bar)
-
-        self.memory_label = QtWidgets.QLabel(f"内存　{memory_text}")
-        self.memory_bar = QtWidgets.QProgressBar()
-        self.memory_bar.setRange(0, 100)
-        self.memory_bar.setValue(max(0, min(100, memory_percent)))
-        self.memory_bar.setTextVisible(False)
-        layout.addWidget(self.memory_label)
-        layout.addWidget(self.memory_bar)
-
-        path_label = QtWidgets.QLabel(path_text)
-        path_label.setObjectName("nodePath")
-        path_label.setToolTip(path_text)
-        path_label.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(path_label)
-
-        job_label = QtWidgets.QLabel(job_text)
-        job_label.setObjectName("nodeJob")
-        job_label.setWordWrap(True)
-        layout.addWidget(job_label)
-        self.path_label = path_label
-        self.job_label = job_label
-
-    def update_resource(
-        self,
-        *,
-        status: str,
-        cpu_text: str,
-        cpu_percent: int,
-        memory_text: str,
-        memory_percent: int,
-        path_text: str,
-        job_text: str,
-    ) -> None:
-        self.status_badge.setText(status)
-        if status == "在线":
-            status_style = "statusOnline"
-        elif status in {"未连接", "未配置"}:
-            status_style = "statusOffline"
-        else:
-            status_style = "statusWarning"
-        self.status_badge.setObjectName(status_style)
-        self.status_badge.style().unpolish(self.status_badge)
-        self.status_badge.style().polish(self.status_badge)
-        self.cpu_label.setText(f"CPU　{cpu_text}")
-        self.cpu_bar.setValue(max(0, min(100, cpu_percent)))
-        self.memory_label.setText(f"内存　{memory_text}")
-        self.memory_bar.setValue(max(0, min(100, memory_percent)))
-        self.path_label.setText(path_text)
-        self.path_label.setToolTip(path_text)
-        self.job_label.setText(job_text)
-
-    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
-        if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            self.selected.emit(self.node_id)
-        super().mousePressEvent(event)
-
-
 class ClusterTopologyWidget(QtWidgets.QWidget):
-    """C-style scheduler and Windows resource topology."""
+    """Dense resource view backed only by real local or remote snapshots."""
 
     nodeSelected = Signal(str)
+    refreshRequested = Signal()
+
+    COLUMNS = (
+        "资源",
+        "连接状态",
+        "CPU",
+        "内存",
+        "运行 / 等待",
+        "计算目录",
+        "更新时间",
+    )
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._queue_count = 0
+        self._resources: dict[str, dict] = {}
+        self._selected_resource_id = "local"
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        layout.setSpacing(8)
 
         header = QtWidgets.QHBoxLayout()
-        header.addWidget(_section_title("计算资源拓扑"))
+        header.addWidget(_section_title("计算资源"))
+        self.queue_summary_label = QtWidgets.QLabel("队列作业：0")
+        self.queue_summary_label.setObjectName("hint")
+        header.addWidget(self.queue_summary_label)
         header.addStretch(1)
-        self.topology_view_btn = QtWidgets.QPushButton("拓扑")
-        self.topology_view_btn.setObjectName("segmentedSelected")
-        self.list_view_btn = QtWidgets.QPushButton("列表")
-        self.list_view_btn.setObjectName("segmented")
+        self.refresh_btn = QtWidgets.QPushButton("刷新")
+        self.refresh_btn.setObjectName("light")
         self.server_filter = WorkbenchComboBox()
-        self.server_filter.addItems(["全部服务器", "在线服务器", "需处理"])
-        header.addWidget(self.topology_view_btn)
-        header.addWidget(self.list_view_btn)
+        self.server_filter.addItems(["全部资源", "在线", "未连接"])
+        header.addWidget(self.refresh_btn)
         header.addWidget(self.server_filter)
         layout.addLayout(header)
 
-        local_cpu_total = os.cpu_count() or 1
-        local_cpu_percent = int(psutil.cpu_percent(interval=None))
-        memory = psutil.virtual_memory()
-        memory_total_gb = max(1, int(round(memory.total / (1024**3))))
-        memory_used_gb = max(0, int(round(memory.used / (1024**3))))
-
-        topology_scroll = QtWidgets.QScrollArea()
-        topology_scroll.setObjectName("topologyScroll")
-        topology_scroll.setWidgetResizable(True)
-        topology_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        topology_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        topology_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-
-        topology_content = QtWidgets.QWidget()
-        topology_content.setObjectName("topologyContent")
-        topology_row = QtWidgets.QHBoxLayout(topology_content)
-        topology_row.setContentsMargins(8, 6, 8, 6)
-        topology_row.setSpacing(10)
-
-        hub, hub_layout = _card("schedulerHub")
-        hub.setFixedWidth(156)
-        hub_title = QtWidgets.QLabel("Scheduler Core")
-        hub_title.setObjectName("hubTitle")
-        hub_layout.addWidget(hub_title)
-        self.hub_status = QtWidgets.QLabel("● 心跳正常")
-        self.hub_status.setObjectName("hubStatus")
-        hub_layout.addWidget(self.hub_status)
-        self.hub_queue = QtWidgets.QLabel("队列 0")
-        self.hub_queue.setObjectName("hubQueue")
-        hub_layout.addWidget(self.hub_queue)
-        hub_layout.addStretch(1)
-        topology_row.addWidget(hub)
-
-        arrow = QtWidgets.QLabel("⟶")
-        arrow.setObjectName("topologyArrow")
-        topology_row.addWidget(arrow)
-
-        self.local_node = ResourceNodeCard(
-            "local",
-            "本机工作站",
-            "Windows · 本地执行",
-            status="在线",
-            cpu_text=f"{max(1, local_cpu_total // 2)} / {local_cpu_total}",
-            cpu_percent=local_cpu_percent,
-            memory_text=f"{memory_used_gb} / {memory_total_gb} GB",
-            memory_percent=int(memory.percent),
-            path_text=os.getcwd(),
-            job_text="当前无本地活动作业",
+        self.resource_table = QtWidgets.QTableWidget(0, len(self.COLUMNS))
+        self.resource_table.setObjectName("resourceTable")
+        self.resource_table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.resource_table.setSelectionBehavior(
+            QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
         )
-        self.compute_01_node = ResourceNodeCard(
-            "remote-01",
-            "远程节点 1",
-            "Windows Server · SSH",
-            status="未连接",
-            cpu_text="未获取",
-            cpu_percent=0,
-            memory_text="未获取",
-            memory_percent=0,
-            path_text="尚未获取计算根目录",
-            job_text="连接服务器后显示真实作业与资源",
+        self.resource_table.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
         )
-        self.compute_02_node = ResourceNodeCard(
-            "remote-02",
-            "远程节点 2",
-            "Windows Server · SSH",
-            status="未配置",
-            cpu_text="未获取",
-            cpu_percent=0,
-            memory_text="未获取",
-            memory_percent=0,
-            path_text="尚未配置服务器",
-            job_text="无远程资源快照",
+        self.resource_table.setEditTriggers(
+            QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
         )
-        for node in (self.local_node, self.compute_01_node, self.compute_02_node):
-            node.selected.connect(self.nodeSelected)
-            topology_row.addWidget(node)
-        topology_row.addStretch(1)
-        topology_scroll.setWidget(topology_content)
-        layout.addWidget(topology_scroll, 1)
+        self.resource_table.setAlternatingRowColors(True)
+        self.resource_table.setShowGrid(False)
+        self.resource_table.verticalHeader().setVisible(False)
+        self.resource_table.verticalHeader().setDefaultSectionSize(32)
+        resource_header = self.resource_table.horizontalHeader()
+        resource_header.setStretchLastSection(False)
+        resource_header.setSectionResizeMode(
+            QtWidgets.QHeaderView.ResizeMode.ResizeToContents
+        )
+        resource_header.setSectionResizeMode(
+            5,
+            QtWidgets.QHeaderView.ResizeMode.Stretch,
+        )
+        layout.addWidget(self.resource_table, 1)
 
-        route_row = QtWidgets.QHBoxLayout()
-        route_row.setSpacing(10)
-        sftp_card, sftp_layout = _card("routeCard")
-        sftp_title = QtWidgets.QLabel("SFTP 暂存区")
-        sftp_title.setObjectName("routeTitle")
-        sftp_layout.addWidget(sftp_title)
-        sftp_layout.addWidget(QtWidgets.QLabel(".part 断点续传 · SHA256 校验"))
-        self.transfer_status_label = QtWidgets.QLabel("当前无传输任务")
-        self.transfer_status_label.setObjectName("routeStatus")
-        sftp_layout.addWidget(self.transfer_status_label)
-        self.transfer_bar = QtWidgets.QProgressBar()
-        self.transfer_bar.setRange(0, 100)
-        self.transfer_bar.setValue(0)
-        self.transfer_bar.setTextVisible(False)
-        sftp_layout.addWidget(self.transfer_bar)
-        route_row.addWidget(sftp_card, 1)
-
-        merge_card, merge_layout = _card("mergeRouteCard")
-        merge_title = QtWidgets.QLabel("ODB 合并器")
-        merge_title.setObjectName("routeTitle")
-        merge_layout.addWidget(merge_title)
-        merge_layout.addWidget(QtWidgets.QLabel("history · 服务器端 · 只读验证"))
-        merge_flow = QtWidgets.QLabel(
-            "当前无正在执行的 ODB 合并任务"
+        details = QtWidgets.QGroupBox("所选资源详情")
+        detail_layout = QtWidgets.QGridLayout(details)
+        detail_layout.setColumnStretch(1, 1)
+        self.detail_name = QtWidgets.QLabel()
+        self.detail_status = QtWidgets.QLabel()
+        self.detail_cpu = QtWidgets.QLabel()
+        self.detail_memory = QtWidgets.QLabel()
+        self.detail_queue = QtWidgets.QLabel()
+        self.detail_path = QtWidgets.QLabel()
+        self.detail_path.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        merge_flow.setObjectName("mergeFlow")
-        merge_layout.addWidget(merge_flow)
-        route_row.addWidget(merge_card, 1)
-        layout.addLayout(route_row)
+        self.detail_jobs = QtWidgets.QLabel()
+        self.detail_jobs.setWordWrap(True)
+        for row, (label, value) in enumerate(
+            (
+                ("资源", self.detail_name),
+                ("连接状态", self.detail_status),
+                ("CPU", self.detail_cpu),
+                ("内存", self.detail_memory),
+                ("运行 / 等待", self.detail_queue),
+                ("计算目录", self.detail_path),
+                ("活动作业", self.detail_jobs),
+            )
+        ):
+            detail_layout.addWidget(QtWidgets.QLabel(label), row, 0)
+            detail_layout.addWidget(value, row, 1)
+        layout.addWidget(details)
 
-        rule = QtWidgets.QLabel(
-            "路径规则：源 INP 在 SSD 内原位计算；不在 SSD 时复制到临时目录，"
-            "完成后归档回源文件目录。"
-        )
-        rule.setObjectName("topologyRule")
-        rule.setWordWrap(True)
-        layout.addWidget(rule)
+        self.refresh_btn.clicked.connect(self._refresh_now)
+        self.server_filter.currentTextChanged.connect(self._apply_filter)
+        self.resource_table.cellClicked.connect(self._on_resource_clicked)
+        self.refresh_local_resource()
 
     def set_queue_count(self, count: int) -> None:
-        self.hub_queue.setText(f"队列 {max(0, count)}")
+        self._queue_count = max(0, count)
+        self.queue_summary_label.setText(f"队列作业：{self._queue_count}")
+        local = self._resources.get("local")
+        if local is not None:
+            local["waiting_jobs"] = max(
+                0,
+                self._queue_count - len(local["active_jobs"]),
+            )
+            self._rebuild_table()
+
+    def _refresh_now(self) -> None:
+        self.refresh_local_resource()
+        self.refreshRequested.emit()
 
     def refresh_local_resource(
         self,
@@ -322,34 +182,42 @@ class ClusterTopologyWidget(QtWidgets.QWidget):
             memory_used_bytes = int(memory.used)
             memory_total_bytes = int(memory.total)
             memory_percent = float(memory.percent)
-        self.local_node.update_resource(
-            status="在线",
-            cpu_text=f"{busy_cpus} / {logical_cpus} 线程",
-            cpu_percent=cpu_percent,
-            memory_text=(
+        active_jobs = tuple(
+            line.strip()
+            for line in active_job_text.splitlines()
+            if line.strip()
+        )
+        self._resources["local"] = {
+            "resource_id": "local",
+            "name": "本机",
+            "status": "在线",
+            "cpu": f"{busy_cpus} / {logical_cpus} 线程（{cpu_percent}%）",
+            "memory": (
                 f"{memory_used_bytes / (1024**3):.1f} / "
                 f"{memory_total_bytes / (1024**3):.1f} GB"
+                f"（{round(memory_percent)}%）"
             ),
-            memory_percent=round(memory_percent),
-            path_text=work_dir or os.getcwd(),
-            job_text=active_job_text or "当前无本地活动作业",
-        )
+            "running_jobs": len(active_jobs),
+            "waiting_jobs": max(0, self._queue_count - len(active_jobs)),
+            "compute_root": work_dir or os.getcwd(),
+            "active_jobs": active_jobs,
+            "updated_at": QtCore.QDateTime.currentDateTime().toString(
+                "yyyy-MM-dd HH:mm:ss"
+            ),
+        }
+        self._rebuild_table()
 
     def apply_remote_resource_snapshot(self, snapshot: dict) -> None:
-        slot = int(snapshot.get("slot", 1) or 1)
-        node = self.compute_02_node if slot == 2 else self.compute_01_node
-        profile_name = str(snapshot.get("profile_name") or f"远程节点 {slot}")
-        node.node_id = profile_name
-        title_labels = node.findChildren(QtWidgets.QLabel, "nodeTitle")
-        if title_labels:
-            title_labels[0].setText(profile_name)
+        profile_name = str(snapshot.get("profile_name") or "").strip()
+        if not profile_name:
+            return
         connected = bool(snapshot.get("connected", False))
         cpu_used = snapshot.get("cpu_used")
         cpu_total = snapshot.get("cpu_total")
         memory_used = snapshot.get("memory_used_gb")
         memory_total = snapshot.get("memory_total_gb")
         cpu_text = (
-            f"{cpu_used} / {cpu_total}"
+            f"{cpu_used} / {cpu_total} 线程"
             if cpu_used is not None and cpu_total is not None
             else "未获取"
         )
@@ -358,34 +226,110 @@ class ClusterTopologyWidget(QtWidgets.QWidget):
             if memory_used is not None and memory_total is not None
             else "未获取"
         )
-        cpu_percent = (
-            round(float(cpu_used) / float(cpu_total) * 100)
-            if cpu_used is not None and cpu_total
-            else 0
-        )
-        memory_percent = (
-            round(float(memory_used) / float(memory_total) * 100)
-            if memory_used is not None and memory_total
-            else 0
-        )
-        active_jobs = snapshot.get("active_jobs") or ()
-        node.update_resource(
-            status="在线" if connected else "未连接",
-            cpu_text=cpu_text,
-            cpu_percent=cpu_percent,
-            memory_text=memory_text,
-            memory_percent=memory_percent,
-            path_text=str(snapshot.get("compute_root") or "尚未获取计算根目录"),
-            job_text=(
-                "\n".join(str(job) for job in active_jobs[:3])
-                if active_jobs
-                else ("当前无远程活动作业" if connected else "连接后获取真实作业")
+        active_jobs = tuple(str(job) for job in snapshot.get("active_jobs") or ())
+        self._resources[profile_name] = {
+            "resource_id": profile_name,
+            "name": profile_name,
+            "status": "在线" if connected else "未连接",
+            "cpu": cpu_text,
+            "memory": memory_text,
+            "running_jobs": len(active_jobs),
+            "waiting_jobs": int(snapshot.get("waiting_jobs", 0) or 0),
+            "compute_root": str(snapshot.get("compute_root") or "未获取"),
+            "active_jobs": active_jobs,
+            "updated_at": str(
+                snapshot.get("updated_at")
+                or QtCore.QDateTime.currentDateTime().toString(
+                    "yyyy-MM-dd HH:mm:ss"
+                )
             ),
+        }
+        self._rebuild_table()
+
+    def _resource_rows(self) -> list[dict]:
+        return sorted(
+            self._resources.values(),
+            key=lambda resource: (
+                resource["resource_id"] != "local",
+                resource["name"].lower(),
+            ),
+        )
+
+    def _rebuild_table(self) -> None:
+        rows = self._resource_rows()
+        self.resource_table.blockSignals(True)
+        self.resource_table.setRowCount(len(rows))
+        selected_row = 0
+        for row, resource in enumerate(rows):
+            values = (
+                resource["name"],
+                resource["status"],
+                resource["cpu"],
+                resource["memory"],
+                f"{resource['running_jobs']} / {resource['waiting_jobs']}",
+                resource["compute_root"],
+                resource["updated_at"],
+            )
+            for column, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(
+                        QtCore.Qt.ItemDataRole.UserRole,
+                        resource["resource_id"],
+                    )
+                item.setToolTip(str(value))
+                self.resource_table.setItem(row, column, item)
+            if resource["resource_id"] == self._selected_resource_id:
+                selected_row = row
+        if rows:
+            self.resource_table.selectRow(selected_row)
+            self._show_resource_details(rows[selected_row])
+        self.resource_table.blockSignals(False)
+        self._apply_filter()
+
+    def _apply_filter(self) -> None:
+        selected_filter = self.server_filter.currentText()
+        for row in range(self.resource_table.rowCount()):
+            status_item = self.resource_table.item(row, 1)
+            status = status_item.text() if status_item is not None else ""
+            hidden = (
+                selected_filter == "在线"
+                and status != "在线"
+                or selected_filter == "未连接"
+                and status != "未连接"
+            )
+            self.resource_table.setRowHidden(row, hidden)
+
+    def _on_resource_clicked(self, row: int, _column: int) -> None:
+        item = self.resource_table.item(row, 0)
+        if item is None:
+            return
+        resource_id = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+        resource = self._resources.get(resource_id)
+        if resource is None:
+            return
+        self._selected_resource_id = resource_id
+        self._show_resource_details(resource)
+        self.nodeSelected.emit(resource_id)
+
+    def _show_resource_details(self, resource: dict) -> None:
+        self.detail_name.setText(str(resource["name"]))
+        self.detail_status.setText(str(resource["status"]))
+        self.detail_cpu.setText(str(resource["cpu"]))
+        self.detail_memory.setText(str(resource["memory"]))
+        self.detail_queue.setText(
+            f"{resource['running_jobs']} / {resource['waiting_jobs']}"
+        )
+        self.detail_path.setText(str(resource["compute_root"]))
+        self.detail_path.setToolTip(str(resource["compute_root"]))
+        active_jobs = resource["active_jobs"]
+        self.detail_jobs.setText(
+            "、".join(active_jobs) if active_jobs else "无"
         )
 
 
 class RemoteMergeInspector(QtWidgets.QWidget):
-    """Persistent frontend-only SSH and ODB merge inspector."""
+    """Persistent SSH and ODB merge inspector."""
 
     def __init__(self, bridge: RemoteFrontendBridge, parent=None) -> None:
         super().__init__(parent)
@@ -645,6 +589,17 @@ class SubmissionWizardDialog(QtWidgets.QDialog):
         self.allowed_roots_edit.setPlaceholderText("多个根目录用分号分隔")
         self.remote_path_edit = QtWidgets.QLineEdit()
         self.remote_path_edit.setPlaceholderText("选择服务器现有 INP 时填写")
+        remote_path_row = QtWidgets.QWidget()
+        remote_path_row.setObjectName("formFieldRow")
+        remote_path_layout = QtWidgets.QHBoxLayout(remote_path_row)
+        remote_path_layout.setContentsMargins(0, 0, 0, 0)
+        remote_path_layout.setSpacing(5)
+        remote_path_layout.addWidget(self.remote_path_edit, 1)
+        self.browse_remote_btn = configure_path_picker_button(
+            QtWidgets.QPushButton(),
+            "浏览服务器允许目录",
+        )
+        remote_path_layout.addWidget(self.browse_remote_btn)
         form.addRow("服务器", self.server_combo)
         form.addRow("主机", self.host_edit)
         form.addRow("用户名", self.username_edit)
@@ -653,15 +608,13 @@ class SubmissionWizardDialog(QtWidgets.QDialog):
         form.addRow("Abaqus 命令", self.abaqus_command_edit)
         form.addRow("SSD 计算根目录", self.compute_root_edit)
         form.addRow("允许根目录", self.allowed_roots_edit)
-        form.addRow("服务器 INP", self.remote_path_edit)
+        form.addRow("服务器 INP", remote_path_row)
         server_layout.addLayout(form)
         actions = QtWidgets.QHBoxLayout()
         self.test_connection_btn = QtWidgets.QPushButton("测试连接")
-        self.browse_remote_btn = QtWidgets.QPushButton("浏览允许目录")
-        self.connection_status_label = QtWidgets.QLabel("前端接口已预留，尚未连接后端")
+        self.connection_status_label = QtWidgets.QLabel("尚未连接服务器")
         self.connection_status_label.setObjectName("hint")
         actions.addWidget(self.test_connection_btn)
-        actions.addWidget(self.browse_remote_btn)
         actions.addWidget(self.connection_status_label, 1)
         server_layout.addLayout(actions)
         layout.addWidget(server_card, 1)
@@ -1047,7 +1000,7 @@ class SubmissionWizardDialog(QtWidgets.QDialog):
         self.draft_label.setText(f"{self.inferred_job_name()} · 未提交")
 
     def request_connection_test(self) -> None:
-        self.connection_status_label.setText("已发送测试请求，等待远程 Adapter")
+        self.connection_status_label.setText("请在服务器连接窗口中完成认证")
         self.bridge.testConnectionRequested.emit(self.build_server_profile())
 
     def request_remote_browse(self) -> None:
@@ -1072,6 +1025,5 @@ class SubmissionWizardDialog(QtWidgets.QDialog):
 __all__ = [
     "ClusterTopologyWidget",
     "RemoteMergeInspector",
-    "ResourceNodeCard",
     "SubmissionWizardDialog",
 ]

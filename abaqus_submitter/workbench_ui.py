@@ -18,6 +18,7 @@ from .ui_components import (
     ResourceProgressBar,
     SegmentedSpinBox,
     WorkbenchComboBox,
+    configure_path_picker_button,
 )
 
 
@@ -58,7 +59,7 @@ def _group(title: str) -> tuple[QtWidgets.QGroupBox, QtWidgets.QVBoxLayout]:
 
 
 class ProjectRemoteExplorer(QtWidgets.QFrame):
-    """Project files, jobs, merge plans, and allowed SSH roots."""
+    """Project files, jobs, and merge plans."""
 
     itemActivated = Signal(str)
     refreshRequested = Signal()
@@ -68,7 +69,6 @@ class ProjectRemoteExplorer(QtWidgets.QFrame):
         self.setObjectName("projectExplorer")
         self.setMinimumWidth(250)
         self.setMaximumWidth(330)
-        self._remote_snapshots: dict[str, dict] = {}
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -77,7 +77,7 @@ class ProjectRemoteExplorer(QtWidgets.QFrame):
         header.setObjectName("dockHeader")
         header_layout = QtWidgets.QHBoxLayout(header)
         header_layout.setContentsMargins(10, 7, 8, 7)
-        title = QtWidgets.QLabel("项目与远程资源")
+        title = QtWidgets.QLabel("项目")
         title.setObjectName("dockTitle")
         header_layout.addWidget(title)
         header_layout.addStretch(1)
@@ -189,11 +189,7 @@ class ProjectRemoteExplorer(QtWidgets.QFrame):
             merge_plans.addChild(QtWidgets.QTreeWidgetItem(["尚无重启动合并计划"]))
         project.addChildren([inputs, results, jobs, merge_plans])
 
-        servers = QtWidgets.QTreeWidgetItem(["SSH 服务器"])
-        self.server_root_item = servers
-        self.tree.addTopLevelItems([project, servers])
-        servers.setHidden(True)
-        self._rebuild_remote_tree()
+        self.tree.addTopLevelItem(project)
         self.tree.expandAll()
         self.resource_summary.refresh(
             queue_items,
@@ -202,50 +198,177 @@ class ProjectRemoteExplorer(QtWidgets.QFrame):
         )
 
     def apply_remote_snapshot(self, snapshot: dict) -> None:
-        profile_name = str(snapshot.get("profile_name") or "未命名服务器")
-        self._remote_snapshots[profile_name] = dict(snapshot)
-        self._rebuild_remote_tree()
+        self.resource_summary.apply_remote_snapshot(snapshot)
 
-    def _rebuild_remote_tree(self) -> None:
-        self.server_root_item.takeChildren()
-        if not self._remote_snapshots:
-            self.server_root_item.addChild(
-                QtWidgets.QTreeWidgetItem(["○ 尚未连接远程服务器"])
+
+class ResourceNodeSummaryCard(QtWidgets.QFrame):
+    """Readable, selectable node summary without button-like typography."""
+
+    clicked = Signal()
+
+    def __init__(self, resource_id: str, parent=None) -> None:
+        super().__init__(parent)
+        self.resource_id = resource_id
+        self._plain_lines = ("", "", "", "")
+        self.resource_rows: dict[
+            str,
+            tuple[ResourceProgressBar, QtWidgets.QLabel],
+        ] = {}
+        self.setObjectName("resourceNodeSummary")
+        self.setProperty("selected", False)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.TabFocus)
+        self.setToolTip("选择此计算节点并在右侧查看资源用量")
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(9, 5, 3, 6)
+        layout.setSpacing(3)
+        self.name_label = QtWidgets.QLabel()
+        self.name_label.setObjectName("resourceNodeName")
+        layout.addWidget(self.name_label)
+
+        metric_layout = QtWidgets.QGridLayout()
+        metric_layout.setContentsMargins(0, 0, 0, 0)
+        metric_layout.setHorizontalSpacing(5)
+        metric_layout.setVerticalSpacing(0)
+        metric_layout.setColumnStretch(1, 1)
+        for row, label_text in enumerate(("CPU", "内存", "作业")):
+            metric_row = row * 2
+            label = QtWidgets.QLabel()
+            label.setText(label_text)
+            label.setObjectName("resourceNodeMetricName")
+            label.setFixedWidth(28)
+            bar = ResourceProgressBar()
+            bar.setRange(0, 100)
+            detail = QtWidgets.QLabel("未获取")
+            detail.setObjectName("resourceNodeMetricValue")
+            detail.setAlignment(
+                QtCore.Qt.AlignmentFlag.AlignRight
+                | QtCore.Qt.AlignmentFlag.AlignVCenter
             )
-        for snapshot in self._remote_snapshots.values():
-            connected = bool(snapshot.get("connected", False))
-            profile_name = str(snapshot.get("profile_name") or "未命名服务器")
-            status_marker = "●" if connected else "○"
-            server_item = QtWidgets.QTreeWidgetItem(
-                [f"{status_marker} {profile_name}　{'已连接' if connected else '未连接'}"]
-            )
-            for root in snapshot.get("allowed_roots") or ():
-                server_item.addChild(QtWidgets.QTreeWidgetItem([str(root)]))
-            self.server_root_item.addChild(server_item)
-            server_item.setExpanded(True)
-        self.server_root_item.setExpanded(True)
+            metric_layout.addWidget(label, metric_row, 0)
+            metric_layout.addWidget(bar, metric_row, 1)
+            metric_layout.addWidget(detail, metric_row + 1, 1)
+            self.resource_rows[label_text] = (bar, detail)
+        layout.addLayout(metric_layout)
+
+    def set_resource(
+        self,
+        status_line: str,
+        metrics: tuple[
+            tuple[str, int, str],
+            tuple[str, int, str],
+            tuple[str, int, str],
+        ],
+    ) -> None:
+        self._plain_lines = (status_line,) + tuple(
+            f"{label}　{detail}" for label, _value, detail in metrics
+        )
+        marker_color = "#16a34a" if status_line.startswith("●") else "#94a3b8"
+        marker = status_line[:1]
+        status_text = status_line[1:].strip()
+        self.name_label.setText(
+            f'<span style="color:{marker_color}">{marker}</span> {status_text}'
+        )
+        for label, value, detail in metrics:
+            bar, detail_label = self.resource_rows[label]
+            bar.setValue(max(0, min(100, round(value))))
+            detail_label.setText(detail)
+        self.setAccessibleName("；".join(self._plain_lines))
+
+    def set_selected(self, selected: bool) -> None:
+        self.setProperty("selected", selected)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def text(self) -> str:
+        return "\n".join(self._plain_lines)
+
+    def click(self) -> None:
+        self.clicked.emit()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (
+            QtCore.Qt.Key.Key_Return,
+            QtCore.Qt.Key.Key_Enter,
+            QtCore.Qt.Key.Key_Space,
+        ):
+            self.clicked.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class ResourceSummaryWidget(QtWidgets.QFrame):
-    """Real local resource and scheduler summary."""
+    """Compact selector and live summary for local and remote resources."""
+
+    resourceSelected = Signal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("resourceSummary")
+        self._selected_resource_id = "local"
+        self._remote_snapshots: dict[str, dict] = {}
+        self._local_snapshot: LocalResourceSnapshot | None = None
+        self._queue_items: tuple[QueueItem, ...] = ()
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(9, 7, 9, 7)
         layout.setSpacing(3)
+
+        title_row = QtWidgets.QHBoxLayout()
+        title_row.setSpacing(6)
         title = QtWidgets.QLabel("资源总览")
         title.setObjectName("dockTitle")
-        layout.addWidget(title)
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        self.resource_selector = WorkbenchComboBox()
+        self.resource_selector.setObjectName("resourceSelector")
+        self.resource_selector.setToolTip("选择要查看的计算节点")
+        self.resource_selector.setMinimumWidth(170)
+        self.resource_selector.setMaximumWidth(200)
+        self.resource_selector.setFixedHeight(24)
+        self.resource_selector.addItem("本机", "local")
+        title_row.addWidget(self.resource_selector)
+        layout.addLayout(title_row)
+
+        self.resource_choices_widget = QtWidgets.QWidget()
+        self.resource_choices_widget.setObjectName("resourceChoices")
+        self.resource_choices_layout = QtWidgets.QVBoxLayout(
+            self.resource_choices_widget
+        )
+        self.resource_choices_layout.setContentsMargins(0, 2, 0, 2)
+        self.resource_choices_layout.setSpacing(4)
+        self.resource_choice_buttons: dict[str, ResourceNodeSummaryCard] = {}
+        layout.addWidget(self.resource_choices_widget)
+
+        self.overflow_resource_card = ResourceNodeSummaryCard("local")
+        self.overflow_resource_card.setCursor(
+            QtCore.Qt.CursorShape.ArrowCursor
+        )
+        self.overflow_resource_card.setFocusPolicy(
+            QtCore.Qt.FocusPolicy.NoFocus
+        )
+        layout.addWidget(self.overflow_resource_card)
+
+        # Compatibility labels retain the current summary text for queue/status
+        # consumers, but the visible presentation is progress-based.
+        self.status_label = QtWidgets.QLabel()
         self.cpu_label = QtWidgets.QLabel()
         self.memory_label = QtWidgets.QLabel()
         self.job_label = QtWidgets.QLabel()
-        self.scheduler_label = QtWidgets.QLabel()
+        layout.addWidget(self.status_label)
         layout.addWidget(self.cpu_label)
         layout.addWidget(self.memory_label)
         layout.addWidget(self.job_label)
-        layout.addWidget(self.scheduler_label)
+        self.resource_selector.currentIndexChanged.connect(
+            self._on_resource_selection_changed
+        )
+        self._rebuild_resource_choices()
         self.refresh((), scheduler_ready=False)
 
     def refresh(
@@ -255,14 +378,221 @@ class ResourceSummaryWidget(QtWidgets.QFrame):
         scheduler_ready: bool,
         resource_snapshot: LocalResourceSnapshot | None = None,
     ) -> None:
-        snapshot = resource_snapshot or capture_local_resource_snapshot()
+        self._local_snapshot = resource_snapshot or capture_local_resource_snapshot()
+        self._queue_items = tuple(queue_items)
+        self._refresh_selected_resource()
+        self._refresh_resource_choice_texts()
+
+    def apply_remote_snapshot(self, snapshot: dict) -> None:
+        profile_name = str(snapshot.get("profile_name") or "").strip()
+        if not profile_name:
+            return
+        self._remote_snapshots[profile_name] = dict(snapshot)
+        if self._find_resource_index(profile_name) < 0:
+            self.resource_selector.addItem(profile_name, profile_name)
+            self._rebuild_resource_choices()
+        else:
+            index = self._find_resource_index(profile_name)
+            self.resource_selector.setItemText(index, profile_name)
+        self._refresh_resource_choice_texts()
+        if self._selected_resource_id == profile_name:
+            self._refresh_selected_resource()
+
+    def select_resource(self, resource_id: str, *, emit: bool = False) -> bool:
+        normalized_id = str(resource_id or "local").strip() or "local"
+        index = self._find_resource_index(normalized_id)
+        if index < 0:
+            return False
+        self._selected_resource_id = normalized_id
+        previous = self.resource_selector.blockSignals(True)
+        self.resource_selector.setCurrentIndex(index)
+        self.resource_selector.blockSignals(previous)
+        self._sync_resource_choice_selection()
+        self._refresh_selected_resource()
+        self._refresh_resource_choice_texts()
+        if emit:
+            self.resourceSelected.emit(normalized_id)
+        return True
+
+    def _find_resource_index(self, resource_id: str) -> int:
+        for index in range(self.resource_selector.count()):
+            if str(self.resource_selector.itemData(index) or "") == resource_id:
+                return index
+        return -1
+
+    def _on_resource_selection_changed(self, index: int) -> None:
+        resource_id = str(self.resource_selector.itemData(index) or "local")
+        self._selected_resource_id = resource_id
+        self._sync_resource_choice_selection()
+        self._refresh_selected_resource()
+        self._refresh_resource_choice_texts()
+        self.resourceSelected.emit(resource_id)
+
+    def _rebuild_resource_choices(self) -> None:
+        while self.resource_choices_layout.count():
+            item = self.resource_choices_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.resource_choice_buttons.clear()
+
+        for index in range(self.resource_selector.count()):
+            resource_id = str(
+                self.resource_selector.itemData(index) or "local"
+            )
+            button = ResourceNodeSummaryCard(resource_id)
+            button.clicked.connect(
+                lambda selected_id=resource_id: self.select_resource(
+                    selected_id,
+                    emit=True,
+                )
+            )
+            self.resource_choices_layout.addWidget(button)
+            self.resource_choice_buttons[resource_id] = button
+
+        use_direct_list = self.resource_selector.count() <= 3
+        self.resource_choices_widget.setVisible(use_direct_list)
+        self.resource_selector.setVisible(not use_direct_list)
+        self.overflow_resource_card.setVisible(not use_direct_list)
+        for label in (
+            self.status_label,
+            self.cpu_label,
+            self.memory_label,
+            self.job_label,
+        ):
+            label.hide()
+        self._sync_resource_choice_selection()
+        self._refresh_resource_choice_texts()
+
+    def _sync_resource_choice_selection(self) -> None:
+        for resource_id, button in self.resource_choice_buttons.items():
+            button.set_selected(resource_id == self._selected_resource_id)
+
+    def _refresh_resource_choice_texts(self) -> None:
+        for resource_id, button in self.resource_choice_buttons.items():
+            button.set_resource(*self._resource_choice_metrics(resource_id))
+        self.overflow_resource_card.set_resource(
+            *self._resource_choice_metrics(self._selected_resource_id)
+        )
+
+    def _resource_choice_metrics(
+        self,
+        resource_id: str,
+    ) -> tuple[
+        str,
+        tuple[
+            tuple[str, int, str],
+            tuple[str, int, str],
+            tuple[str, int, str],
+        ],
+    ]:
+        if resource_id == "local":
+            snapshot = self._local_snapshot or capture_local_resource_snapshot()
+            logical_cpus = snapshot.logical_cpus
+            cpu_percent = snapshot.cpu_percent
+            busy_cpus = min(
+                logical_cpus,
+                round(logical_cpus * cpu_percent / 100),
+            )
+            used_gb = snapshot.memory_used_bytes / (1024**3)
+            total_gb = snapshot.memory_total_bytes / (1024**3)
+            running = sum(
+                1
+                for item in self._queue_items
+                if item.status in ACTIVE_STATUSES
+            )
+            total_jobs = len(self._queue_items)
+            job_percent = round(running / max(1, total_jobs) * 100)
+            return (
+                "● 本机 · 在线",
+                (
+                    (
+                        "CPU",
+                        round(cpu_percent),
+                        f"{busy_cpus} / {logical_cpus}",
+                    ),
+                    (
+                        "内存",
+                        round(snapshot.memory_percent),
+                        f"{used_gb:.1f} / {total_gb:.1f} GB",
+                    ),
+                    ("作业", job_percent, f"{running} / {total_jobs}"),
+                ),
+            )
+
+        snapshot = self._remote_snapshots.get(resource_id)
+        if snapshot is None or not snapshot.get("connected", False):
+            return (
+                f"○ {resource_id} · 未连接",
+                (
+                    ("CPU", 0, "未获取"),
+                    ("内存", 0, "未获取"),
+                    ("作业", 0, "未获取"),
+                ),
+            )
+        cpu_used = int(snapshot.get("cpu_used") or 0)
+        cpu_total = int(snapshot.get("cpu_total") or 0)
+        cpu_percent = float(snapshot.get("cpu_percent") or 0)
+        if not cpu_percent and cpu_total:
+            cpu_percent = cpu_used / cpu_total * 100
+        memory_used = float(snapshot.get("memory_used_gb") or 0)
+        memory_total = float(snapshot.get("memory_total_gb") or 0)
+        memory_percent = (
+            memory_used / memory_total * 100 if memory_total else 0
+        )
+        running = int(
+            snapshot.get("running_jobs")
+            or len(tuple(snapshot.get("active_jobs") or ()))
+        )
+        waiting = int(snapshot.get("waiting_jobs") or 0)
+        job_total = running + waiting
+        job_percent = round(running / max(1, job_total) * 100)
+        return (
+            f"● {resource_id} · 已连接",
+            (
+                (
+                    "CPU",
+                    round(cpu_percent),
+                    f"{cpu_used} / {cpu_total}" if cpu_total else "未获取",
+                ),
+                (
+                    "内存",
+                    round(memory_percent),
+                    (
+                        f"{memory_used:.1f} / {memory_total:.1f} GB"
+                        if memory_total
+                        else "未获取"
+                    ),
+                ),
+                ("作业", job_percent, f"{running} / {job_total}"),
+            ),
+        )
+
+    def _refresh_selected_resource(self) -> None:
+        if self._selected_resource_id == "local":
+            self._show_local_resource()
+            return
+        snapshot = self._remote_snapshots.get(self._selected_resource_id)
+        if snapshot is None:
+            self._show_unavailable_resource(self._selected_resource_id)
+            return
+        self._show_remote_resource(snapshot)
+
+    def _show_local_resource(self) -> None:
+        snapshot = self._local_snapshot or capture_local_resource_snapshot()
         logical_cpus = snapshot.logical_cpus
         cpu_percent = snapshot.cpu_percent
         busy_cpus = min(logical_cpus, round(logical_cpus * cpu_percent / 100))
         used_gb = snapshot.memory_used_bytes / (1024**3)
         total_gb = snapshot.memory_total_bytes / (1024**3)
-        running = sum(1 for item in queue_items if item.status in ACTIVE_STATUSES)
-        pending = sum(1 for item in queue_items if "等待" in str(item.status or ""))
+        running = sum(
+            1 for item in self._queue_items if item.status in ACTIVE_STATUSES
+        )
+        pending = sum(
+            1 for item in self._queue_items if "等待" in str(item.status or "")
+        )
+        self.status_label.setText("● 本机 · 在线")
+        self.status_label.setObjectName("successText")
         self.cpu_label.setText(
             f"CPU　{busy_cpus} / {logical_cpus} 线程（{cpu_percent:.0f}%）"
         )
@@ -270,18 +600,63 @@ class ResourceSummaryWidget(QtWidgets.QFrame):
             f"内存　{used_gb:.1f} / {total_gb:.1f} GB（{snapshot.memory_percent:.0f}%）"
         )
         self.job_label.setText(
-            f"队列　{len(queue_items)} 个 · 运行 {running} · 等待 {pending}"
+            f"作业　运行 {running} · 等待 {pending} · 共 {len(self._queue_items)}"
         )
-        self.scheduler_label.setText(
-            "● Scheduler Core 已初始化"
-            if scheduler_ready
-            else "○ Scheduler Core 未初始化"
+        self._refresh_status_style()
+
+    def _show_remote_resource(self, snapshot: dict) -> None:
+        profile_name = str(
+            snapshot.get("profile_name") or self._selected_resource_id
         )
-        self.scheduler_label.setObjectName(
-            "successText" if scheduler_ready else "warningText"
+        connected = bool(snapshot.get("connected", False))
+        if not connected:
+            self._show_unavailable_resource(profile_name)
+            return
+
+        cpu_used = int(snapshot.get("cpu_used") or 0)
+        cpu_total = int(snapshot.get("cpu_total") or 0)
+        cpu_percent = float(snapshot.get("cpu_percent") or 0)
+        if not cpu_percent and cpu_total:
+            cpu_percent = cpu_used / cpu_total * 100
+        memory_used = float(snapshot.get("memory_used_gb") or 0)
+        memory_total = float(snapshot.get("memory_total_gb") or 0)
+        memory_percent = (
+            memory_used / memory_total * 100 if memory_total else 0
         )
-        self.scheduler_label.style().unpolish(self.scheduler_label)
-        self.scheduler_label.style().polish(self.scheduler_label)
+        running = int(
+            snapshot.get("running_jobs")
+            or len(tuple(snapshot.get("active_jobs") or ()))
+        )
+        waiting = int(snapshot.get("waiting_jobs") or 0)
+        self.status_label.setText(f"● {profile_name} · 已连接")
+        self.status_label.setObjectName("successText")
+        self.cpu_label.setText(
+            f"CPU　{cpu_used} / {cpu_total} 线程（{cpu_percent:.0f}%）"
+            if cpu_total
+            else "CPU　未获取"
+        )
+        self.memory_label.setText(
+            f"内存　{memory_used:.1f} / {memory_total:.1f} GB"
+            f"（{memory_percent:.0f}%）"
+            if memory_total
+            else "内存　未获取"
+        )
+        self.job_label.setText(
+            f"作业　运行 {running} · 等待 {waiting} · 共 {running + waiting}"
+        )
+        self._refresh_status_style()
+
+    def _show_unavailable_resource(self, profile_name: str) -> None:
+        self.status_label.setText(f"○ {profile_name} · 未连接")
+        self.status_label.setObjectName("warningText")
+        self.cpu_label.setText("CPU　未获取")
+        self.memory_label.setText("内存　未获取")
+        self.job_label.setText("作业　未获取")
+        self._refresh_status_style()
+
+    def _refresh_status_style(self) -> None:
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
 
 
 class JobConfigurationWorkbench(QtWidgets.QWidget):
@@ -326,7 +701,7 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
         content_layout = QtWidgets.QVBoxLayout(content)
         content_layout.setContentsMargins(12, 10, 12, 12)
         content_layout.setSpacing(8)
-        title = QtWidgets.QLabel("作业配置与 ODB 合并")
+        title = QtWidgets.QLabel("单作业提交")
         title.setObjectName("workbenchPageTitle")
         content_layout.addWidget(title)
 
@@ -353,8 +728,10 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
         original_row_layout.setContentsMargins(0, 0, 0, 0)
         original_row_layout.setSpacing(5)
         original_row_layout.addWidget(self.oldjob_path_edit, 1)
-        self.choose_original_btn = QtWidgets.QPushButton("…")
-        self.choose_original_btn.setObjectName("compactPicker")
+        self.choose_original_btn = configure_path_picker_button(
+            QtWidgets.QPushButton(),
+            "选择依赖 ODB 文件",
+        )
         original_row_layout.addWidget(self.choose_original_btn)
         input_row = QtWidgets.QWidget()
         input_row.setObjectName("formFieldRow")
@@ -362,8 +739,10 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
         input_row_layout.setContentsMargins(0, 0, 0, 0)
         input_row_layout.setSpacing(5)
         input_row_layout.addWidget(self.input_path_edit, 1)
-        self.choose_input_btn = QtWidgets.QPushButton("…")
-        self.choose_input_btn.setObjectName("compactPicker")
+        self.choose_input_btn = configure_path_picker_button(
+            QtWidgets.QPushButton(),
+            "选择输入 INP 文件",
+        )
         input_row_layout.addWidget(self.choose_input_btn)
         fortran_row = QtWidgets.QWidget()
         fortran_row.setObjectName("formFieldRow")
@@ -371,8 +750,10 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
         fortran_row_layout.setContentsMargins(0, 0, 0, 0)
         fortran_row_layout.setSpacing(5)
         fortran_row_layout.addWidget(self.fortran_path_edit, 1)
-        self.choose_fortran_btn = QtWidgets.QPushButton("…")
-        self.choose_fortran_btn.setObjectName("compactPicker")
+        self.choose_fortran_btn = configure_path_picker_button(
+            QtWidgets.QPushButton(),
+            "选择 Fortran 用户子程序",
+        )
         fortran_row_layout.addWidget(self.choose_fortran_btn)
         self.execution_combo = WorkbenchComboBox()
         self.execution_combo.addItem("本机计算", ExecutionLocation.LOCAL)
@@ -390,13 +771,19 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
             if item is not None:
                 item.setEnabled(False)
                 item.setToolTip("远程执行 Adapter 尚未实现")
+        self.use_ssd_check = QtWidgets.QCheckBox("使用 SSD 目录计算")
+        self.use_ssd_check.setToolTip(
+            "勾选后才启用 SSD 工作目录和结果归档目录；"
+            "未勾选时作业在 INP 所在目录运行。"
+        )
+        self.use_ssd_check.setChecked(False)
         self.calculation_root_edit = QtWidgets.QLineEdit()
         self.calculation_root_edit.setPlaceholderText(
             "可选：将作业复制到本机 SSD 工作目录计算"
         )
         calculation_root_row = self._picker_row(
             self.calculation_root_edit,
-            "选择…",
+            "选择 SSD 工作目录",
             "calculationRootPicker",
         )
         self.choose_calculation_root_btn = calculation_root_row[1]
@@ -404,7 +791,7 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
         self.archive_root_edit.setPlaceholderText("可选：计算完成后归档结果")
         archive_root_row = self._picker_row(
             self.archive_root_edit,
-            "选择…",
+            "选择结果归档目录",
             "archiveRootPicker",
         )
         self.choose_archive_root_btn = archive_root_row[1]
@@ -413,8 +800,10 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
         input_form.addRow("依赖 ODB", original_row)
         input_form.addRow("用户子程序", fortran_row)
         input_form.addRow("执行策略", self.execution_combo)
+        input_form.addRow("", self.use_ssd_check)
         input_form.addRow("SSD 工作目录", calculation_root_row[0])
         input_form.addRow("结果归档目录", archive_root_row[0])
+        self._set_ssd_controls_enabled(False)
         input_layout.addLayout(input_form)
         self.path_decision_label = QtWidgets.QLabel(
             "尚未选择 INP，无法判定执行目录。"
@@ -439,6 +828,7 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
             QtCore.Qt.AlignmentFlag.AlignRight
             | QtCore.Qt.AlignmentFlag.AlignVCenter
         )
+        self.server_form = server_form
         self.server_combo = WorkbenchComboBox()
         self.server_combo.addItem("尚未连接服务器")
         self.host_edit = QtWidgets.QLineEdit()
@@ -456,25 +846,58 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
         self.allowed_roots_edit = QtWidgets.QLineEdit()
         self.allowed_roots_edit.setPlaceholderText("多个允许目录用分号分隔")
         self.cpu_spin = SegmentedSpinBox()
+        self.cpu_spin.setObjectName("resourceCpuSpin")
         self.cpu_spin.setRange(0, MAX_CPUS)
         self.cpu_spin.setValue(max(1, DEFAULT_CPUS))
         self.cpu_spin.setSpecialValueText("全部")
         self.memory_value_edit = QtWidgets.QLineEdit("90")
-        self.memory_value_edit.setMaximumWidth(90)
+        self.memory_value_edit.setMinimumWidth(65)
+        self.memory_value_edit.setMaximumWidth(110)
         self.memory_unit_combo = WorkbenchComboBox()
         self.memory_unit_combo.addItems(MEMORY_OPTIONS)
         self.memory_unit_combo.setCurrentText("%")
-        memory_row = QtWidgets.QWidget()
-        memory_row.setObjectName("formFieldRow")
-        memory_layout = QtWidgets.QHBoxLayout(memory_row)
+        self.memory_unit_combo.setFixedWidth(68)
+        self.resource_row = QtWidgets.QWidget()
+        self.resource_row.setObjectName("formFieldRow")
+        resource_layout = QtWidgets.QHBoxLayout(self.resource_row)
+        resource_layout.setContentsMargins(0, 0, 0, 0)
+        resource_layout.setSpacing(0)
+
+        self.cpu_resource_group = QtWidgets.QWidget()
+        self.cpu_resource_group.setObjectName("resourceInlineGroup")
+        cpu_layout = QtWidgets.QHBoxLayout(self.cpu_resource_group)
+        cpu_layout.setContentsMargins(0, 0, 0, 0)
+        cpu_layout.setSpacing(6)
+        cpu_layout.addWidget(self.cpu_spin, 1)
+
+        self.memory_resource_group = QtWidgets.QWidget()
+        self.memory_resource_group.setObjectName("resourceInlineGroup")
+        memory_layout = QtWidgets.QHBoxLayout(self.memory_resource_group)
         memory_layout.setContentsMargins(0, 0, 0, 0)
-        memory_layout.setSpacing(5)
+        memory_layout.setSpacing(6)
+        self.memory_label = QtWidgets.QLabel("内存")
+        memory_layout.addWidget(self.memory_label)
         memory_layout.addWidget(self.memory_value_edit, 1)
-        memory_layout.addWidget(self.memory_unit_combo)
+        memory_layout.addWidget(self.memory_unit_combo, 1)
+
+        self.priority_resource_group = QtWidgets.QWidget()
+        self.priority_resource_group.setObjectName("resourceInlineGroup")
+        priority_layout = QtWidgets.QHBoxLayout(self.priority_resource_group)
+        priority_layout.setContentsMargins(0, 0, 0, 0)
+        priority_layout.setSpacing(6)
+        priority_layout.addWidget(QtWidgets.QLabel("优先级"))
         self.priority_combo = WorkbenchComboBox()
         self.priority_combo.addItem("普通", 0)
         self.priority_combo.addItem("高", 10)
         self.priority_combo.addItem("低", -10)
+        self.priority_combo.setFixedWidth(170)
+        priority_layout.addWidget(self.priority_combo, 1)
+
+        resource_layout.addWidget(self.cpu_resource_group)
+        resource_layout.addSpacing(18)
+        resource_layout.addWidget(self.memory_resource_group)
+        resource_layout.addStretch(1)
+        resource_layout.addWidget(self.priority_resource_group)
         server_form.addRow("服务器", self.server_combo)
         server_form.addRow("主机", self.host_edit)
         server_form.addRow("用户名", self.username_edit)
@@ -483,9 +906,7 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
         server_form.addRow("Abaqus 命令", self.abaqus_command_edit)
         server_form.addRow("SSD 计算根目录", self.compute_root_edit)
         server_form.addRow("允许目录", self.allowed_roots_edit)
-        server_form.addRow("CPU", self.cpu_spin)
-        server_form.addRow("内存", memory_row)
-        server_form.addRow("优先级", self.priority_combo)
+        server_form.addRow("CPU", self.resource_row)
         for remote_widget in (
             self.server_combo,
             self.host_edit,
@@ -545,19 +966,19 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
         self.merge_output_edit.setPlaceholderText("选择结果保存位置，文件名以 _joined.odb 结尾")
         original_merge_row = self._picker_row(
             self.merge_original_edit,
-            "选择…",
+            "选择原始 ODB 文件",
             "mergeOriginalPicker",
         )
         self.choose_merge_original_btn = original_merge_row[1]
         restart_merge_row = self._picker_row(
             self.merge_restart_edit,
-            "选择…",
+            "选择重启动 ODB 文件",
             "mergeRestartPicker",
         )
         self.choose_merge_restart_btn = restart_merge_row[1]
         output_merge_row = self._picker_row(
             self.merge_output_edit,
-            "保存到…",
+            "选择合并结果保存位置",
             "mergeOutputPicker",
         )
         self.choose_merge_output_btn = output_merge_row[1]
@@ -615,7 +1036,9 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
         self.merge_status_label.setObjectName("hint")
         self.merge_status_label.setWordWrap(True)
         merge_layout.addWidget(self.merge_status_label)
-        content_layout.addWidget(merge_group)
+        self.odb_merge_group = merge_group
+        self.odb_merge_group.setParent(self)
+        self.odb_merge_group.hide()
         content_layout.addWidget(input_group)
         content_layout.addWidget(server_group)
         content_layout.addWidget(run_group)
@@ -627,7 +1050,7 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
     @staticmethod
     def _picker_row(
         edit: QtWidgets.QLineEdit,
-        button_text: str,
+        button_tooltip: str,
         button_name: str,
     ) -> tuple[QtWidgets.QWidget, QtWidgets.QPushButton]:
         container = QtWidgets.QWidget()
@@ -636,8 +1059,11 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(5)
         layout.addWidget(edit, 1)
-        button = QtWidgets.QPushButton(button_text)
-        button.setObjectName(button_name)
+        button = configure_path_picker_button(
+            QtWidgets.QPushButton(),
+            button_tooltip,
+        )
+        button.setProperty("pathPickerRole", button_name)
         layout.addWidget(button)
         return container, button
 
@@ -681,6 +1107,7 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
         }
 
     def local_job_draft(self) -> LocalJobDraft:
+        use_ssd_calculation = self.use_ssd_check.isChecked()
         return LocalJobDraft(
             inp_file=self.input_path_edit.text().strip(),
             job_name=self.job_name_edit.text().strip(),
@@ -695,8 +1122,17 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
             abaqus_command=self.abaqus_command_edit.text().strip(),
             priority=int(self.priority_combo.currentData() or 0),
             max_parallel=self.max_parallel_spin.value(),
-            calculation_root_dir=self.calculation_root_edit.text().strip(),
-            archive_dir=self.archive_root_edit.text().strip(),
+            use_ssd_calculation=use_ssd_calculation,
+            calculation_root_dir=(
+                self.calculation_root_edit.text().strip()
+                if use_ssd_calculation
+                else ""
+            ),
+            archive_dir=(
+                self.archive_root_edit.text().strip()
+                if use_ssd_calculation
+                else ""
+            ),
         )
 
     def export_settings(self) -> dict[str, object]:
@@ -715,8 +1151,9 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
             "abaqus_command": draft.abaqus_command,
             "priority": draft.priority,
             "max_parallel": draft.max_parallel,
-            "calculation_root_dir": draft.calculation_root_dir,
-            "archive_dir": draft.archive_dir,
+            "use_ssd_calculation": self.use_ssd_check.isChecked(),
+            "calculation_root_dir": self.calculation_root_edit.text().strip(),
+            "archive_dir": self.archive_root_edit.text().strip(),
             "merge_include_history": self.history_check.isChecked(),
             "merge_compress_result": self.compress_check.isChecked(),
             "merge_copy_original": self.copy_original_check.isChecked(),
@@ -755,6 +1192,7 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
                 (self.interactive_check, "interactive", False),
                 (self.datacheck_check, "datacheck", False),
                 (self.notify_check, "notify", True),
+                (self.use_ssd_check, "use_ssd_calculation", False),
                 (self.history_check, "merge_include_history", True),
                 (self.compress_check, "merge_compress_result", False),
                 (self.copy_original_check, "merge_copy_original", False),
@@ -774,6 +1212,7 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
             pass
         finally:
             self._syncing = False
+        self._set_ssd_controls_enabled(self.use_ssd_check.isChecked())
         self.sync_to_wizard()
 
     @staticmethod
@@ -886,6 +1325,15 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
     def workbench_focus(self) -> None:
         self.input_path_edit.setFocus(QtCore.Qt.FocusReason.OtherFocusReason)
 
+    def _set_ssd_controls_enabled(self, enabled: bool) -> None:
+        for widget in (
+            self.calculation_root_edit,
+            self.choose_calculation_root_btn,
+            self.archive_root_edit,
+            self.choose_archive_root_btn,
+        ):
+            widget.setEnabled(enabled)
+
     def _connect_signals(self) -> None:
         for widget, signal_name in (
             (self.job_name_edit, "textChanged"),
@@ -917,11 +1365,13 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
             self.interactive_check,
             self.datacheck_check,
             self.notify_check,
+            self.use_ssd_check,
             self.history_check,
             self.compress_check,
             self.copy_original_check,
         ):
             checkbox.toggled.connect(self.sync_to_wizard)
+        self.use_ssd_check.toggled.connect(self._set_ssd_controls_enabled)
         for edit in (
             self.merge_original_edit,
             self.merge_restart_edit,
@@ -1025,8 +1475,17 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
                 decision = "尚未选择 INP，无法判定执行目录。"
                 archive_path = ""
             elif location == ExecutionLocation.LOCAL:
-                calculation_root = self.calculation_root_edit.text().strip()
-                archive_root = self.archive_root_edit.text().strip()
+                use_ssd_calculation = self.use_ssd_check.isChecked()
+                calculation_root = (
+                    self.calculation_root_edit.text().strip()
+                    if use_ssd_calculation
+                    else ""
+                )
+                archive_root = (
+                    self.archive_root_edit.text().strip()
+                    if use_ssd_calculation
+                    else ""
+                )
                 job_name = (
                     self.job_name_edit.text().strip()
                     or PureWindowsPath(input_path.replace("/", "\\")).stem
@@ -1036,6 +1495,8 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
                         f"本机 SSD 计算：工作目录将在 "
                         f"{Path(calculation_root) / job_name} 下创建"
                     )
+                elif use_ssd_calculation:
+                    decision = "已启用 SSD 目录计算，请选择 SSD 工作目录。"
                 else:
                     decision = f"本机计算：工作目录为 {Path(input_path).parent}"
                 archive_path = (
@@ -1053,7 +1514,7 @@ class JobConfigurationWorkbench(QtWidgets.QWidget):
 
 
 class WorkbenchPropertiesPanel(QtWidgets.QFrame):
-    """Right-side properties, quotas, dependencies, and operations."""
+    """Right-side job properties, dependencies, and operations."""
 
     saveRequested = Signal()
     submitRequested = Signal()
@@ -1073,7 +1534,6 @@ class WorkbenchPropertiesPanel(QtWidgets.QFrame):
         title.setObjectName("dockTitle")
         header.addWidget(title)
         header.addStretch(1)
-        header.addWidget(QtWidgets.QLabel("×"))
         layout.addLayout(header)
         self.status_label = QtWidgets.QLabel("状态：　未选择作业")
         self.status_label.setObjectName("hint")
@@ -1084,25 +1544,6 @@ class WorkbenchPropertiesPanel(QtWidgets.QFrame):
         self.job_info.setWordWrap(True)
         info_layout.addWidget(self.job_info)
         layout.addWidget(info_group)
-
-        quota_group, quota_layout = _group("本机资源（实时）")
-        self.resource_rows: dict[str, tuple[QtWidgets.QProgressBar, QtWidgets.QLabel]] = {}
-        for label_text in ("CPU", "内存", "作业"):
-            row = QtWidgets.QHBoxLayout()
-            row.addWidget(QtWidgets.QLabel(label_text))
-            bar = ResourceProgressBar()
-            bar.setRange(0, 100)
-            bar.setValue(0)
-            bar.setTextVisible(False)
-            row.addWidget(bar, 1)
-            detail_label = QtWidgets.QLabel("未获取")
-            row.addWidget(detail_label)
-            quota_layout.addLayout(row)
-            self.resource_rows[label_text] = (bar, detail_label)
-        self.external_label = QtWidgets.QLabel("远程资源：未连接，未获取")
-        self.external_label.setObjectName("hint")
-        quota_layout.addWidget(self.external_label)
-        layout.addWidget(quota_group)
 
         dependencies, dependency_layout = _group("依赖关系")
         self.dependency_label = QtWidgets.QLabel("尚未选择作业")
@@ -1138,25 +1579,6 @@ class WorkbenchPropertiesPanel(QtWidgets.QFrame):
         selected_item: QueueItem | None = None,
         resource_snapshot: LocalResourceSnapshot | None = None,
     ) -> None:
-        snapshot = resource_snapshot or capture_local_resource_snapshot()
-        cpu_percent = max(0, min(100, round(snapshot.cpu_percent)))
-        logical_cpus = snapshot.logical_cpus
-        active_count = sum(1 for item in queue_items if item.status in ACTIVE_STATUSES)
-        max_jobs = max(1, len(queue_items))
-        job_percent = round(active_count / max_jobs * 100)
-        cpu_bar, cpu_detail = self.resource_rows["CPU"]
-        cpu_bar.setValue(cpu_percent)
-        cpu_detail.setText(f"{cpu_percent}% · {logical_cpus} 线程")
-        memory_bar, memory_detail = self.resource_rows["内存"]
-        memory_bar.setValue(round(snapshot.memory_percent))
-        memory_detail.setText(
-            f"{snapshot.memory_used_bytes / (1024**3):.1f} / "
-            f"{snapshot.memory_total_bytes / (1024**3):.1f} GB"
-        )
-        job_bar, job_detail = self.resource_rows["作业"]
-        job_bar.setValue(job_percent)
-        job_detail.setText(f"{active_count} / {len(queue_items)}")
-
         if selected_item is None:
             self.status_label.setText("状态：　未选择作业")
             self.status_label.setObjectName("hint")
@@ -1207,29 +1629,6 @@ class WorkbenchPropertiesPanel(QtWidgets.QFrame):
         )
         self.dependency_label.setText(f"前置作业：{original_job or '无'}")
         self.submit_btn.setEnabled(bool(input_path))
-
-    def apply_remote_snapshot(self, snapshot: dict) -> None:
-        if not snapshot.get("connected", False):
-            self.external_label.setText("远程资源：未连接，未获取")
-            self.external_label.setObjectName("hint")
-        else:
-            profile_name = str(snapshot.get("profile_name") or "远程服务器")
-            cpu_used = snapshot.get("cpu_used")
-            cpu_total = snapshot.get("cpu_total")
-            memory_used = snapshot.get("memory_used_gb")
-            memory_total = snapshot.get("memory_total_gb")
-            running_jobs = snapshot.get("running_jobs")
-            parts = [f"远程资源：{profile_name}"]
-            if cpu_used is not None and cpu_total is not None:
-                parts.append(f"CPU {cpu_used}/{cpu_total}")
-            if memory_used is not None and memory_total is not None:
-                parts.append(f"内存 {memory_used}/{memory_total} GB")
-            if running_jobs is not None:
-                parts.append(f"作业 {running_jobs}")
-            self.external_label.setText(" · ".join(parts))
-            self.external_label.setObjectName("successText")
-        self.external_label.style().unpolish(self.external_label)
-        self.external_label.style().polish(self.external_label)
 
 
 class WorkbenchLogDock(QtWidgets.QTabWidget):

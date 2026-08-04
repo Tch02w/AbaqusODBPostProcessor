@@ -1,11 +1,103 @@
 """Small reusable Qt UI components."""
 
-import os
 import time
 import unicodedata
 from collections.abc import Mapping
 
 from .qt_compat import QtCore, QtGui, QtWidgets, Signal
+
+
+class _RoundedPopupSurface(QtCore.QObject):
+    """Paint one antialiased popup surface with per-pixel transparency."""
+
+    RADIUS = 6.0
+
+    def __init__(self, widget: QtWidgets.QWidget) -> None:
+        super().__init__(widget)
+        self.widget = widget
+        widget.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        widget = getattr(self, "widget", None)
+        if widget is None:
+            return False
+        if (
+            watched is widget
+            and event.type() == QtCore.QEvent.Type.Paint
+        ):
+            painter = QtGui.QPainter(widget)
+            painter.setRenderHint(
+                QtGui.QPainter.RenderHint.Antialiasing,
+                True,
+            )
+            painter.setCompositionMode(
+                QtGui.QPainter.CompositionMode.CompositionMode_Source
+            )
+            painter.fillRect(
+                widget.rect(),
+                QtCore.Qt.GlobalColor.transparent,
+            )
+            painter.setCompositionMode(
+                QtGui.QPainter.CompositionMode.CompositionMode_SourceOver
+            )
+            painter.setPen(QtGui.QPen(QtGui.QColor("#94a3b8"), 1))
+            painter.setBrush(QtGui.QColor("#ffffff"))
+            painter.drawRoundedRect(
+                QtCore.QRectF(widget.rect()).adjusted(
+                    0.5,
+                    0.5,
+                    -0.5,
+                    -0.5,
+                ),
+                self.RADIUS,
+                self.RADIUS,
+            )
+            painter.end()
+        return super().eventFilter(watched, event)
+
+
+def _prepare_translucent_popup(widget: QtWidgets.QWidget) -> None:
+    """Enable antialiased per-pixel popup corners on Windows."""
+    widget.setWindowFlag(
+        QtCore.Qt.WindowType.NoDropShadowWindowHint,
+        True,
+    )
+    widget.setWindowFlag(
+        QtCore.Qt.WindowType.FramelessWindowHint,
+        True,
+    )
+    widget.setAttribute(
+        QtCore.Qt.WidgetAttribute.WA_TranslucentBackground,
+        True,
+    )
+    widget.setAutoFillBackground(False)
+    widget.clearMask()
+    surface = getattr(widget, "_rounded_popup_surface", None)
+    if surface is None:
+        surface = _RoundedPopupSurface(widget)
+        widget._rounded_popup_surface = surface
+
+
+def configure_path_picker_button(
+    button: QtWidgets.QPushButton,
+    tooltip: str,
+) -> QtWidgets.QPushButton:
+    """Apply the shared compact appearance and semantics for path pickers."""
+    button.setText("...")
+    button.setObjectName("pathPicker")
+    button.setProperty("pathPicker", True)
+    button.setToolTip(tooltip)
+    button.setAccessibleName(tooltip)
+    button.setFixedWidth(32)
+    button.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+    return button
+
+
+def configure_popup_menu(menu: QtWidgets.QMenu) -> QtWidgets.QMenu:
+    """Give application menus the same rounded, shadowless popup surface."""
+    menu.setObjectName("workbenchPopupMenu")
+    _prepare_translucent_popup(menu)
+    return menu
 
 
 def format_elapsed_seconds(elapsed_seconds: float) -> str:
@@ -216,6 +308,10 @@ class ResourceProgressBar(QtWidgets.QProgressBar):
             QtWidgets.QSizePolicy.Policy.Fixed,
         )
 
+    def minimumSizeHint(self) -> QtCore.QSize:
+        """Allow narrow resource grids to shrink without clipping values."""
+        return QtCore.QSize(self.BAR_HEIGHT, self.BAR_HEIGHT)
+
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         if self.maximum() <= self.minimum():
             super().paintEvent(event)
@@ -410,23 +506,23 @@ class WorkbenchComboBox(QtWidgets.QComboBox):
         view.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         view.setAttribute(
             QtCore.Qt.WidgetAttribute.WA_TranslucentBackground,
-            False,
-        )
-        view.setWindowFlag(
-            QtCore.Qt.WindowType.NoDropShadowWindowHint,
             True,
         )
+        popup = view.window()
+        popup.setObjectName("workbenchComboContainer")
+        popup.setStyleSheet("background: transparent; border: 0;")
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:
+        """Do not let page scrolling silently change the selected value."""
+        event.ignore()
 
     def showPopup(self) -> None:
         view = self.view()
-        view.setWindowFlag(
-            QtCore.Qt.WindowType.NoDropShadowWindowHint,
-            True,
-        )
         view.setAttribute(
             QtCore.Qt.WidgetAttribute.WA_TranslucentBackground,
-            False,
+            True,
         )
+        _prepare_translucent_popup(view.window())
         super().showPopup()
         QtCore.QTimer.singleShot(0, self._position_popup_below)
 
@@ -436,15 +532,11 @@ class WorkbenchComboBox(QtWidgets.QComboBox):
         if popup is None:
             return
 
-        popup.setWindowFlag(
-            QtCore.Qt.WindowType.NoDropShadowWindowHint,
-            True,
-        )
+        popup.setObjectName("workbenchComboContainer")
         popup.setAttribute(
             QtCore.Qt.WidgetAttribute.WA_TranslucentBackground,
-            False,
+            True,
         )
-        popup.clearMask()
 
         top_left = self.mapToGlobal(QtCore.QPoint(0, self.height()))
         screen = QtGui.QGuiApplication.screenAt(top_left) or self.screen()
@@ -469,6 +561,7 @@ class WorkbenchComboBox(QtWidgets.QComboBox):
             popup_width,
             content_height,
         )
+        popup.clearMask()
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         super().paintEvent(event)
@@ -501,8 +594,13 @@ class FilePickerRow(QtWidgets.QWidget):
         self._path = ""
         self.placeholder = placeholder
         self.label = QtWidgets.QLabel(label)
-        self.button = QtWidgets.QPushButton(placeholder)
-        self.button.setObjectName("filePicker")
+        self.path_edit = QtWidgets.QLineEdit()
+        self.path_edit.setReadOnly(True)
+        self.path_edit.setPlaceholderText(placeholder)
+        self.button = configure_path_picker_button(
+            QtWidgets.QPushButton(),
+            placeholder,
+        )
         self.button.setFixedHeight(30)
         self.setFixedHeight(34)
 
@@ -511,15 +609,14 @@ class FilePickerRow(QtWidgets.QWidget):
         layout.setSpacing(8)
         self.label.setFixedWidth(34)
         layout.addWidget(self.label)
-        layout.addWidget(self.button, 1)
+        layout.addWidget(self.path_edit, 1)
+        layout.addWidget(self.button)
 
     def text(self) -> str:
         return self._path
 
     def set_path(self, path: str) -> None:
         self._path = path.strip()
-        if self._path:
-            self.button.setText(os.path.basename(self._path))
-        else:
-            self.button.setText(self.placeholder)
+        self.path_edit.setText(self._path)
+        self.path_edit.setToolTip(self._path)
         self.pathChanged.emit(self._path)

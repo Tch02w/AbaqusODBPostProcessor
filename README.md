@@ -110,9 +110,11 @@ ODB 的基础缓存；运行当前组时重建该组预扫描缓存；运行全�
 组内选定帧统计。损伤变量从 0 到组内观测最大值；手动图例覆盖同时作用于静态云图
 和 GIF。
 
-每次后处理同时保留两套 PNG：`frames/`、`contours/` 是 Abaqus 直接输出且完全不
-改写的原图；`frames_transparent/`、`contours_transparent/` 是去除近白背景后的
-透明 PNG 副本。GIF 从未处理的完整帧生成，避免透明 GIF 调色板造成颜色或动画损失。
+“云图导出”提供“白底 PNG”和“透明底 PNG”两个复选框，默认同时勾选，至少保留
+一种输出。`frames/`、`contours/` 是 Abaqus 直接输出且完全不改写的白底原图；
+`frames_transparent/`、`contours_transparent/` 是去除近白背景后的透明 PNG 副本。
+GIF 始终先由未处理的完整帧生成，避免透明 GIF 调色板造成颜色或动画损失；如果只
+选择透明底 PNG，GIF 生成完成后会删除中间白底 PNG，不在结果目录中重复保留。
 
 “输出图像”提供横向、纵向和单位设置。默认 `1500×1000 pixel`；pixel 模式按
 输入比例创建当前屏幕可容纳的最大 Abaqus Viewport，再输出指定像素。切换为 mm
@@ -181,8 +183,8 @@ G:\Job\GJA_ODB\AbaqusODBPostProcessor_Results\
 │  └─ YYYYMMDD_HHMMSS\
 │     ├─ _AbaqusODBPostProcessor_ResultIndex.sqlite3
 │     └─ ODB名称\
-│        ├─ frames\、frames_transparent\、animations\
-│        └─ contours\、contours_transparent\
+│        ├─ frames\ / frames_transparent\（按勾选生成）、animations\
+│        └─ contours\ / contours_transparent\（按勾选生成）
 ├─ 未分组\
 ├─ _批次记录\
 └─ _历史测试\

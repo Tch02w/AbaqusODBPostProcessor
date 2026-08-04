@@ -146,11 +146,15 @@ def write_group_member_manifest(
             "shared_data_relative_path": relative_asset,
             "shared_data_absolute_path": str(asset_root),
             "group_dependent_contents": [
-                "frames",
-                "frames_transparent",
-                "animations",
-                "contours",
-                "contours_transparent",
+                name
+                for name in (
+                    "frames",
+                    "frames_transparent",
+                    "animations",
+                    "contours",
+                    "contours_transparent",
+                )
+                if (output_root / name).exists()
             ],
         },
     )

@@ -17,6 +17,8 @@
   "image_size_unit": "px",
   "image_width": 1500,
   "image_height": 1000,
+  "export_white_background_png": true,
+  "export_transparent_background_png": true,
   "axial_cut_count": 100,
   "pile_head_above_ground_mm": 500.0,
   "longitudinal_orientation_threshold": 0.95,

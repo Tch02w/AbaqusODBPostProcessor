@@ -278,3 +278,26 @@ def test_image_size_controls_support_pixel_and_mm(tmp_path: Path) -> None:
     assert saved["image_width"] == 397
     assert saved["image_height"] == 265
     window.close()
+
+
+def test_cloud_png_background_options_are_persistent_and_not_both_off(
+    tmp_path: Path,
+) -> None:
+    application()
+    window = MainWindow()
+    window.state_path = tmp_path / "state.json"
+    assert window.export_white_background_checkbox.isChecked()
+    assert window.export_transparent_background_checkbox.isChecked()
+
+    window.export_transparent_background_checkbox.setChecked(False)
+    saved = json.loads(window.state_path.read_text(encoding="utf-8"))
+    assert saved["export_white_background_png"] is True
+    assert saved["export_transparent_background_png"] is False
+
+    window.export_white_background_checkbox.setChecked(False)
+    assert not window.export_white_background_checkbox.isChecked()
+    assert window.export_transparent_background_checkbox.isChecked()
+    saved = json.loads(window.state_path.read_text(encoding="utf-8"))
+    assert saved["export_white_background_png"] is False
+    assert saved["export_transparent_background_png"] is True
+    window.close()

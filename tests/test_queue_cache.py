@@ -111,7 +111,9 @@ def test_sequential_groups_reuse_prescan_and_numeric_cache(
         batch_module, "finalize_numeric_output", fake_finalize_numeric
     )
     monkeypatch.setattr(
-        batch_module, "finalize_render_output", lambda *_args: None
+        batch_module,
+        "finalize_render_output",
+        lambda *_args, **_kwargs: None,
     )
 
     logs: list[str] = []

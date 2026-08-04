@@ -108,13 +108,37 @@ def finalize_numeric_output(output_dir: Path) -> dict:
     return manifest
 
 
-def finalize_render_output(output_dir: Path, fps: int = 5) -> dict:
+def finalize_render_output(
+    output_dir: Path,
+    fps: int = 5,
+    *,
+    export_white_background_png: bool = True,
+    export_transparent_background_png: bool = True,
+) -> dict:
     """Create assets whose appearance depends on comparison-group legends."""
 
+    if not export_white_background_png and not export_transparent_background_png:
+        raise ValueError("At least one PNG background output must be enabled")
+    white_png_count = count_render_pngs(output_dir, ("frames", "contours"))
+    transparent_png_count = (
+        build_transparent_backgrounds(output_dir)
+        if export_transparent_background_png
+        else 0
+    )
+    if not export_transparent_background_png:
+        remove_render_png_directories(
+            output_dir, ("frames_transparent", "contours_transparent")
+        )
+    animations = build_gifs(output_dir, fps)
+    if not export_white_background_png:
+        remove_render_png_directories(output_dir, ("frames", "contours"))
     manifest = {
-        "transparent_png_count": build_transparent_backgrounds(output_dir),
-        "original_pngs_preserved": True,
-        "animations": build_gifs(output_dir, fps),
+        "white_png_count": white_png_count if export_white_background_png else 0,
+        "transparent_png_count": transparent_png_count,
+        "original_pngs_preserved": bool(export_white_background_png),
+        "export_white_background_png": bool(export_white_background_png),
+        "export_transparent_background_png": bool(export_transparent_background_png),
+        "animations": animations,
     }
     (output_dir / "render_postprocess_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -123,11 +147,22 @@ def finalize_render_output(output_dir: Path, fps: int = 5) -> dict:
     return manifest
 
 
-def finalize_output(output_dir: Path, fps: int = 5) -> dict:
+def finalize_output(
+    output_dir: Path,
+    fps: int = 5,
+    *,
+    export_white_background_png: bool = True,
+    export_transparent_background_png: bool = True,
+) -> dict:
     """Compatibility wrapper for legacy result folders containing both parts."""
 
     numeric = finalize_numeric_output(output_dir)
-    render = finalize_render_output(output_dir, fps)
+    render = finalize_render_output(
+        output_dir,
+        fps,
+        export_white_background_png=export_white_background_png,
+        export_transparent_background_png=export_transparent_background_png,
+    )
     manifest = {**numeric, **render}
     (output_dir / "host_postprocess_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"

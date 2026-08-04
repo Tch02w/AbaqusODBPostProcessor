@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import csv, json, math, re
+import csv, json, math, re, shutil
 from collections import defaultdict
 from pathlib import Path
 
@@ -56,6 +56,30 @@ def build_transparent_backgrounds(output_dir: Path) -> int:
             Image.fromarray(rgba, "RGBA").save(target_path)
             count += 1
     return count
+
+
+def remove_render_png_directories(
+    output_dir: Path, folder_names: tuple[str, ...]
+) -> int:
+    """Remove selected generated PNG trees after dependent assets are built."""
+
+    removed = 0
+    for folder_name in folder_names:
+        target = output_dir / folder_name
+        if not target.is_dir():
+            continue
+        removed += sum(1 for path in target.rglob("*.png") if path.is_file())
+        shutil.rmtree(target)
+    return removed
+
+
+def count_render_pngs(output_dir: Path, folder_names: tuple[str, ...]) -> int:
+    return sum(
+        1
+        for folder_name in folder_names
+        for path in (output_dir / folder_name).rglob("*.png")
+        if path.is_file()
+    )
 
 
 def build_gifs(output_dir: Path, fps: int = 5) -> dict[str, int]:
@@ -572,17 +596,52 @@ def finalize_numeric_output(output_dir: Path) -> dict:
     return manifest
 
 
-def finalize_render_output(output_dir: Path, fps: int = 5) -> dict:
-    manifest = {"transparent_png_count": build_transparent_backgrounds(output_dir),
-        "original_pngs_preserved": True,
-        "animations": build_gifs(output_dir, fps)}
+def finalize_render_output(
+    output_dir: Path,
+    fps: int = 5,
+    *,
+    export_white_background_png: bool = True,
+    export_transparent_background_png: bool = True,
+) -> dict:
+    if not export_white_background_png and not export_transparent_background_png:
+        raise ValueError("At least one PNG background output must be enabled")
+    white_png_count = count_render_pngs(output_dir, ("frames", "contours"))
+    transparent_png_count = (
+        build_transparent_backgrounds(output_dir)
+        if export_transparent_background_png
+        else 0
+    )
+    if not export_transparent_background_png:
+        remove_render_png_directories(
+            output_dir, ("frames_transparent", "contours_transparent")
+        )
+    animations = build_gifs(output_dir, fps)
+    if not export_white_background_png:
+        remove_render_png_directories(output_dir, ("frames", "contours"))
+    manifest = {"white_png_count": white_png_count if export_white_background_png else 0,
+        "transparent_png_count": transparent_png_count,
+        "original_pngs_preserved": bool(export_white_background_png),
+        "export_white_background_png": bool(export_white_background_png),
+        "export_transparent_background_png": bool(export_transparent_background_png),
+        "animations": animations}
     (output_dir/"render_postprocess_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     hide_internal_result_json_files(output_dir)
     return manifest
 
 
-def finalize_output(output_dir: Path, fps: int = 5) -> dict:
-    manifest = {**finalize_numeric_output(output_dir), **finalize_render_output(output_dir, fps)}
+def finalize_output(
+    output_dir: Path,
+    fps: int = 5,
+    *,
+    export_white_background_png: bool = True,
+    export_transparent_background_png: bool = True,
+) -> dict:
+    manifest = {**finalize_numeric_output(output_dir), **finalize_render_output(
+        output_dir,
+        fps,
+        export_white_background_png=export_white_background_png,
+        export_transparent_background_png=export_transparent_background_png,
+    )}
     (output_dir/"host_postprocess_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     hide_internal_result_json_files(output_dir)
     return manifest

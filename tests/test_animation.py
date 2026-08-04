@@ -6,6 +6,7 @@ from abaqus_odb_postprocessor.postprocess_core import (
     build_gifs,
     build_transparent_backgrounds,
 )
+from abaqus_odb_postprocessor.postprocess import finalize_render_output
 
 
 def test_build_gif_contains_every_rendered_frame(tmp_path: Path) -> None:
@@ -42,3 +43,52 @@ def test_transparent_copy_does_not_modify_original_png(tmp_path: Path) -> None:
         rgba = transparent.convert("RGBA")
         assert rgba.getpixel((0, 0))[3] == 0
         assert rgba.getpixel((5, 4))[3] == 255
+
+
+def test_finalize_render_output_can_export_only_transparent_pngs(
+    tmp_path: Path,
+) -> None:
+    frame = tmp_path / "frames" / "PILE_U_MAG" / "0000.png"
+    contour = tmp_path / "contours" / "PILE_U_MAG_LAST.png"
+    frame.parent.mkdir(parents=True)
+    contour.parent.mkdir(parents=True)
+    Image.new("RGB", (12, 8), "white").save(frame)
+    Image.new("RGB", (12, 8), "white").save(contour)
+
+    manifest = finalize_render_output(
+        tmp_path,
+        export_white_background_png=False,
+        export_transparent_background_png=True,
+    )
+
+    assert not (tmp_path / "frames").exists()
+    assert not (tmp_path / "contours").exists()
+    assert (tmp_path / "frames_transparent" / "PILE_U_MAG" / "0000.png").is_file()
+    assert (tmp_path / "contours_transparent" / "PILE_U_MAG_LAST.png").is_file()
+    assert (tmp_path / "animations" / "PILE_U_MAG.gif").is_file()
+    assert manifest["original_pngs_preserved"] is False
+    assert manifest["white_png_count"] == 0
+    assert manifest["transparent_png_count"] == 2
+
+
+def test_finalize_render_output_can_export_only_white_pngs(tmp_path: Path) -> None:
+    frame = tmp_path / "frames" / "PILE_U_MAG" / "0000.png"
+    contour = tmp_path / "contours" / "PILE_U_MAG_LAST.png"
+    frame.parent.mkdir(parents=True)
+    contour.parent.mkdir(parents=True)
+    Image.new("RGB", (12, 8), "white").save(frame)
+    Image.new("RGB", (12, 8), "white").save(contour)
+
+    manifest = finalize_render_output(
+        tmp_path,
+        export_white_background_png=True,
+        export_transparent_background_png=False,
+    )
+
+    assert frame.is_file()
+    assert contour.is_file()
+    assert not (tmp_path / "frames_transparent").exists()
+    assert not (tmp_path / "contours_transparent").exists()
+    assert manifest["original_pngs_preserved"] is True
+    assert manifest["white_png_count"] == 2
+    assert manifest["transparent_png_count"] == 0

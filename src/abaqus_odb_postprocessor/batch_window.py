@@ -214,6 +214,23 @@ class MainWindow(_base.MainWindow):
         output_hint = QLabel("按此比例创建最大 Abaqus Viewport")
         output_hint.setProperty("role", "hint")
         output_layout.addWidget(output_hint)
+        output_layout.addWidget(QLabel("云图导出"))
+        self.export_white_background_checkbox = QCheckBox("白底 PNG")
+        self.export_white_background_checkbox.setObjectName(
+            "exportWhiteBackgroundPng"
+        )
+        self.export_white_background_checkbox.setToolTip(
+            "保留 Abaqus 直接输出的白色背景 PNG；GIF 始终由该原始帧生成。"
+        )
+        output_layout.addWidget(self.export_white_background_checkbox)
+        self.export_transparent_background_checkbox = QCheckBox("透明底 PNG")
+        self.export_transparent_background_checkbox.setObjectName(
+            "exportTransparentBackgroundPng"
+        )
+        self.export_transparent_background_checkbox.setToolTip(
+            "额外生成去除近白背景的透明 PNG；不会改变云图颜色和图例。"
+        )
+        output_layout.addWidget(self.export_transparent_background_checkbox)
         output_layout.addStretch(1)
         saved_unit = str(
             self.state.get(
@@ -246,10 +263,34 @@ class MainWindow(_base.MainWindow):
             self.image_unit_selector.findData(saved_unit)
         )
         self._apply_image_unit(saved_unit, saved_width, saved_height)
+        export_white = bool(
+            self.state.get(
+                "export_white_background_png",
+                self.defaults.get("export_white_background_png", True),
+            )
+        )
+        export_transparent = bool(
+            self.state.get(
+                "export_transparent_background_png",
+                self.defaults.get("export_transparent_background_png", True),
+            )
+        )
+        if not export_white and not export_transparent:
+            export_white = True
+        self.export_white_background_checkbox.setChecked(export_white)
+        self.export_transparent_background_checkbox.setChecked(
+            export_transparent
+        )
         self.image_width_input.valueChanged.connect(self._image_size_changed)
         self.image_height_input.valueChanged.connect(self._image_size_changed)
         self.image_unit_selector.currentIndexChanged.connect(
             self._image_unit_changed
+        )
+        self.export_white_background_checkbox.toggled.connect(
+            self._background_output_changed
+        )
+        self.export_transparent_background_checkbox.toggled.connect(
+            self._background_output_changed
         )
         self._update_image_ratio()
         self.centralWidget().layout().insertWidget(3, output_panel)
@@ -350,6 +391,27 @@ class MainWindow(_base.MainWindow):
         self.state["image_height"] = int(self.image_height_input.value())
         save_json(self.state_path, self.state)
 
+    def _background_output_changed(self, _checked: bool) -> None:
+        white = self.export_white_background_checkbox.isChecked()
+        transparent = self.export_transparent_background_checkbox.isChecked()
+        if not white and not transparent:
+            changed = self.sender()
+            fallback = (
+                self.export_transparent_background_checkbox
+                if changed is self.export_white_background_checkbox
+                else self.export_white_background_checkbox
+            )
+            fallback.blockSignals(True)
+            fallback.setChecked(True)
+            fallback.blockSignals(False)
+            white = self.export_white_background_checkbox.isChecked()
+            transparent = (
+                self.export_transparent_background_checkbox.isChecked()
+            )
+        self.state["export_white_background_png"] = bool(white)
+        self.state["export_transparent_background_png"] = bool(transparent)
+        save_json(self.state_path, self.state)
+
     def _update_parallel_worker_tooltip(self, workers: int) -> None:
         descriptions = {
             1: "串行处理，资源占用最低，稳定性最好。",
@@ -379,6 +441,8 @@ class MainWindow(_base.MainWindow):
             self.image_width_input.setEnabled(not busy)
             self.image_height_input.setEnabled(not busy)
             self.image_unit_selector.setEnabled(not busy)
+            self.export_white_background_checkbox.setEnabled(not busy)
+            self.export_transparent_background_checkbox.setEnabled(not busy)
         if hasattr(self, "cancel_run_button"):
             self.cancel_run_button.setEnabled(bool(busy and self.batch_active))
         if not busy and hasattr(self, "group_tabs"):
@@ -452,6 +516,12 @@ class MainWindow(_base.MainWindow):
         settings["image_size_unit"] = self._current_image_unit
         settings["image_width"] = int(self.image_width_input.value())
         settings["image_height"] = int(self.image_height_input.value())
+        settings["export_white_background_png"] = bool(
+            self.export_white_background_checkbox.isChecked()
+        )
+        settings["export_transparent_background_png"] = bool(
+            self.export_transparent_background_checkbox.isChecked()
+        )
         payload["settings"] = settings
         info = self._name_info(row)
         selected_direction = row["direction"].currentText()
@@ -1164,6 +1234,16 @@ class MainWindow(_base.MainWindow):
                 finalize_render_output(
                     output_dir,
                     int(payload["settings"].get("animation_fps", 5)),
+                    export_white_background_png=bool(
+                        payload["settings"].get(
+                            "export_white_background_png", True
+                        )
+                    ),
+                    export_transparent_background_png=bool(
+                        payload["settings"].get(
+                            "export_transparent_background_png", True
+                        )
+                    ),
                 )
             write_group_member_manifest(
                 output_dir,

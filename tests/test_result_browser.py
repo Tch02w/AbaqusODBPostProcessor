@@ -6,17 +6,22 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QTableView
 from PIL import Image
 
 from abaqus_odb_postprocessor.result_browser import (
     AspectRatioPreviewLabel,
     ResultBrowserDialog,
+    ResultIndexCoordinator,
     classify_result,
+    collect_shared_asset_records,
     collect_result_records,
     fit_preview_size,
     read_csv_preview,
+    result_section,
 )
+from abaqus_odb_postprocessor.result_assets import write_group_member_manifest
+from abaqus_odb_postprocessor.result_index import INDEX_FILENAME, build_result_index
 
 
 def application() -> QApplication:
@@ -50,6 +55,32 @@ def make_result_tree(root: Path) -> Path:
     ).write_bytes(b"png")
     (odb / "metadata.json").write_text('{"odb_path": "sample.odb"}', encoding="utf-8")
     return odb
+
+
+def test_group_scope_includes_referenced_shared_odb_data(tmp_path: Path) -> None:
+    asset = tmp_path / "ODB数据" / "A" / "asset"
+    (asset / "data").mkdir(parents=True)
+    (asset / "data" / "load_point_raw.csv").write_text(
+        "TotalTime,U3\n0,0\n", encoding="utf-8"
+    )
+    (asset / "summary.xlsx").write_bytes(b"xlsx")
+    group_member = tmp_path / "组A" / "batch" / "A"
+    group_member.mkdir(parents=True)
+    write_group_member_manifest(
+        group_member,
+        asset_dir=asset,
+        comparison_group="组A",
+        odb_path=tmp_path / "A.odb",
+        content_fingerprint="a" * 64,
+        numeric_config_hash="b" * 64,
+    )
+
+    records = collect_shared_asset_records(group_member)
+    assert {record.path.name for record in records} == {
+        "load_point_raw.csv",
+        "summary.xlsx",
+    }
+    assert all("ODB 公共数据" in record.description for record in records)
 
 
 def test_result_files_are_translated_to_engineering_uses(tmp_path: Path) -> None:
@@ -131,6 +162,12 @@ def test_result_browser_shows_group_batch_odb_and_common_results(
     internal = tmp_path / "_批次记录" / "20260723_120000"
     internal.mkdir(parents=True)
     (internal / "manifest.json").write_text("{}", encoding="utf-8")
+    time_directory = odb.parent
+    build_result_index(
+        time_directory,
+        classify_result,
+        result_section,
+    )
 
     dialog = ResultBrowserDialog(tmp_path)
     flags = dialog.windowFlags()
@@ -155,7 +192,8 @@ def test_result_browser_shows_group_batch_odb_and_common_results(
         for index in range(dialog.section_tabs.count())
     ] == ["常用", "数据", "曲线图", "云图", "动画", "说明与日志", "全部"]
     assert dialog.use_case_combo.currentText() == "全部内容"
-    assert dialog.file_table.rowCount() == 5
+    assert isinstance(dialog.file_table, QTableView)
+    assert dialog.file_table.model().rowCount() == 5
     assert dialog.content_splitter.orientation() == Qt.Vertical
     assert dialog.preview.hasScaledContents() is False
 
@@ -167,10 +205,15 @@ def test_result_browser_shows_group_batch_odb_and_common_results(
     dialog.section_tabs.setCurrentIndex(data_index)
     load_row = next(
         row
-        for row in range(dialog.file_table.rowCount())
-        if dialog.file_table.item(row, 3).text() == "load_point_raw.csv"
+        for row in range(dialog.file_table.model().rowCount())
+        if dialog.file_table.model().data(
+            dialog.file_table.model().index(row, 3)
+        )
+        == "load_point_raw.csv"
     )
     dialog.file_table.selectRow(load_row)
+    for thread in list(dialog._background_threads):
+        assert thread.wait(1000)
     QApplication.processEvents()
     assert dialog.preview_stack.currentWidget() is dialog.data_preview
     assert dialog.data_preview.columnCount() == 3
@@ -182,8 +225,11 @@ def test_result_browser_shows_group_batch_odb_and_common_results(
         if dialog.section_tabs.tabData(index) == "animations"
     )
     dialog.section_tabs.setCurrentIndex(animation_index)
-    assert dialog.file_table.rowCount() == 1
-    assert dialog.file_table.item(0, 1).text() == "动画"
+    assert dialog.file_table.model().rowCount() == 1
+    assert (
+        dialog.file_table.model().data(dialog.file_table.model().index(0, 1))
+        == "动画"
+    )
 
     all_index = next(
         index
@@ -191,7 +237,7 @@ def test_result_browser_shows_group_batch_odb_and_common_results(
         if dialog.section_tabs.tabData(index) == "all"
     )
     dialog.section_tabs.setCurrentIndex(all_index)
-    assert dialog.file_table.rowCount() == 7
+    assert dialog.file_table.model().rowCount() == 7
     dialog.close()
 
 
@@ -212,3 +258,69 @@ def test_result_browser_can_switch_to_the_main_window_result_root(
     assert dialog.root_edit.text() == str(second_root.resolve())
     assert dialog.scope_tree.topLevelItem(0).childCount() == 1
     dialog.close()
+
+
+def test_result_browser_startup_reads_only_directory_structure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application()
+    time_directory = (
+        tmp_path / "对比组" / "20260724_120000"
+    )
+    (time_directory / "GJA-1-R_U100D").mkdir(parents=True)
+    (time_directory / INDEX_FILENAME).write_bytes(b"not-opened")
+
+    def fail_if_loaded(_path):
+        raise AssertionError("startup must not open an index")
+
+    monkeypatch.setattr(
+        "abaqus_odb_postprocessor.result_browser.load_result_index",
+        fail_if_loaded,
+    )
+    dialog = ResultBrowserDialog(tmp_path)
+
+    root = dialog.scope_tree.topLevelItem(0)
+    assert root.child(0).child(0).text(0) == "20260724_120000"
+    assert dialog.records == []
+    assert "未读取任何结果索引" in dialog.status_label.text()
+    dialog.close()
+
+
+def test_manual_index_request_has_priority_over_newest_first_bulk(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application()
+    older = tmp_path / "20260723_120000"
+    newer = tmp_path / "20260724_120000_900000"
+    older.mkdir()
+    newer.mkdir()
+    coordinator = ResultIndexCoordinator()
+    monkeypatch.setattr(coordinator, "_start_next", lambda: None)
+
+    assert coordinator.enqueue_bulk([older, newer]) == 2
+    assert coordinator.pending_paths() == [
+        str(newer.resolve()),
+        str(older.resolve()),
+    ]
+
+    coordinator.enqueue_manual(older)
+    assert coordinator.pending_paths()[0] == str(older.resolve())
+
+
+def test_manual_refresh_replaces_a_pending_incremental_request(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application()
+    time_directory = tmp_path / "20260724_120000"
+    scope = time_directory / "GJA-1-R_U100D"
+    scope.mkdir(parents=True)
+    coordinator = ResultIndexCoordinator()
+    monkeypatch.setattr(coordinator, "_start_next", lambda: None)
+
+    assert coordinator.enqueue_incremental(time_directory, scope)
+    assert coordinator.enqueue_manual(time_directory, refresh=True)
+
+    assert len(coordinator.pending) == 1
+    assert coordinator.pending[0]["operation"] == "refresh"
+    assert coordinator.pending[0]["priority"] == 0
+    assert coordinator.pending[0]["scopes"] == set()

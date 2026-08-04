@@ -16,9 +16,14 @@ from PySide6.QtWidgets import (
 )
 
 from .config import load_defaults, save_json
+from .file_attributes import ensure_windows_hidden
 from .group_ui import GroupDropTable
 from .paths import result_root_for_odb, scan_cache_dir
-from .legends import aggregate_group_ranges, choose_sequences
+from .legends import (
+    aggregate_group_animation_ranges,
+    aggregate_group_ranges,
+    choose_sequences,
+)
 from .models import OdbScan, choose_name
 from .postprocess import finalize_output
 from .runner import run_job, scan_field_ranges, scan_folder
@@ -231,11 +236,27 @@ class MainWindow(QMainWindow):
                                  "comparison_group": payload["comparison_group"], "selected_sequence_indices": indices})
                 log(f"帧选择 {scan.path.name}: {indices}; 自动断裂前帧={detected}")
 
-            plans = aggregate_group_ranges(prepared); save_json(run_root / "comparison_group_legends.json", plans)
+            plans = aggregate_group_ranges(prepared)
+            animation_plans = aggregate_group_animation_ranges(prepared)
+            legends_path = run_root / "comparison_group_legends.json"
+            save_json(
+                legends_path,
+                {
+                    name: {
+                        "ranges": plans[name],
+                        "animation_ranges": animation_plans.get(name, {}),
+                    }
+                    for name in plans
+                },
+            )
+            ensure_windows_hidden(legends_path)
             outputs = []
             for item in prepared:
                 payload = item["payload"]; payload.pop("range_scan", None)
                 payload["legend_ranges"] = plans[payload["comparison_group"]]
+                payload["animation_legend_ranges"] = animation_plans[
+                    payload["comparison_group"]
+                ]
                 save_json(item["config_path"], payload)
                 log(f"开始正式提取：{Path(payload['odb_path']).name}；对比组={payload['comparison_group']}")
                 run_job(self.defaults["abaqus_command"], item["config_path"], log)

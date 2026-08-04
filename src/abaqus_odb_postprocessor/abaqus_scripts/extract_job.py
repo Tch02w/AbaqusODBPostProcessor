@@ -70,15 +70,17 @@ rebar_dir = os.path.join(output_dir, "rebar")
 freebody_dir = os.path.join(output_dir, "freebody")
 frame_root = os.path.join(output_dir, "frames")
 contour_dir = os.path.join(output_dir, "contours")
-for directory in (
+render_outputs = bool(config.get("render_outputs", True))
+directories = [
     output_dir,
     data_dir,
     history_output_dir,
     rebar_dir,
     freebody_dir,
-    frame_root,
-    contour_dir,
-):
+]
+if render_outputs:
+    directories.extend([frame_root, contour_dir])
+for directory in directories:
     os.makedirs(directory, exist_ok=True)
 log_path = os.path.join(output_dir, "abaqus_worker.log")
 
@@ -871,7 +873,7 @@ specs = [
     {"name": "REBAR_LONG_S_MISES_UNDEFORMED", "variable": "S", "refinement": (INVARIANT, "Mises"), "longitudinal": True, "undeformed": True},
     {"name": "REBAR_LONG_S11_UNDEFORMED", "variable": "S", "refinement": (COMPONENT, "S11"), "longitudinal": True, "undeformed": True},
 ]
-for spec in specs:
+for spec in specs if render_outputs else []:
     render(spec)
 
 metadata = {
@@ -901,7 +903,8 @@ metadata = {
     "requested_image_size": [image_width, image_height],
     "contact_history_columns": history_columns,
     "contact_history_source_count": len(history_source_metadata),
-    "animation_legend_mode": "odb_full_timeline_fixed",
+    "render_outputs": render_outputs,
+    "animation_legend_mode": "comparison_group_full_timeline_fixed",
     "animation_legend_ranges": animation_legend_ranges,
     "static_contour_legend_mode": "comparison_group_fixed_selected_frames",
 }

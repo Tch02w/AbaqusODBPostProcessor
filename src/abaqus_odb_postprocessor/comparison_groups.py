@@ -36,9 +36,14 @@ from PySide6.QtWidgets import (
 
 from . import safe_defaults as _previous
 from .config import save_json
+from .file_attributes import ensure_windows_hidden
 from .paths import result_root_for_odb, scan_cache_dir, state_file
 from .group_ui import ComparisonTree, LegendRangeDialog
-from .legends import aggregate_group_ranges, choose_sequences
+from .legends import (
+    aggregate_group_animation_ranges,
+    aggregate_group_ranges,
+    choose_sequences,
+)
 from .models import OdbScan
 from .naming import natural_sort_key
 from .postprocess import finalize_output
@@ -1021,6 +1026,7 @@ class MainWindow(_previous.MainWindow):
                 log(f"帧选择 {Path(path).name}: {indices}; 自动断裂前帧={detected}")
 
             group_ranges: dict[str, dict[str, Any]] = {}
+            group_animation_ranges: dict[str, dict[str, Any]] = {}
             for group in group_specs:
                 jobs = []
                 for path in group["members"]:
@@ -1031,13 +1037,28 @@ class MainWindow(_previous.MainWindow):
                         "range_scan": item["range_scan"],
                     })
                 plan = aggregate_group_ranges(jobs).get(str(group["name"]), {})
+                animation_plan = aggregate_group_animation_ranges(jobs).get(
+                    str(group["name"]), {}
+                )
                 self._apply_overrides(plan, group.get("overrides", {}), str(group["name"]))
+                self._apply_overrides(
+                    animation_plan,
+                    group.get("overrides", {}),
+                    str(group["name"]),
+                )
                 group_ranges[group["id"]] = plan
+                group_animation_ranges[group["id"]] = animation_plan
+            legends_path = run_root / "comparison_group_legends.json"
             save_json(
-                run_root / "comparison_group_legends.json",
-                {group["id"]: {"name": group["name"], "ranges": group_ranges[group["id"]]}
+                legends_path,
+                {group["id"]: {
+                    "name": group["name"],
+                    "ranges": group_ranges[group["id"]],
+                    "animation_ranges": group_animation_ranges[group["id"]],
+                }
                  for group in group_specs},
             )
+            ensure_windows_hidden(legends_path)
 
             outputs = []
             for path in unique_paths:
@@ -1055,6 +1076,9 @@ class MainWindow(_previous.MainWindow):
                     payload["output_dir"] = str(output_dir)
                     payload["comparison_group"] = str(group["name"])
                     payload["legend_ranges"] = group_ranges[group["id"]]
+                    payload["animation_legend_ranges"] = group_animation_ranges[
+                        group["id"]
+                    ]
                     config_path = output_dir / "job_config.json"
                     if membership_index == 0:
                         save_json(config_path, payload)

@@ -12,6 +12,7 @@ from abaqus_odb_postprocessor import batch_window as batch_module
 from abaqus_odb_postprocessor.app import MainWindow
 from abaqus_odb_postprocessor.models import OdbScan
 from abaqus_odb_postprocessor.runner_parallel import MultiProcessController
+from abaqus_odb_postprocessor.result_assets import resolve_group_member_asset
 
 
 def application() -> QApplication:
@@ -95,13 +96,23 @@ def test_sequential_groups_reuse_prescan_and_numeric_cache(
             "max": 3.0,
             "observed_min": -2.0,
             "observed_max": 3.0,
-            "source": "odb_full_animation_timeline",
+            "source": "comparison_group_full_animation_timeline",
+            "comparison_group": config["comparison_group"],
         }
 
     monkeypatch.setattr(batch_module, "scan_field_ranges", fake_prescan)
     monkeypatch.setattr(batch_module, "run_job", fake_extract)
     monkeypatch.setattr(batch_module, "render_group_contours", fake_render)
-    monkeypatch.setattr(batch_module, "finalize_output", lambda *_args: None)
+
+    def fake_finalize_numeric(output_dir):
+        (Path(output_dir) / "summary.xlsx").write_bytes(b"xlsx")
+
+    monkeypatch.setattr(
+        batch_module, "finalize_numeric_output", fake_finalize_numeric
+    )
+    monkeypatch.setattr(
+        batch_module, "finalize_render_output", lambda *_args: None
+    )
 
     logs: list[str] = []
 
@@ -123,20 +134,30 @@ def test_sequential_groups_reuse_prescan_and_numeric_cache(
             "folder_root": str(folder.resolve()),
         }
 
-    window._execute_group_task(
+    first_outputs = window._execute_group_task(
         task("a", "组A", "20260723_120000_000001"),
         1,
         MultiProcessController(),
         logs.append,
     )
-    window._execute_group_task(
+    second_outputs = window._execute_group_task(
         task("b", "组B", "20260723_120001_000001"),
         1,
         MultiProcessController(),
         logs.append,
     )
 
-    assert calls == {"prescan": 1, "extract": 1, "render": 1}
+    assert calls == {"prescan": 1, "extract": 1, "render": 2}
+    first_output = Path(first_outputs[0])
+    second_output = Path(second_outputs[0])
+    assert not (first_output / "data").exists()
+    assert not (second_output / "data").exists()
+    first_asset = resolve_group_member_asset(first_output)
+    second_asset = resolve_group_member_asset(second_output)
+    assert first_asset is not None
+    assert first_asset == second_asset
+    assert (first_asset / "data" / "timeline_alignment.csv").is_file()
+    assert (first_asset / "summary.xlsx").is_file()
     assert any("命中预扫描缓存" in message for message in logs)
-    assert any("复用已提取数值并仅重渲染组输出" in message for message in logs)
+    assert any("复用 ODB 公共数据" in message for message in logs)
     window.close()

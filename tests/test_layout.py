@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import os
+import stat
 import tempfile
 from pathlib import Path
 
-from abaqus_odb_postprocessor.config import abaqus_script
+import pytest
+
+from abaqus_odb_postprocessor.config import abaqus_script, save_json
+from abaqus_odb_postprocessor.file_attributes import (
+    hide_internal_result_json_files,
+)
 from abaqus_odb_postprocessor.paths import (
     batch_temp_dir,
     result_root_for_odb,
@@ -35,6 +42,31 @@ def test_batch_scratch_is_in_system_temp() -> None:
 def test_results_are_next_to_odb(tmp_path: Path) -> None:
     odb = tmp_path / "case.odb"
     assert result_root_for_odb(odb) == tmp_path / "AbaqusODBPostProcessor_Results"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file attributes only")
+def test_internal_result_json_files_are_hidden_but_user_notes_remain_visible(
+    tmp_path: Path,
+) -> None:
+    job_config = tmp_path / "job_config.json"
+    metadata = tmp_path / "metadata.json"
+    manifest = tmp_path / "host_postprocess_manifest.json"
+    notes = tmp_path / "load_resistance_notes.json"
+
+    job_config.write_text("{}", encoding="utf-8")
+    metadata.write_text("{}", encoding="utf-8")
+    manifest.write_text("{}", encoding="utf-8")
+    notes.write_text("{}", encoding="utf-8")
+    hide_internal_result_json_files(tmp_path)
+
+    for path in (job_config, metadata, manifest):
+        assert path.stat().st_file_attributes & stat.FILE_ATTRIBUTE_HIDDEN
+    assert not notes.stat().st_file_attributes & stat.FILE_ATTRIBUTE_HIDDEN
+
+    save_json(metadata, {"rewritten": True})
+    assert not metadata.stat().st_file_attributes & stat.FILE_ATTRIBUTE_HIDDEN
+    hide_internal_result_json_files(tmp_path)
+    assert metadata.stat().st_file_attributes & stat.FILE_ATTRIBUTE_HIDDEN
 
 
 def test_contours_use_configurable_large_viewport() -> None:
@@ -117,13 +149,19 @@ def test_animation_and_static_contours_use_fixed_scoped_legends() -> None:
         assert "set_animation_limits(spec)" in source
         assert "set_static_limits(spec)" in source
         assert 'static_base = os.path.join(contour_dir, spec["name"] + "_LAST")' in source
-        assert '"animation_legend_mode": "odb_full_timeline_fixed"' in source
+        assert (
+            '"animation_legend_mode": '
+            '"comparison_group_full_timeline_fixed"'
+        ) in source
         assert "animation_legend_ranges" in source
         assert (
             '"static_contour_legend_mode": '
             '"comparison_group_fixed_selected_frames"'
         ) in source
         assert "shutil.copyfile(written[-1]" not in source
+
+    assert "render_timeline = full_timeline" in group_renderer
+    assert "static_item = selected_timeline[-1]" in group_renderer
 
     animation_call = group_renderer.index(
         "set_animation_limits(spec)",

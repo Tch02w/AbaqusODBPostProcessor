@@ -2,6 +2,7 @@ import pytest
 
 from abaqus_odb_postprocessor.legends import (
     aggregate_animation_ranges,
+    aggregate_group_animation_ranges,
     aggregate_group_ranges,
     choose_sequences,
     parse_sequence_expression,
@@ -65,6 +66,31 @@ def test_group_range_uses_only_selected_frames_and_isolated_groups():
     assert plans["A"]["PILE_U_MAG"]["min"] == -2
     assert plans["A"]["PILE_U_MAG"]["max"] == 8
     assert plans["B"]["PILE_U_MAG"]["min"] == 10
+
+
+def test_group_animation_range_uses_all_frames_of_all_members():
+    jobs = [
+        {"comparison_group": "A", "selected_sequence_indices": [1],
+         "range_scan": catalog([0, 1], {
+             0: {"PILE_U_MAG": {"min": -5, "max": 2}},
+             1: {"PILE_U_MAG": {"min": 0, "max": 8}},
+         })},
+        {"comparison_group": "A", "selected_sequence_indices": [0],
+         "range_scan": catalog([0], {
+             0: {"PILE_U_MAG": {"min": -2, "max": 12}},
+         })},
+        {"comparison_group": "B", "selected_sequence_indices": [0],
+         "range_scan": catalog([0], {
+             0: {"PILE_U_MAG": {"min": 100, "max": 200}},
+         })},
+    ]
+    plans = aggregate_group_animation_ranges(jobs)
+    assert plans["A"]["PILE_U_MAG"]["min"] == -5
+    assert plans["A"]["PILE_U_MAG"]["max"] == 12
+    assert plans["A"]["PILE_U_MAG"]["source"] == (
+        "comparison_group_full_animation_timeline"
+    )
+    assert plans["B"]["PILE_U_MAG"]["min"] == 100
 
 
 def test_damage_palette_uses_group_maximum_and_zero_minimum():

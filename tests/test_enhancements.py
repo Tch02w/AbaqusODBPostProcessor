@@ -44,6 +44,34 @@ def test_main_window_has_a_result_browser_launch_button() -> None:
     window.close()
 
 
+def test_completed_odb_output_is_submitted_for_incremental_indexing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    application()
+    window = MainWindow()
+    output = (
+        tmp_path
+        / "AbaqusODBPostProcessor_Results"
+        / "组A"
+        / "20260724_120000"
+        / "GJA-1-R_U100D"
+    )
+    output.mkdir(parents=True)
+    calls = []
+    monkeypatch.setattr(
+        window.result_index_coordinator,
+        "enqueue_incremental",
+        lambda time_directory, scope: calls.append(
+            (Path(time_directory), Path(scope))
+        ),
+    )
+
+    window._append_log(f"INDEX_INCREMENTAL|{output}")
+
+    assert calls == [(output.parent.resolve(), output.resolve())]
+    window.close()
+
+
 def make_scan(path: Path) -> OdbScan:
     return OdbScan(
         path=path,

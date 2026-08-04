@@ -39,15 +39,27 @@ from .cache import (
     write_numeric_cache_metadata,
 )
 from .config import save_json
+from .file_attributes import ensure_windows_hidden
 from .legends import (
-    aggregate_animation_ranges,
+    aggregate_group_animation_ranges,
     aggregate_group_ranges,
     choose_sequences,
 )
 from .naming import OdbNameInfo, natural_sort_key, parse_odb_name
-from .postprocess import finalize_output
+from .postprocess import finalize_numeric_output, finalize_render_output
 from .paths import batch_temp_dir, result_root_for_odb, scan_cache_dir
-from .result_browser import ResultBrowserDialog, RESULT_ROOT_NAME
+from .result_browser import (
+    RESULT_ROOT_NAME,
+    ResultBrowserDialog,
+    ResultIndexCoordinator,
+)
+from .result_assets import (
+    copy_numeric_payload,
+    numeric_asset_dir,
+    numeric_asset_is_valid,
+    write_group_member_manifest,
+    write_numeric_asset_manifest,
+)
 from .runner_parallel import (
     MultiProcessController,
     ProcessCancelled,
@@ -89,6 +101,12 @@ class MainWindow(_base.MainWindow):
         self._pending_queue_advance = False
         self._finalize_lock = threading.Lock()
         super().__init__()
+        self.result_index_coordinator = ResultIndexCoordinator(self)
+        self.result_index_coordinator.logMessage.connect(
+            lambda text: self._append_log(
+                f"[{self._timestamp()}] 结果索引：{text}"
+            )
+        )
         self.setWindowTitle("Abaqus ODB PostProcessor 0.5")
 
     def _build_ui(self) -> None:
@@ -259,7 +277,11 @@ class MainWindow(_base.MainWindow):
             existing.raise_()
             existing.activateWindow()
             return
-        dialog = ResultBrowserDialog(result_root, self)
+        dialog = ResultBrowserDialog(
+            result_root,
+            self,
+            coordinator=self.result_index_coordinator,
+        )
         dialog.setAttribute(Qt.WA_DeleteOnClose)
         dialog.destroyed.connect(
             lambda: setattr(self, "_result_browser_dialog", None)
@@ -525,6 +547,15 @@ class MainWindow(_base.MainWindow):
         self._refresh_queue_ui()
 
     def _append_log(self, text: str) -> None:
+        if text.startswith("INDEX_INCREMENTAL|"):
+            output_dir = Path(text.split("|", 1)[1]).resolve()
+            self.result_index_coordinator.enqueue_incremental(
+                output_dir.parent, output_dir
+            )
+            super()._append_log(
+                f"[{self._timestamp()}] 已提交结果增量索引：{output_dir.name}"
+            )
+            return
         if text.startswith("BATCH_PROGRESS|"):
             _, phase, done, total, name = text.split("|", 4)
             self.batch_completed = int(done)
@@ -926,9 +957,6 @@ class MainWindow(_base.MainWindow):
                     -1 if detected is None else int(detected)
                 )
             payload["selected_sequence_indices"] = indices
-            payload["animation_legend_ranges"] = aggregate_animation_ranges(
-                range_scan
-            )
             tagged(path, f"帧选择={indices}；自动断裂前帧={detected}")
             return path, {
                 "payload": payload,
@@ -968,21 +996,34 @@ class MainWindow(_base.MainWindow):
             for path in members
         ]
         group_ranges = aggregate_group_ranges(jobs).get(item["name"], {})
+        group_animation_ranges = aggregate_group_animation_ranges(jobs).get(
+            item["name"], {}
+        )
         self._apply_overrides(
             group_ranges, plan.get("overrides", {}), item["name"]
         )
-        save_json(
+        self._apply_overrides(
+            group_animation_ranges,
+            plan.get("overrides", {}),
+            item["name"],
+        )
+        legends_path = (
             result_root
             / "_批次记录"
             / item["batch_id"]
-            / "comparison_group_legends.json",
+            / "comparison_group_legends.json"
+        )
+        save_json(
+            legends_path,
             {
                 item["id"]: {
                     "name": item["name"],
                     "ranges": group_ranges,
+                    "animation_ranges": group_animation_ranges,
                 }
             },
         )
+        ensure_windows_hidden(legends_path)
 
         def extract_one(path: str) -> str:
             check_cancelled()
@@ -1004,23 +1045,65 @@ class MainWindow(_base.MainWindow):
             payload["output_dir"] = str(output_dir)
             payload["comparison_group"] = item["name"]
             payload["legend_ranges"] = group_ranges
+            payload["animation_legend_ranges"] = group_animation_ranges
             numeric_snapshot = numeric_config_snapshot(payload)
             numeric_hash = stable_config_hash(numeric_snapshot)
+            fingerprint = prepared[path]["content_fingerprint"]
             numeric_entry = cache_entry_dir(
                 cache_root,
                 "numeric",
-                prepared[path]["content_fingerprint"],
+                fingerprint,
+                numeric_hash,
+            )
+            shared_data_dir = numeric_asset_dir(
+                result_root,
+                path,
+                fingerprint,
                 numeric_hash,
             )
             config_path = output_dir / "job_config.json"
-            if numeric_cache_is_valid(
-                numeric_entry,
-                content_fingerprint=prepared[path]["content_fingerprint"],
+            shared_data_ready = numeric_asset_is_valid(
+                shared_data_dir,
+                content_fingerprint=fingerprint,
+                numeric_config_hash=numeric_hash,
                 abaqus_version=abaqus_version,
-                config_hash=numeric_hash,
-            ):
-                self._copy_numeric_cache(numeric_entry, output_dir)
-                metadata_path = output_dir / "metadata.json"
+            )
+            if not shared_data_ready:
+                cache_ready = numeric_cache_is_valid(
+                    numeric_entry,
+                    content_fingerprint=fingerprint,
+                    abaqus_version=abaqus_version,
+                    config_hash=numeric_hash,
+                )
+                if cache_ready:
+                    copy_numeric_payload(numeric_entry, shared_data_dir)
+                    tagged(
+                        path,
+                        "从持久缓存恢复 ODB 公共数据；"
+                        f"配置={numeric_hash[:12]}",
+                    )
+                else:
+                    extract_payload = copy.deepcopy(payload)
+                    extract_payload["output_dir"] = str(shared_data_dir)
+                    extract_payload["comparison_group"] = "ODB公共数据"
+                    extract_payload["legend_ranges"] = {}
+                    extract_payload["animation_legend_ranges"] = {}
+                    extract_payload["render_outputs"] = False
+                    asset_config_path = shared_data_dir / "job_config.json"
+                    save_json(asset_config_path, extract_payload)
+                    tagged(
+                        path,
+                        "提取一次 ODB 公共数值数据；"
+                        f"配置={numeric_hash[:12]}",
+                    )
+                    run_job(
+                        self.defaults["abaqus_command"],
+                        asset_config_path,
+                        lambda line: log(f"[{Path(path).name}] {line}"),
+                        controller,
+                    )
+
+                metadata_path = shared_data_dir / "metadata.json"
                 if metadata_path.is_file():
                     metadata = json.loads(
                         metadata_path.read_text(encoding="utf-8")
@@ -1028,72 +1111,69 @@ class MainWindow(_base.MainWindow):
                     metadata.update(
                         {
                             "odb_path": str(Path(path).resolve()),
-                            "numeric_cache_reused": True,
-                            "content_fingerprint": prepared[path][
-                                "content_fingerprint"
-                            ],
+                            "numeric_cache_reused": cache_ready,
+                            "content_fingerprint": fingerprint,
                             "numeric_config_hash": numeric_hash,
+                            "result_layout_version": 2,
+                            "comparison_group_independent": True,
                         }
                     )
                     save_json(metadata_path, metadata)
-                payload["source_output_dir"] = str(numeric_entry)
-                save_json(config_path, payload)
-                tagged(
-                    path,
-                    f"复用已提取数值并仅重渲染组输出；组={item['name']}；"
-                    f"配置={numeric_hash[:12]}",
-                )
-                render_group_contours(
-                    self.defaults["abaqus_command"],
-                    config_path,
-                    lambda line: log(f"[{Path(path).name}] {line}"),
-                    controller,
-                )
-            else:
-                save_json(config_path, payload)
-                tagged(
-                    path,
-                    f"数值缓存未命中，执行完整提取；组={item['name']}；"
-                    f"配置={numeric_hash[:12]}",
-                )
-                run_job(
-                    self.defaults["abaqus_command"],
-                    config_path,
-                    lambda line: log(f"[{Path(path).name}] {line}"),
-                    controller,
-                )
-                metadata_path = output_dir / "metadata.json"
-                if metadata_path.is_file():
-                    metadata = json.loads(
-                        metadata_path.read_text(encoding="utf-8")
-                    )
-                    metadata.update(
-                        {
-                            "content_fingerprint": prepared[path][
-                                "content_fingerprint"
-                            ],
-                            "numeric_config_hash": numeric_hash,
-                            "numeric_cache_reused": False,
-                        }
-                    )
-                    save_json(metadata_path, metadata)
-                self._copy_numeric_cache(output_dir, numeric_entry)
-                write_numeric_cache_metadata(
-                    numeric_entry,
-                    odb_path=Path(path),
-                    content_fingerprint=prepared[path][
-                        "content_fingerprint"
-                    ],
+                with self._finalize_lock:
+                    finalize_numeric_output(shared_data_dir)
+                write_numeric_asset_manifest(
+                    shared_data_dir,
+                    odb_path=path,
+                    content_fingerprint=fingerprint,
+                    numeric_config_hash=numeric_hash,
                     abaqus_version=abaqus_version,
-                    config_hash=numeric_hash,
-                    config_snapshot=numeric_snapshot,
                 )
-                tagged(path, "已写入持久数值缓存")
+                if not cache_ready:
+                    copy_numeric_payload(shared_data_dir, numeric_entry)
+                    write_numeric_cache_metadata(
+                        numeric_entry,
+                        odb_path=Path(path),
+                        content_fingerprint=fingerprint,
+                        abaqus_version=abaqus_version,
+                        config_hash=numeric_hash,
+                        config_snapshot=numeric_snapshot,
+                    )
+                    tagged(path, "已写入持久数值缓存")
+                log(f"INDEX_SHARED_DATA|{shared_data_dir}")
+            else:
+                tagged(
+                    path,
+                    "复用 ODB 公共数据；"
+                    f"配置={numeric_hash[:12]}",
+                )
+
+            payload["source_output_dir"] = str(shared_data_dir)
+            payload["render_outputs"] = True
+            save_json(config_path, payload)
+            tagged(
+                path,
+                f"按对比组重渲染云图与动画；组={item['name']}",
+            )
+            render_group_contours(
+                self.defaults["abaqus_command"],
+                config_path,
+                lambda line: log(f"[{Path(path).name}] {line}"),
+                controller,
+            )
             with self._finalize_lock:
-                finalize_output(
+                finalize_render_output(
                     output_dir,
                     int(payload["settings"].get("animation_fps", 5)),
                 )
+            write_group_member_manifest(
+                output_dir,
+                asset_dir=shared_data_dir,
+                comparison_group=item["name"],
+                odb_path=path,
+                content_fingerprint=fingerprint,
+                numeric_config_hash=numeric_hash,
+            )
+            log(f"INDEX_INCREMENTAL|{output_dir}")
             tagged(path, f"完成组输出：{output_dir}")
             return str(output_dir)
 
@@ -1135,6 +1215,11 @@ class MainWindow(_base.MainWindow):
             f"[{self._timestamp()}] 组完成：{item['name']}；"
             f"输出={len(outputs)}"
         )
+        for output in outputs:
+            output_dir = Path(output).resolve()
+            self.result_index_coordinator.enqueue_incremental(
+                output_dir.parent, output_dir
+            )
         self.scan_status.setText(
             f"组完成：{item['name']}｜排队："
             f"{'、'.join(self._queued_task_name(task) for task in self.group_queue) or '无'}"
@@ -1175,12 +1260,16 @@ class MainWindow(_base.MainWindow):
 
     def closeEvent(self, event) -> None:
         self._save_state()
-        if self._has_group_work() and not self._exit_after_cancel:
+        has_index_work = self.result_index_coordinator.has_work()
+        if (
+            (self._has_group_work() or has_index_work)
+            and not self._exit_after_cancel
+        ):
             dialog = QMessageBox(self)
-            dialog.setWindowTitle("仍有后处理任务")
-            dialog.setText("仍有正在运行或排队的组。")
+            dialog.setWindowTitle("仍有后台任务")
+            dialog.setText("仍有正在运行或排队的后处理组/结果索引任务。")
             dialog.setInformativeText(
-                "请选择返回，或取消全部任务并退出。"
+                "请选择返回，或安全取消全部任务并退出。"
             )
             return_button = dialog.addButton(
                 "返回", QMessageBox.RejectRole
@@ -1195,6 +1284,17 @@ class MainWindow(_base.MainWindow):
                 return
             self.group_queue.clear()
             self._exit_after_cancel = True
+            if has_index_work:
+                self._append_log(
+                    f"[{self._timestamp()}] 正在安全取消结果索引任务并退出"
+                )
+                if not self.result_index_coordinator.shutdown(30000):
+                    self._append_log(
+                        f"[{self._timestamp()}] 结果索引线程仍在退出，暂不关闭程序"
+                    )
+                    self._exit_after_cancel = False
+                    event.ignore()
+                    return
             if self.batch_controller is not None:
                 self._append_log(
                     f"[{self._timestamp()}] 正在取消全部任务并退出"

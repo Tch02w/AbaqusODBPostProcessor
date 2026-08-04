@@ -126,3 +126,54 @@ def aggregate_animation_ranges(
             "source": "odb_full_animation_timeline",
         }
     return result
+
+
+def aggregate_group_animation_ranges(
+    jobs: list[dict[str, Any]],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Build fixed GIF limits from every frame of every ODB in each group.
+
+    Static contours intentionally use :func:`aggregate_group_ranges`, which
+    only inspects the selected (usually last/pre-fracture) frames.  Animations
+    represent the complete formal loading history, so their fixed legend must
+    cover the complete frame catalog of all members in the comparison group.
+    """
+
+    observed: dict[str, dict[str, list[float]]] = {}
+    for job in jobs:
+        group = str(job["comparison_group"]).strip() or "默认组"
+        group_ranges = observed.setdefault(group, {})
+        for frame in job["range_scan"].get("frame_catalog", []):
+            for spec, limits in frame.get("ranges", {}).items():
+                current = group_ranges.setdefault(
+                    str(spec), [float("inf"), float("-inf")]
+                )
+                current[0] = min(current[0], float(limits["min"]))
+                current[1] = max(current[1], float(limits["max"]))
+
+    plans: dict[str, dict[str, dict[str, Any]]] = {}
+    for group, fields in observed.items():
+        plan: dict[str, dict[str, Any]] = {}
+        for spec, (minimum, maximum) in fields.items():
+            observed_min = minimum
+            observed_max = maximum
+            if spec in DAMAGE_SPECS:
+                minimum = DAMAGE_DISPLAY_MIN
+                maximum = max(observed_max, 1.0e-12)
+                source = "comparison_group_damage_max_full_animation_timeline"
+            else:
+                source = "comparison_group_full_animation_timeline"
+                if minimum == maximum:
+                    padding = max(abs(minimum), 1.0) * 1.0e-9
+                    minimum -= padding
+                    maximum += padding
+            plan[spec] = {
+                "min": minimum,
+                "max": maximum,
+                "observed_min": observed_min,
+                "observed_max": observed_max,
+                "source": source,
+                "comparison_group": group,
+            }
+        plans[group] = plan
+    return plans

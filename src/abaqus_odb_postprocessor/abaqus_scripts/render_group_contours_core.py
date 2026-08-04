@@ -273,7 +273,7 @@ def set_static_limits(spec):
 
 
 def set_animation_limits(spec):
-    """Use one observed min/max range for this ODB's complete animation."""
+    """Use the comparison group's fixed range for the complete animation."""
 
     limits = animation_legend_ranges.get(spec["name"], {})
     if spec["variable"] in ("DAMAGET", "DAMAGEC") and limits:
@@ -389,7 +389,6 @@ def render(spec):
     set_static_limits(spec)
     viewport.view.fitView()
     written = []
-    last_rendered_item = None
     render_timeline = full_timeline
     for animation_index, item in enumerate(render_timeline):
         step_index = int(item["StepIndex"])
@@ -408,14 +407,15 @@ def render(spec):
         try:
             session.printToFile(fileName=base, format=PNG, canvasObjects=(viewport,))
             written.append(base + ".png")
-            last_rendered_item = item
         except Exception:
             log("RENDER FAILED {0} {1}\n{2}".format(
                 spec["name"], animation_index, traceback.format_exc()
             ))
-    if last_rendered_item is not None:
-        step_index = int(last_rendered_item["StepIndex"])
-        frame_index = int(last_rendered_item["FrameIndex"])
+    static_item = selected_timeline[-1]
+    step_index = int(static_item["StepIndex"])
+    frame_index = int(static_item["FrameIndex"])
+    static_frame = list(odb.steps.values())[step_index].frames[frame_index]
+    if spec["variable"] in static_frame.fieldOutputs:
         viewport.odbDisplay.setFrame(step=step_index, frame=frame_index)
         set_static_limits(spec)
         static_base = os.path.join(contour_dir, spec["name"] + "_LAST")
@@ -452,7 +452,7 @@ metadata.update(
         "render_viewport_mm": list(render_viewport_mm),
         "image_size_unit": image_size_unit,
         "requested_image_size": [image_width, image_height],
-        "animation_legend_mode": "odb_full_timeline_fixed",
+        "animation_legend_mode": "comparison_group_full_timeline_fixed",
         "animation_legend_ranges": animation_legend_ranges,
         "static_contour_legend_mode": "comparison_group_fixed_selected_frames",
     }
